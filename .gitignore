@@ -1,0 +1,33 @@
+# Build output
+Debug/
+Release/
+build/
+Objects/
+Listings/
+
+# Keil / ARMCC output
+*.o
+*.d
+*.crf
+*.htm
+*.dep
+*.lnp
+*.iex
+*.axf
+*.elf
+*.map
+*.bin
+*.hex
+*.lst
+
+# Logs
+*.log
+
+# VSCode
+.vscode/
+
+# User-specific Keil files
+*.uvguix.*
+*.uvoptx.bak
+*.uvprojx.bak
+.idea/

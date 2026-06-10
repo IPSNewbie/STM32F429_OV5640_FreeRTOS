@@ -1,0 +1,194 @@
+//
+// Created by FAKE on 2026/6/2.
+//
+#include "ov5640.h"
+#include "bsp_sccb.h"
+#include "bsp_log.h"
+#include "ov5640cfg.h"
+/*
+ * 本文件只做“最小可视化调试配置”。
+ * 当前目标：RGB565 + QVGA + 测试彩条输出到 DCMI/LCD
+ * 复杂画质、曝光、AWB、AF 后面再接完整寄存器表。
+ */
+
+// 写 OV5640 单个寄存器
+static uint8_t OV5640_Min_WriteReg(uint16_t reg, uint8_t val)
+{
+    // 通过 SCCB 写 16 位寄存器地址 + 8 位数据
+    uint8_t ret = SCCB_WriteReg(reg, val);
+
+    // 写失败则打印寄存器地址和值，方便定位
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 write failed: reg=0x%04X, val=0x%02X", reg, val);
+        return 1;
+    }
+
+    // 每次写寄存器后稍作延时，保证传感器内部配置稳定
+    HAL_Delay(1);
+
+    return 0;
+}
+
+// 读 OV5640 单个寄存器
+static uint8_t OV5640_Min_ReadReg(uint16_t reg, uint8_t *val)
+{
+    // 通过 SCCB 读取指定寄存器
+    uint8_t ret = SCCB_ReadReg(reg, val);
+
+    // 读失败则打印寄存器地址
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 read failed: reg=0x%04X", reg);
+        return 1;
+    }
+
+    return 0;
+}
+
+// 批量写寄存器表
+static uint8_t OV5640_Min_WriteTable(const uint16_t (*tbl)[2], uint32_t len)
+{
+    // 表格式：{寄存器地址, 寄存器值}
+    for (uint32_t i = 0; i < len; i++)
+    {
+        // 逐项写入寄存器表
+        if (OV5640_Min_WriteReg(tbl[i][0], (uint8_t)tbl[i][1]) != 0)
+        {
+            LOG_ERROR("OV5640 table write failed at index=%lu, reg=0x%04X, val=0x%02X",
+                      i, tbl[i][0], (uint8_t)tbl[i][1]);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+// 检查 OV5640 芯片 ID
+uint8_t OV5640_Min_CheckID(void)
+{
+    // 读取 0x300A 和 0x300B，组合成芯片 ID
+    uint16_t id = OV5640_ReadID();
+
+    // 正常情况下应为 0x5640
+    if (id == OV5640_MIN_ID)
+    {
+        return 0;
+    }
+
+    LOG_ERROR("OV5640 ID error: 0x%04X", id);
+    return 1;
+}
+
+// 打开或关闭 OV5640 内部测试彩条
+uint8_t OV5640_Min_EnableTestBar(uint8_t enable)
+{
+    // 0x4741 是测试图相关寄存器
+    // bit[2] = 1：开启测试图
+    // bit[0] = 1：选择 8-bit 测试图输出
+    // 0x05 = bit[2] + bit[0]
+    return OV5640_Min_WriteReg(0x4741, enable ? 0x05 : 0x00);
+}
+
+// 初始化 OV5640 为 RGB565 + QVGA + 测试彩条
+uint8_t OV5640_Min_InitRGB565_QVGA_TestBar(void)
+{
+    // 先确认 SCCB 通信和芯片 ID 正常
+    if (OV5640_Min_CheckID() != 0)
+    {
+        return 1;
+    }
+
+    // 1. 写基础初始化表。
+    // 主要配置 OV5640 的时钟、ISP、DVP 输出等基础功能，让 OV5640 的时钟、ISP、DVP 等进入可工作状态。
+    if (OV5640_Min_WriteTable(ov5640_init_reg_tbl,
+                              sizeof(ov5640_init_reg_tbl) / sizeof(ov5640_init_reg_tbl[0])) != 0)
+    {
+        return 2;
+    }
+    // 等待基础配置稳定
+    HAL_Delay(50);
+
+    // 2.写 RGB565 模式表
+    // 主要配置 RGB565 输出格式、PLL、PCLK、timing、ISP 等相关寄存器，确保 OV5640 输出 RGB565 格式的图像，并且时钟和时序满足 DCMI 的要求。
+    if (OV5640_Min_WriteTable(ov5640_rgb565_reg_tbl,
+                              sizeof(ov5640_rgb565_reg_tbl) / sizeof(ov5640_rgb565_reg_tbl[0])) != 0)
+    {
+        return 3;
+    }
+    // 等待 RGB565 配置稳定
+    HAL_Delay(50);
+
+    //3. 覆盖输出尺寸为 QVGA 320x240。
+    // 注意：只改 DVP 输出尺寸，先不尝试完整手写裁剪/缩放表。
+
+    // 设置 DVP 输出宽度为 320
+    // 0x3808/0x3809 = 0x0140 = 320
+    if (OV5640_Min_WriteReg(0x3808, 0x01)) return 4;  /* width  = 0x0140 = 320 */
+    if (OV5640_Min_WriteReg(0x3809, 0x40)) return 5;
+
+    // 设置 DVP 输出高度为 240
+    // 0x380A/0x380B = 0x00F0 = 240
+    if (OV5640_Min_WriteReg(0x380A, 0x00)) return 6;  /* height = 0x00F0 = 240 */
+    if (OV5640_Min_WriteReg(0x380B, 0xF0)) return 7;
+
+    // 4. 确保 DVP 输出格式是 RGB565。
+    // 0x501F = 0x01 对应 RGB565 输出路径，如果之前的 RGB565 表没有覆盖这个寄存器，则在这里单独写入。
+    if (OV5640_Min_WriteReg(0x501F, 0x01)) return 8;
+
+
+    // 5.最后开启内部测试彩条
+    if (OV5640_Min_EnableTestBar(1)) return 9;
+
+    LOG_INFO("OV5640 full table RGB565 QVGA testbar init done");
+
+    return 0;
+}
+
+// 读回关键寄存器，用于确认配置是否真正写入 OV5640
+uint8_t OV5640_Min_ReadBackDebug(void)
+{
+    uint8_t val = 0;
+
+    // 测试彩条寄存器
+    if (OV5640_Min_ReadReg(0x4741, &val)) return 1;
+    LOG_INFO("OV5640 0x4741 = 0x%02X", val);
+
+    // RGB/YUV/JPEG 输出格式控制寄存器
+    if (OV5640_Min_ReadReg(0x4300, &val)) return 1;
+    LOG_INFO("OV5640 0x4300 = 0x%02X", val);
+
+    // ISP 输出格式选择寄存器
+    if (OV5640_Min_ReadReg(0x501F, &val)) return 1;
+    LOG_INFO("OV5640 0x501F = 0x%02X", val);
+
+    // PLL 分频相关寄存器
+    if (OV5640_Min_ReadReg(0x3035, &val)) return 1;
+    LOG_INFO("OV5640 0x3035 = 0x%02X", val);
+
+    // PLL 倍频相关寄存器
+    if (OV5640_Min_ReadReg(0x3036, &val)) return 1;
+    LOG_INFO("OV5640 0x3036 = 0x%02X", val);
+
+    // PCLK 分频寄存器
+    if (OV5640_Min_ReadReg(0x3824, &val)) return 1;
+    LOG_INFO("OV5640 0x3824 = 0x%02X", val);
+
+    // DVP 输出宽度高字节
+    if (OV5640_Min_ReadReg(0x3808, &val)) return 1;
+    LOG_INFO("OV5640 0x3808 = 0x%02X", val);
+
+    // DVP 输出宽度低字节
+    if (OV5640_Min_ReadReg(0x3809, &val)) return 1;
+    LOG_INFO("OV5640 0x3809 = 0x%02X", val);
+
+    // DVP 输出高度高字节
+    if (OV5640_Min_ReadReg(0x380A, &val)) return 1;
+    LOG_INFO("OV5640 0x380A = 0x%02X", val);
+
+    // DVP 输出高度低字节
+    if (OV5640_Min_ReadReg(0x380B, &val)) return 1;
+    LOG_INFO("OV5640 0x380B = 0x%02X", val);
+
+    return 0;
+}
