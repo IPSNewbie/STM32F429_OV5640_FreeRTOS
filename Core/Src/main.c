@@ -147,15 +147,19 @@ int main(void)
     * 5. LCD 初始化，本地彩条验证
     */
   LCD_MCU_Init();
-  LCD_MCU_TestSequence();
+  //关闭LCD彩条测试
+  // LCD_MCU_TestSequence();
   HAL_Delay(1000);
 
   /*
    * 6. 配置 OV5640：RGB565 + QVGA + 测试彩条
    */
-  uint8_t ret = OV5640_Min_InitRGB565_QVGA_TestBar();
-  LOG_INFO("OV5640 testbar init ret = %d", ret);
+  // uint8_t ret = OV5640_Min_InitRGB565_QVGA_TestBar();
+  // LOG_INFO("OV5640 testbar init ret = %d", ret);\
 
+  //关闭彩条测试，配置 OV5640 输出真实图像
+  uint8_t ret = OV5640_Min_InitRGB565_QVGA_RealImage();
+  LOG_INFO("OV5640 real image init ret = %d", ret);
   /*
    * 7. 初始化 DCMI
    */
@@ -192,7 +196,7 @@ int main(void)
     // LOG_ERROR("Sensor read failed, error = 0x%02X", err);
     //LOG_RAW("This is raw text without any prefix\r\n");
     //PCF8574_WriteBit(PCF8574_IO_P0, 0);   /* 设置 P0 引脚为低电平，测试蜂鸣器 */
-    
+
     //PCF8574_WriteBit(PCF8574_OV_PWDN_IO, 0);   /* 连接摄像头电源引脚到地，开启摄像头 */
 
   }

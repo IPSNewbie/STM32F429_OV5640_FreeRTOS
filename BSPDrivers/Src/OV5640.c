@@ -192,3 +192,77 @@ uint8_t OV5640_Min_ReadBackDebug(void)
 
     return 0;
 }
+
+uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void)
+{
+    uint8_t ret = 0;
+    uint8_t val = 0;
+
+    /*
+     * 1. 先复用已经验证成功的完整 RGB565 + QVGA 初始化流程
+     *    这一步会写：
+     *    ov5640_init_reg_tbl
+     *    ov5640_rgb565_reg_tbl
+     *    LCD 全屏输出 480x320
+     *    并临时打开测试彩条
+     */
+    ret = OV5640_Min_InitRGB565_QVGA_TestBar();
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 RGB565 QVGA base init failed, ret = %d", ret);
+        return ret;
+    }
+
+    /*
+     * 2. 关闭 OV5640 测试图案，切换为真实图像输出
+     *
+     * 0x4741:
+     * bit[2] = 1: enable test pattern
+     * bit[2] = 0: disable test pattern
+     */
+    ret = SCCB_WriteReg(0x4741, 0x00);
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 disable test pattern failed");
+        return 10;
+    }
+
+    HAL_Delay(20);
+
+    /*
+     * 3. 确认测试图案已经关闭
+     */
+    ret = SCCB_ReadReg(0x4741, &val);
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 read 0x4741 failed");
+        return 11;
+    }
+
+    LOG_INFO("OV5640 0x4741 = 0x%02X", val);
+
+    /*
+     * 4. 确保自动曝光/自动增益打开
+     *
+     * 0x3503:
+     * bit[0] AEC manual enable
+     * bit[1] AGC manual enable
+     *
+     * 写 0x00 表示让 AEC/AGC 自动工作。
+     */
+    ret = SCCB_WriteReg(0x3503, 0x00);
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 enable AEC/AGC failed");
+        return 12;
+    }
+
+    /*
+     * 5. 等待自动曝光稳定几帧
+     */
+    HAL_Delay(200);
+
+    LOG_INFO("OV5640 RGB565 480x320 real image init done");
+    
+    return 0;
+}

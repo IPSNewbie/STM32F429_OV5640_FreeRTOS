@@ -23,4 +23,6 @@ uint8_t OV5640_Min_EnableTestBar(uint8_t enable);
 // 读回关键寄存器，用于调试确认配置是否写入成功
 uint8_t OV5640_Min_ReadBackDebug(void);
 
+//关闭彩条测试，输出传感器图像至LCD
+uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void);
 #endif // ISP_OV5640_OV5640_H
