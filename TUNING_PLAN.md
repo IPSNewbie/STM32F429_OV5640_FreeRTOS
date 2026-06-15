@@ -1,71 +1,118 @@
-# TUNING_PLAN.md
+# \# TUNING\_PLAN.md
 
-## 当前优先级
+# 
 
-当前先不做 OV5640 调参。
+# \## 当前优先级
 
-第一优先级是：
-把当前 OV5640 RGB565 QVGA 320x240 真实图像放大到 3.5 寸 NT35310 LCD 横屏 480x320 显示。
+# 
 
-## 重要结论
+# 当前先不做 OV5640 画质调参。
 
-当前工程的摄像头显示路径是：
+# 
 
-OV5640 -> DCMI -> DMA -> LCD GRAM
+# 当前目标是：
 
-也就是 DCMI DMA 直接写 LCD，不经过 RAM 帧缓冲。
+# 把真实图像从当前 320x240 显示，改为铺满 3.5 寸 NT35310 LCD 横屏 480x320 显示。
 
-这种路径不能直接做 320x240 到 480x320 的缩放。
+# 
 
-因此，全屏缩放需要新增一条路径：
+# \## 重要结论
 
-OV5640 -> DCMI -> DMA -> RAM framebuffer -> LCD 缩放显示
+# 
 
-## Stage 0-A：检查帧缓冲可行性
+# 当前工程的显示路径是：
 
-先检查：
-- 工程是否已经初始化外部 SDRAM
-- 是否有 SDRAM 地址宏
-- 是否有 linker script / memory map
-- 当前 DCMI DMA 数据宽度和对齐方式
-- 当前 LCD 写 RGB565 的方式
+# 
 
-不要修改代码。
+# OV5640 -> DCMI -> DMA -> LCD GRAM
 
-## Stage 0-B：新增 framebuffer 采集路径
+# 
 
-允许新增 DCMI 到 RAM 的采集接口。
+# 也就是 DCMI DMA 直接写 LCD，不经过 RAM framebuffer。
 
-要求：
-- 保留原来的 Camera_DCMI_DMA_ConfigToLCD()
-- 保留原来的 Camera_DCMI_StartToLCD()
-- 不破坏当前能显示 320x240 真实图像的稳定路径
-- 只新增 DCMI 到 framebuffer 的并行路径
+# 
 
-## Stage 0-C：新增 LCD 缩放显示函数
+# 如果保持 OV5640 输出 320x240 不变，就不能直接软件缩放到 480x320，因为工程当前没有 SDRAM framebuffer。
 
-新增 LCD 层函数，把 320x240 RGB565 framebuffer 显示到 480x320 LCD。
+# 
 
-显示模式：
-- NATIVE：320x240 原图居中
-- FIT：等比例放大，有黑边，不变形
-- FILL：等比例放大，裁剪上下，铺满屏幕，不变形
-- STRETCH：直接拉伸，铺满但可能变形
+# 因此当前优先方案改为：
 
-默认先测试：
-1. NATIVE
-2. STRETCH
-3. FILL
+# 
 
-## 禁止修改
+# 让 OV5640 直接输出 480x320 RGB565，
 
-不要修改：
-- OV5640 初始化表
-- SCCB 驱动
-- PCF8574 / PWDN / RESET
-- OV5640 输出分辨率
-- 画质调参功能
+# 然后让 DCMI DMA 直接写 LCD 480x320 窗口。
 
-暂时不要创建：
-- ov5640_tuning.c
-- ov5640_tuning.h
+# 
+
+# \## Stage 0：OV5640 直接输出 480x320
+
+# 
+
+# 目标：
+
+# \- 保持 DCMI -> LCD 直接显示路径
+
+# \- 不使用 SDRAM
+
+# \- 不使用 framebuffer
+
+# \- 不做软件缩放
+
+# \- 新增或调整 OV5640 输出尺寸为 480x320
+
+# \- LCD window 改为 480x320
+
+# 
+
+# 要求：
+
+# \- 保留当前稳定的 320x240 QVGA 显示函数
+
+# \- 新增 480x320 显示函数或配置
+
+# \- 不破坏原来的 QVGA 路径
+
+# \- 不修改 SCCB 驱动
+
+# \- 不修改 PCF8574 / PWDN / RESET
+
+# \- 不做画质调参
+
+# \- 不创建 ov5640\_tuning.c/.h
+
+# 
+
+# \## 禁止修改
+
+# 
+
+# 不要修改：
+
+# \- SCCB 底层驱动
+
+# \- PCF8574 / PWDN / RESET
+
+# \- GPIO 引脚
+
+# \- .ioc 文件
+
+# \- SD 卡相关内容
+
+# \- 画质调参相关代码
+
+# 
+
+# 允许查看并少量修改：
+
+# \- OV5640.c
+
+# \- OV5640.h
+
+# \- main.c
+
+# 
+
+# 如果必须修改 OV5640cfg.h，必须说明具体原因，并保留原来的 320x240 配置。
+
