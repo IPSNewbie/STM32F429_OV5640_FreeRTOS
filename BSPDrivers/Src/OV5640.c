@@ -5,6 +5,8 @@
 #include "bsp_sccb.h"
 #include "bsp_log.h"
 #include "ov5640cfg.h"
+
+#define OV5640_480X320_PCLK_DIV_TEST   0x04
 /*
  * 本文件只做“最小可视化调试配置”。
  * 当前目标：RGB565 + QVGA + 测试彩条输出到 DCMI/LCD
@@ -141,6 +143,7 @@ uint8_t OV5640_Min_InitRGB565_QVGA_TestBar(void)
     if (OV5640_Min_EnableTestBar(1)) return 9;
 
     LOG_INFO("OV5640 full table RGB565 QVGA testbar init done");
+    (void)OV5640_Min_ReadBackTimingDebug("QVGA_TESTBAR");
 
     return 0;
 }
@@ -189,6 +192,48 @@ uint8_t OV5640_Min_ReadBackDebug(void)
     // DVP 输出高度低字节
     if (OV5640_Min_ReadReg(0x380B, &val)) return 1;
     LOG_INFO("OV5640 0x380B = 0x%02X", val);
+
+    return 0;
+}
+
+uint8_t OV5640_Min_ReadBackTimingDebug(const char *tag)
+{
+    static const uint16_t regs[] =
+    {
+        0x3034, 0x3035, 0x3036, 0x3037,
+        0x3108,
+        0x3800, 0x3801,
+        0x3802, 0x3803,
+        0x3804, 0x3805,
+        0x3806, 0x3807,
+        0x3808, 0x3809,
+        0x380A, 0x380B,
+        0x380C, 0x380D,
+        0x380E, 0x380F,
+        0x3810, 0x3811,
+        0x3812, 0x3813,
+        0x3814, 0x3815,
+        0x3820, 0x3821,
+        0x3824,
+        0x4741,
+        0x5001
+    };
+    uint8_t val = 0;
+
+    LOG_INFO("OV5640 timing readback begin: %s", tag);
+
+    for (uint32_t i = 0; i < (sizeof(regs) / sizeof(regs[0])); i++)
+    {
+        if (OV5640_Min_ReadReg(regs[i], &val))
+        {
+            LOG_ERROR("OV5640 timing readback failed: %s reg=0x%04X", tag, regs[i]);
+            return 1;
+        }
+
+        LOG_INFO("OV5640 %s reg 0x%04X = 0x%02X", tag, regs[i], val);
+    }
+
+    LOG_INFO("OV5640 timing readback end: %s", tag);
 
     return 0;
 }
@@ -262,7 +307,212 @@ uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void)
      */
     HAL_Delay(200);
 
-    LOG_INFO("OV5640 RGB565 480x320 real image init done");
+    LOG_INFO("OV5640 RGB565 320x240 real image init done");
     
+    return 0;
+}
+
+uint8_t OV5640_Min_InitRGB565_320x320_RealImage(void)
+{
+    uint8_t ret = 0;
+    uint8_t val = 0;
+
+    if (OV5640_Min_CheckID() != 0)
+    {
+        return 1;
+    }
+
+    if (OV5640_Min_WriteTable(ov5640_init_reg_tbl,
+                              sizeof(ov5640_init_reg_tbl) / sizeof(ov5640_init_reg_tbl[0])) != 0)
+    {
+        return 2;
+    }
+    HAL_Delay(50);
+
+    if (OV5640_Min_WriteTable(ov5640_rgb565_reg_tbl,
+                              sizeof(ov5640_rgb565_reg_tbl) / sizeof(ov5640_rgb565_reg_tbl[0])) != 0)
+    {
+        return 3;
+    }
+    HAL_Delay(50);
+
+    if (OV5640_Min_WriteReg(0x3808, 0x01)) return 4;  /* width  = 0x0140 = 320 */
+    if (OV5640_Min_WriteReg(0x3809, 0x40)) return 5;
+
+    if (OV5640_Min_WriteReg(0x380A, 0x01)) return 6;  /* height = 0x0140 = 320 */
+    if (OV5640_Min_WriteReg(0x380B, 0x40)) return 7;
+
+    if (OV5640_Min_WriteReg(0x501F, 0x01)) return 8;
+
+    ret = SCCB_WriteReg(0x4741, 0x00);
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 disable test pattern failed");
+        return 9;
+    }
+
+    HAL_Delay(20);
+
+    ret = SCCB_ReadReg(0x4741, &val);
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 read 0x4741 failed");
+        return 10;
+    }
+
+    LOG_INFO("OV5640 0x4741 = 0x%02X", val);
+
+    ret = SCCB_WriteReg(0x3503, 0x00);
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 enable AEC/AGC failed");
+        return 11;
+    }
+
+    HAL_Delay(200);
+
+    LOG_INFO("OV5640 RGB565 320x320 real image init done");
+
+    return 0;
+}
+
+uint8_t OV5640_Min_InitRGB565_CustomSize_TestBar(uint16_t width, uint16_t height)
+{
+    if (OV5640_Min_CheckID() != 0)
+    {
+        return 1;
+    }
+
+    if (OV5640_Min_WriteTable(ov5640_init_reg_tbl,
+                              sizeof(ov5640_init_reg_tbl) / sizeof(ov5640_init_reg_tbl[0])) != 0)
+    {
+        return 2;
+    }
+    HAL_Delay(50);
+
+    if (OV5640_Min_WriteTable(ov5640_rgb565_reg_tbl,
+                              sizeof(ov5640_rgb565_reg_tbl) / sizeof(ov5640_rgb565_reg_tbl[0])) != 0)
+    {
+        return 3;
+    }
+    HAL_Delay(50);
+
+    if (OV5640_Min_WriteReg(0x3808, (uint8_t)(width >> 8))) return 4;
+    if (OV5640_Min_WriteReg(0x3809, (uint8_t)(width & 0xFF))) return 5;
+
+    if (OV5640_Min_WriteReg(0x380A, (uint8_t)(height >> 8))) return 6;
+    if (OV5640_Min_WriteReg(0x380B, (uint8_t)(height & 0xFF))) return 7;
+
+    if (OV5640_Min_WriteReg(0x501F, 0x01)) return 8;
+
+    if (OV5640_Min_EnableTestBar(1)) return 9;
+
+    LOG_INFO("OV5640 RGB565 custom %ux%u testbar init done", width, height);
+    (void)OV5640_Min_ReadBackTimingDebug("CUSTOM_TESTBAR");
+
+    return 0;
+}
+
+uint8_t OV5640_Min_InitRGB565_480x320_TestBar(void)
+{
+    // 先确认 SCCB 通信和芯片 ID 正常
+    if (OV5640_Min_CheckID() != 0)
+    {
+        return 1;
+    }
+
+    // 1. 写基础初始化表。
+    if (OV5640_Min_WriteTable(ov5640_init_reg_tbl,
+                              sizeof(ov5640_init_reg_tbl) / sizeof(ov5640_init_reg_tbl[0])) != 0)
+    {
+        return 2;
+    }
+    HAL_Delay(50);
+
+    // 2. 写 RGB565 模式表。
+    if (OV5640_Min_WriteTable(ov5640_rgb565_reg_tbl,
+                              sizeof(ov5640_rgb565_reg_tbl) / sizeof(ov5640_rgb565_reg_tbl[0])) != 0)
+    {
+        return 3;
+    }
+    HAL_Delay(50);
+
+    // 3. 覆盖 DVP 输出尺寸为 480x320。
+    if (OV5640_Min_WriteReg(0x3808, 0x01)) return 4;  /* width  = 0x01E0 = 480 */
+    if (OV5640_Min_WriteReg(0x3809, 0xE0)) return 5;
+
+    if (OV5640_Min_WriteReg(0x380A, 0x01)) return 6;  /* height = 0x0140 = 320 */
+    if (OV5640_Min_WriteReg(0x380B, 0x40)) return 7;
+
+    if (OV5640_Min_WriteReg(0x3824, OV5640_480X320_PCLK_DIV_TEST)) return 13;
+
+    // 4. 确保 DVP 输出格式是 RGB565。
+    if (OV5640_Min_WriteReg(0x501F, 0x01)) return 8;
+
+    // 5. 最后开启内部测试彩条。
+    if (OV5640_Min_EnableTestBar(1)) return 9;
+
+    LOG_INFO("OV5640 full table RGB565 480x320 testbar init done");
+    (void)OV5640_Min_ReadBackTimingDebug("480X320_TESTBAR");
+
+    return 0;
+}
+
+uint8_t OV5640_Min_InitRGB565_480x320_RealImage(void)
+{
+    uint8_t ret = 0;
+    uint8_t val = 0;
+
+    /*
+     * 1. 先复用 480x320 RGB565 测试图初始化流程。
+     */
+    ret = OV5640_Min_InitRGB565_480x320_TestBar();
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 RGB565 480x320 base init failed, ret = %d", ret);
+        return ret;
+    }
+
+    /*
+     * 2. 关闭 OV5640 测试图案，切换为真实图像输出。
+     */
+    ret = SCCB_WriteReg(0x4741, 0x00);
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 disable test pattern failed");
+        return 10;
+    }
+
+    HAL_Delay(20);
+
+    /*
+     * 3. 确认测试图案已经关闭。
+     */
+    ret = SCCB_ReadReg(0x4741, &val);
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 read 0x4741 failed");
+        return 11;
+    }
+
+    LOG_INFO("OV5640 0x4741 = 0x%02X", val);
+
+    /*
+     * 4. 确保自动曝光/自动增益打开。
+     */
+    ret = SCCB_WriteReg(0x3503, 0x00);
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 enable AEC/AGC failed");
+        return 12;
+    }
+
+    /*
+     * 5. 等待自动曝光稳定几帧。
+     */
+    HAL_Delay(200);
+
+    LOG_INFO("OV5640 RGB565 480x320 real image init done");
+
     return 0;
 }

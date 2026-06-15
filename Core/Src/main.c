@@ -41,6 +41,12 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define CAMERA_USE_480X320_FULLSCREEN  0
+#define CAMERA_USE_TESTBAR             0
+#define CAMERA_USE_CUSTOM_SIZE_TESTBAR 0
+#define CAMERA_USE_320X320_CENTER_REALIMAGE 1
+#define CAMERA_TEST_WIDTH              320
+#define CAMERA_TEST_HEIGHT             320
 
 /* USER CODE END PD */
 
@@ -158,8 +164,33 @@ int main(void)
   // LOG_INFO("OV5640 testbar init ret = %d", ret);\
 
   //关闭彩条测试，配置 OV5640 输出真实图像
+#if CAMERA_USE_320X320_CENTER_REALIMAGE
+  LCD_MCU_Fill(0, 0, g_lcd_mcu.width, g_lcd_mcu.height, LCD_COLOR_BLACK);
+  uint8_t ret = OV5640_Min_InitRGB565_320x320_RealImage();
+  LOG_INFO("OV5640 320x320 centered real image init ret = %d", ret);
+#elif CAMERA_USE_CUSTOM_SIZE_TESTBAR
+  uint8_t ret = OV5640_Min_InitRGB565_CustomSize_TestBar(CAMERA_TEST_WIDTH, CAMERA_TEST_HEIGHT);
+  LOG_INFO("OV5640 custom %ux%u testbar init ret = %d",
+           CAMERA_TEST_WIDTH, CAMERA_TEST_HEIGHT, ret);
+#else
+#if CAMERA_USE_480X320_FULLSCREEN
+#if CAMERA_USE_TESTBAR
+  uint8_t ret = OV5640_Min_InitRGB565_480x320_TestBar();
+  LOG_INFO("OV5640 480x320 testbar init ret = %d", ret);
+#else
+  uint8_t ret = OV5640_Min_InitRGB565_480x320_RealImage();
+  LOG_INFO("OV5640 480x320 real image init ret = %d", ret);
+#endif
+#else
+#if CAMERA_USE_TESTBAR
+  uint8_t ret = OV5640_Min_InitRGB565_QVGA_TestBar();
+  LOG_INFO("OV5640 320x240 testbar init ret = %d", ret);
+#else
   uint8_t ret = OV5640_Min_InitRGB565_QVGA_RealImage();
-  LOG_INFO("OV5640 real image init ret = %d", ret);
+  LOG_INFO("OV5640 320x240 real image init ret = %d", ret);
+#endif
+#endif
+#endif
   /*
    * 7. 初始化 DCMI
    */
@@ -174,7 +205,17 @@ int main(void)
    * 9. 设置 LCD 显示窗口，并启动 DCMI 捕获
    *    QVGA 320x240 显示在屏幕左上角
    */
+#if CAMERA_USE_320X320_CENTER_REALIMAGE
+  Camera_DCMI_StartToLCD(80, 0, 320, 320);
+#elif CAMERA_USE_CUSTOM_SIZE_TESTBAR
+  Camera_DCMI_StartToLCD(0, 0, CAMERA_TEST_WIDTH, CAMERA_TEST_HEIGHT);
+#else
+#if CAMERA_USE_480X320_FULLSCREEN
+  Camera_DCMI_StartToLCD(0, 0, 480, 320);
+#else
   Camera_DCMI_StartToLCD(0, 0, 320, 240);
+#endif
+#endif
   HAL_Delay(100);
 
   LOG_INFO("DCMI CR   = 0x%08lX", DCMI->CR);
