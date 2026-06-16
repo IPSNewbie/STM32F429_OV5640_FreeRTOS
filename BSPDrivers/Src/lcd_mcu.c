@@ -24,6 +24,9 @@ LCD_MCU_Device_t g_lcd_mcu = {0};        // LCD 全局参数结构体，保存 I
 
 static SRAM_HandleTypeDef s_lcd_sram;    // FMC SRAM 句柄，LCD 在 STM32 里按外部 SRAM 方式访问
 
+#define LCD_MCU_WRITE_ADDRESS_SETUP       6
+#define LCD_MCU_WRITE_DATA_SETUP          6
+
 /* ---------------- low level ---------------- */
 
 void LCD_MCU_WriteReg(uint16_t reg)
@@ -162,6 +165,35 @@ static void LCD_MCU_GPIO_FMC_Init(void)
     HAL_Delay(50);                                       // 等待 LCD/FMC 时序稳定
 }
 
+static void LCD_MCU_ApplyFastWriteTimingIfNeeded(void)
+{
+    FMC_NORSRAM_TimingTypeDef timing_write = {0};
+
+    if (g_lcd_mcu.id != LCD_MCU_ID_NT35310)
+    {
+        return;
+    }
+
+    /*
+     * NT35310 write timing for DCMI-DMA direct write to LCD GRAM.
+     * 15/15 and 10/10 produced snow at 480x320.
+     * 8/8, 6/6, 4/4 and 3/3 were verified stable.
+     * Use 6/6 as the stable default.
+     */
+    timing_write.AddressSetupTime = LCD_MCU_WRITE_ADDRESS_SETUP;
+    timing_write.AddressHoldTime = 0;
+    timing_write.DataSetupTime = LCD_MCU_WRITE_DATA_SETUP;
+    timing_write.BusTurnAroundDuration = 0;
+    timing_write.CLKDivision = 2;
+    timing_write.DataLatency = 2;
+    timing_write.AccessMode = FMC_ACCESS_MODE_A;
+
+    (void)FMC_NORSRAM_Extended_Timing_Init(s_lcd_sram.Extended,
+                                           &timing_write,
+                                           s_lcd_sram.Init.NSBank,
+                                           s_lcd_sram.Init.ExtendedMode);
+}
+
 /* ---------------- ID ---------------- */
 
 uint16_t LCD_MCU_ReadID(void)
@@ -252,6 +284,7 @@ void LCD_MCU_Init(void)
     g_lcd_mcu.id = id;                                    // 保存读到的 LCD ID
 
     LCD_MCU_NT35310_RegInit();                            // 执行 NT35310 厂家初始化序列
+    LCD_MCU_ApplyFastWriteTimingIfNeeded();               // Apply verified fast write timing for NT35310.
     LCD_MCU_DisplayDir(1);                                // 设置为横屏，480x320
 
     LCD_MCU_Fill(0, 0, g_lcd_mcu.width, g_lcd_mcu.height, LCD_COLOR_WHITE); // 初始化完成后清白屏

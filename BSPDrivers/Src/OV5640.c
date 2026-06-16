@@ -6,7 +6,6 @@
 #include "bsp_log.h"
 #include "ov5640cfg.h"
 
-#define OV5640_480X320_PCLK_DIV_TEST   0x04
 /*
  * 本文件只做“最小可视化调试配置”。
  * 当前目标：RGB565 + QVGA + 测试彩条输出到 DCMI/LCD
@@ -90,6 +89,53 @@ uint8_t OV5640_Min_EnableTestBar(uint8_t enable)
     // bit[0] = 1：选择 8-bit 测试图输出
     // 0x05 = bit[2] + bit[0]
     return OV5640_Min_WriteReg(0x4741, enable ? 0x05 : 0x00);
+}
+
+// Set the scaled DVP output size and ISP offset.
+uint8_t OV5640_Min_OutSize_Set(uint16_t offx, uint16_t offy, uint16_t width, uint16_t height)
+{
+    if (SCCB_WriteReg(0x3212, 0x03) != 0) return 1;
+
+    if (SCCB_WriteReg(0x3808, (uint8_t)(width >> 8)) != 0) return 2;
+    if (SCCB_WriteReg(0x3809, (uint8_t)(width & 0xFF)) != 0) return 3;
+    if (SCCB_WriteReg(0x380A, (uint8_t)(height >> 8)) != 0) return 4;
+    if (SCCB_WriteReg(0x380B, (uint8_t)(height & 0xFF)) != 0) return 5;
+
+    if (SCCB_WriteReg(0x3810, (uint8_t)(offx >> 8)) != 0) return 6;
+    if (SCCB_WriteReg(0x3811, (uint8_t)(offx & 0xFF)) != 0) return 7;
+    if (SCCB_WriteReg(0x3812, (uint8_t)(offy >> 8)) != 0) return 8;
+    if (SCCB_WriteReg(0x3813, (uint8_t)(offy & 0xFF)) != 0) return 9;
+
+    if (SCCB_WriteReg(0x3212, 0x13) != 0) return 10;
+    if (SCCB_WriteReg(0x3212, 0xA3) != 0) return 11;
+
+    return 0;
+}
+
+// Set the sensor/ISP image window used before output scaling.
+uint8_t OV5640_Min_ImageWindow_Set(uint16_t offx, uint16_t offy, uint16_t width, uint16_t height)
+{
+    uint16_t xst = offx;
+    uint16_t yst = offy;
+    uint16_t xend = offx + width - 1;
+    uint16_t yend = offy + height - 1;
+
+    if (SCCB_WriteReg(0x3212, 0x03) != 0) return 1;
+
+    if (SCCB_WriteReg(0x3800, (uint8_t)(xst >> 8)) != 0) return 2;
+    if (SCCB_WriteReg(0x3801, (uint8_t)(xst & 0xFF)) != 0) return 3;
+    if (SCCB_WriteReg(0x3802, (uint8_t)(yst >> 8)) != 0) return 4;
+    if (SCCB_WriteReg(0x3803, (uint8_t)(yst & 0xFF)) != 0) return 5;
+
+    if (SCCB_WriteReg(0x3804, (uint8_t)(xend >> 8)) != 0) return 6;
+    if (SCCB_WriteReg(0x3805, (uint8_t)(xend & 0xFF)) != 0) return 7;
+    if (SCCB_WriteReg(0x3806, (uint8_t)(yend >> 8)) != 0) return 8;
+    if (SCCB_WriteReg(0x3807, (uint8_t)(yend & 0xFF)) != 0) return 9;
+
+    if (SCCB_WriteReg(0x3212, 0x13) != 0) return 10;
+    if (SCCB_WriteReg(0x3212, 0xA3) != 0) return 11;
+
+    return 0;
 }
 
 // 初始化 OV5640 为 RGB565 + QVGA + 测试彩条
@@ -312,107 +358,6 @@ uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void)
     return 0;
 }
 
-uint8_t OV5640_Min_InitRGB565_320x320_RealImage(void)
-{
-    uint8_t ret = 0;
-    uint8_t val = 0;
-
-    if (OV5640_Min_CheckID() != 0)
-    {
-        return 1;
-    }
-
-    if (OV5640_Min_WriteTable(ov5640_init_reg_tbl,
-                              sizeof(ov5640_init_reg_tbl) / sizeof(ov5640_init_reg_tbl[0])) != 0)
-    {
-        return 2;
-    }
-    HAL_Delay(50);
-
-    if (OV5640_Min_WriteTable(ov5640_rgb565_reg_tbl,
-                              sizeof(ov5640_rgb565_reg_tbl) / sizeof(ov5640_rgb565_reg_tbl[0])) != 0)
-    {
-        return 3;
-    }
-    HAL_Delay(50);
-
-    if (OV5640_Min_WriteReg(0x3808, 0x01)) return 4;  /* width  = 0x0140 = 320 */
-    if (OV5640_Min_WriteReg(0x3809, 0x40)) return 5;
-
-    if (OV5640_Min_WriteReg(0x380A, 0x01)) return 6;  /* height = 0x0140 = 320 */
-    if (OV5640_Min_WriteReg(0x380B, 0x40)) return 7;
-
-    if (OV5640_Min_WriteReg(0x501F, 0x01)) return 8;
-
-    ret = SCCB_WriteReg(0x4741, 0x00);
-    if (ret != 0)
-    {
-        LOG_ERROR("OV5640 disable test pattern failed");
-        return 9;
-    }
-
-    HAL_Delay(20);
-
-    ret = SCCB_ReadReg(0x4741, &val);
-    if (ret != 0)
-    {
-        LOG_ERROR("OV5640 read 0x4741 failed");
-        return 10;
-    }
-
-    LOG_INFO("OV5640 0x4741 = 0x%02X", val);
-
-    ret = SCCB_WriteReg(0x3503, 0x00);
-    if (ret != 0)
-    {
-        LOG_ERROR("OV5640 enable AEC/AGC failed");
-        return 11;
-    }
-
-    HAL_Delay(200);
-
-    LOG_INFO("OV5640 RGB565 320x320 real image init done");
-
-    return 0;
-}
-
-uint8_t OV5640_Min_InitRGB565_CustomSize_TestBar(uint16_t width, uint16_t height)
-{
-    if (OV5640_Min_CheckID() != 0)
-    {
-        return 1;
-    }
-
-    if (OV5640_Min_WriteTable(ov5640_init_reg_tbl,
-                              sizeof(ov5640_init_reg_tbl) / sizeof(ov5640_init_reg_tbl[0])) != 0)
-    {
-        return 2;
-    }
-    HAL_Delay(50);
-
-    if (OV5640_Min_WriteTable(ov5640_rgb565_reg_tbl,
-                              sizeof(ov5640_rgb565_reg_tbl) / sizeof(ov5640_rgb565_reg_tbl[0])) != 0)
-    {
-        return 3;
-    }
-    HAL_Delay(50);
-
-    if (OV5640_Min_WriteReg(0x3808, (uint8_t)(width >> 8))) return 4;
-    if (OV5640_Min_WriteReg(0x3809, (uint8_t)(width & 0xFF))) return 5;
-
-    if (OV5640_Min_WriteReg(0x380A, (uint8_t)(height >> 8))) return 6;
-    if (OV5640_Min_WriteReg(0x380B, (uint8_t)(height & 0xFF))) return 7;
-
-    if (OV5640_Min_WriteReg(0x501F, 0x01)) return 8;
-
-    if (OV5640_Min_EnableTestBar(1)) return 9;
-
-    LOG_INFO("OV5640 RGB565 custom %ux%u testbar init done", width, height);
-    (void)OV5640_Min_ReadBackTimingDebug("CUSTOM_TESTBAR");
-
-    return 0;
-}
-
 uint8_t OV5640_Min_InitRGB565_480x320_TestBar(void)
 {
     // 先确认 SCCB 通信和芯片 ID 正常
@@ -437,19 +382,16 @@ uint8_t OV5640_Min_InitRGB565_480x320_TestBar(void)
     }
     HAL_Delay(50);
 
-    // 3. 覆盖 DVP 输出尺寸为 480x320。
-    if (OV5640_Min_WriteReg(0x3808, 0x01)) return 4;  /* width  = 0x01E0 = 480 */
-    if (OV5640_Min_WriteReg(0x3809, 0xE0)) return 5;
+    // 3. Keep the RGB565 table's default full image window.
+    if (OV5640_Min_ImageWindow_Set(0, 0, 0x0A40, 0x06AA)) return 4;
 
-    if (OV5640_Min_WriteReg(0x380A, 0x01)) return 6;  /* height = 0x0140 = 320 */
-    if (OV5640_Min_WriteReg(0x380B, 0x40)) return 7;
+    // 4. 覆盖 DVP 输出尺寸为 480x320。
+    if (OV5640_Min_OutSize_Set(4, 0, 480, 320)) return 5;
 
-    if (OV5640_Min_WriteReg(0x3824, OV5640_480X320_PCLK_DIV_TEST)) return 13;
-
-    // 4. 确保 DVP 输出格式是 RGB565。
+    // 5. 确保 DVP 输出格式是 RGB565。
     if (OV5640_Min_WriteReg(0x501F, 0x01)) return 8;
 
-    // 5. 最后开启内部测试彩条。
+    // 6. 最后开启内部测试彩条。
     if (OV5640_Min_EnableTestBar(1)) return 9;
 
     LOG_INFO("OV5640 full table RGB565 480x320 testbar init done");
@@ -471,6 +413,13 @@ uint8_t OV5640_Min_InitRGB565_480x320_RealImage(void)
     {
         LOG_ERROR("OV5640 RGB565 480x320 base init failed, ret = %d", ret);
         return ret;
+    }
+
+    ret = OV5640_Min_OutSize_Set(4, 0, 480, 320);
+    if (ret != 0)
+    {
+        LOG_ERROR("OV5640 480x320 outsize set failed, ret = %d", ret);
+        return 13;
     }
 
     /*
