@@ -167,27 +167,44 @@ static void LCD_MCU_GPIO_FMC_Init(void)
 
 static void LCD_MCU_ApplyFastWriteTimingIfNeeded(void)
 {
+    // 定义一个写时序配置结构体并初始化为零
     FMC_NORSRAM_TimingTypeDef timing_write = {0};
 
+    // 仅对 NT35310 型号应用快速写时序，其他液晶驱动直接返回
     if (g_lcd_mcu.id != LCD_MCU_ID_NT35310)
     {
         return;
     }
 
     /*
-     * NT35310 write timing for DCMI-DMA direct write to LCD GRAM.
-     * 15/15 and 10/10 produced snow at 480x320.
-     * 8/8, 6/6, 4/4 and 3/3 were verified stable.
-     * Use 6/6 as the stable default.
+     * NT35310 写时序，用于 DCMI-DMA 直接写入 LCD GRAM。
+     * 测试记录：15/15 和 10/10 在 480x320 下出现雪花，
+     * 8/8、6/6、4/4、3/3 均稳定，选用 6/6 作为默认值。
      */
+
+    // 写地址建立时间（由宏 LCD_MCU_WRITE_ADDRESS_SETUP 指定，例如 6）=(6+1)×5.56≈38.9ns
     timing_write.AddressSetupTime = LCD_MCU_WRITE_ADDRESS_SETUP;
+
+    // 地址保持时间设为 0=(0+1)×5.56=5.56ns
     timing_write.AddressHoldTime = 0;
+
+    // 写数据建立时间（由宏 LCD_MCU_WRITE_DATA_SETUP 指定，例如 6）=(6+1)×5.56≈38.9ns
     timing_write.DataSetupTime = LCD_MCU_WRITE_DATA_SETUP;
+
+    // 总线周转时间设为 0=(0+1)×5.56=5.56ns
     timing_write.BusTurnAroundDuration = 0;
+
+    // FMC 时钟分频系数，影响读写速度
     timing_write.CLKDivision = 2;
+
+    // 数据延迟周期数
     timing_write.DataLatency = 2;
+
+    // 访问模式设为模式 A
     timing_write.AccessMode = FMC_ACCESS_MODE_A;
 
+    // 将上述写时序配置写入 FMC 的扩展模式寄存器，
+    // 作用于当前 LCD 所映射到的存储块和扩展模式。
     (void)FMC_NORSRAM_Extended_Timing_Init(s_lcd_sram.Extended,
                                            &timing_write,
                                            s_lcd_sram.Init.NSBank,
