@@ -29,6 +29,9 @@ uint8_t OV5640_Min_ImageWindow_Set(uint16_t offx, uint16_t offy, uint16_t width,
 //关闭彩条测试，输出传感器图像至LCD
 uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void);
 
+uint8_t OV5640_Min_InitRGB565_160x120_TestBar(void);
+uint8_t OV5640_Min_InitRGB565_160x120_RealImage(void);
+
 uint8_t OV5640_Min_InitRGB565_480x320_TestBar(void);
 uint8_t OV5640_Min_InitRGB565_480x320_RealImage(void);
 #endif // ISP_OV5640_OV5640_H

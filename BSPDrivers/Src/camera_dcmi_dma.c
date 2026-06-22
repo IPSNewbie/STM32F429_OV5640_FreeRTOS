@@ -8,6 +8,9 @@
 DCMI_HandleTypeDef g_camera_dcmi;   // 定义DCMI句柄
 DMA_HandleTypeDef  g_camera_dma;    // 定义DCMI使用的DMA句柄
 
+static volatile uint8_t s_camera_snapshot_active = 0U;
+static volatile uint8_t s_camera_snapshot_done = 0U;
+
 /*
  * Apollo V2 + OV5640 fixed DCMI pins:
  * D0=PC6, D1=PC7, D2=PC8, D3=PC9, D4=PC11, D5=PD3, D6=PB8, D7=PB9
@@ -70,6 +73,69 @@ void Camera_DCMI_Init(void)        // 初始化DCMI外设
 
     HAL_NVIC_SetPriority(DCMI_IRQn, 2, 2);  // 设置DCMI中断优先级
     HAL_NVIC_EnableIRQ(DCMI_IRQn);          // 使能DCMI中断
+}
+
+uint8_t Camera_DCMI_StartSnapshotToBuffer(uint32_t buffer_addr, uint32_t word_count)
+{
+    if ((buffer_addr == 0U) || ((buffer_addr & 0x3U) != 0U) || (word_count == 0U))
+    {
+        return 1U;
+    }
+
+    __HAL_RCC_DMA2_CLK_ENABLE();
+
+    g_camera_dma.Instance = DMA2_Stream1;
+    g_camera_dma.Init.Channel = DMA_CHANNEL_1;
+    g_camera_dma.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    g_camera_dma.Init.PeriphInc = DMA_PINC_DISABLE;
+    g_camera_dma.Init.MemInc = DMA_MINC_ENABLE;
+    g_camera_dma.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    g_camera_dma.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    g_camera_dma.Init.Mode = DMA_NORMAL;
+    g_camera_dma.Init.Priority = DMA_PRIORITY_HIGH;
+    g_camera_dma.Init.FIFOMode = DMA_FIFOMODE_ENABLE;
+    g_camera_dma.Init.FIFOThreshold = DMA_FIFO_THRESHOLD_HALFFULL;
+    g_camera_dma.Init.MemBurst = DMA_MBURST_SINGLE;
+    g_camera_dma.Init.PeriphBurst = DMA_PBURST_SINGLE;
+
+    if (HAL_DMA_DeInit(&g_camera_dma) != HAL_OK)
+    {
+        return 2U;
+    }
+
+    if (HAL_DMA_Init(&g_camera_dma) != HAL_OK)
+    {
+        return 3U;
+    }
+
+    __HAL_LINKDMA(&g_camera_dcmi, DMA_Handle, g_camera_dma);
+
+    HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 2, 1);
+    HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
+
+    s_camera_snapshot_done = 0U;
+    s_camera_snapshot_active = 1U;
+
+    if (HAL_DCMI_Start_DMA(&g_camera_dcmi,
+                           DCMI_MODE_SNAPSHOT,
+                           buffer_addr,
+                           word_count) != HAL_OK)
+    {
+        s_camera_snapshot_active = 0U;
+        return 4U;
+    }
+
+    return 0U;
+}
+
+uint8_t Camera_DCMI_IsSnapshotDone(void)
+{
+    return s_camera_snapshot_done;
+}
+
+void Camera_DCMI_ClearSnapshotDone(void)
+{
+    s_camera_snapshot_done = 0U;
 }
 
 void Camera_DCMI_DMA_ConfigToLCD(uint32_t lcd_ram_addr)  // 配置DMA把DCMI数据搬到LCD
@@ -142,6 +208,13 @@ void DMA2_Stream1_IRQHandler(void)  // DMA2_Stream1中断服务函数
 
 void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)  // DCMI帧中断回调
 {
+    if (s_camera_snapshot_active != 0U)
+    {
+        s_camera_snapshot_active = 0U;
+        s_camera_snapshot_done = 1U;
+        return;
+    }
+
     // LOG_INFO("DCMI frame");  // 调试用：打印收到一帧
 
     (void)hdcmi;  // 避免未使用参数警告

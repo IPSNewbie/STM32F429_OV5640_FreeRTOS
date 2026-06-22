@@ -31,6 +31,7 @@
 #include "bsp_sccb.h"
 #include "lcd_mcu.h"
 #include "camera_dcmi_dma.h"
+#include "camera_pc_dump.h"
 #include "OV5640.h"
 /* USER CODE END Includes */
 
@@ -44,8 +45,10 @@
 #define CAMERA_MODE_480X320_REAL       0
 #define CAMERA_MODE_480X320_TESTBAR    1
 #define CAMERA_MODE_320X240_REAL       2
+#define CAMERA_MODE_PC_DUMP_RGB565     3
 
 #define CAMERA_MODE                    CAMERA_MODE_480X320_REAL
+#define PC_DUMP_USE_REAL_IMAGE         0U
 
 /* USER CODE END PD */
 
@@ -151,15 +154,19 @@ int main(void)
   /*
     * 5. LCD 初始化，本地彩条验证
     */
+#if CAMERA_MODE != CAMERA_MODE_PC_DUMP_RGB565
   LCD_MCU_Init();
   //关闭LCD彩条测试
   // LCD_MCU_TestSequence();
   HAL_Delay(1000);
+#endif
 
   /*
    * 6. Configure OV5640 output mode.
    */
-#if CAMERA_MODE == CAMERA_MODE_480X320_REAL
+#if CAMERA_MODE == CAMERA_MODE_PC_DUMP_RGB565
+  /* OV5640 initialization is deferred until the host sends DUMP. */
+#elif CAMERA_MODE == CAMERA_MODE_480X320_REAL
   uint8_t ret = OV5640_Min_InitRGB565_480x320_RealImage();
   LOG_INFO("OV5640 480x320 real image init ret = %d", ret);
 #elif CAMERA_MODE == CAMERA_MODE_480X320_TESTBAR
@@ -174,11 +181,83 @@ int main(void)
   /*
    * 7. 初始化 DCMI
    */
+#if CAMERA_MODE != CAMERA_MODE_PC_DUMP_RGB565
   Camera_DCMI_Init();
+#endif
 
   /*
    * 8. 配置 DMA：DCMI 数据直接写 LCD GRAM
    */
+#if CAMERA_MODE == CAMERA_MODE_PC_DUMP_RGB565
+  uint32_t pc_dump_frame_id = 1U;
+
+  LOG_RAW("[PC_DUMP] ready, send DUMP to capture frame\r\n");
+
+  while (1)
+  {
+    uint8_t camera_ret;
+    uint8_t snapshot_ret;
+    uint8_t dump_ret;
+    uint32_t snapshot_start_tick;
+
+    (void)Camera_PC_Dump_WaitForDumpCommand(&huart1);
+
+#if PC_DUMP_USE_REAL_IMAGE
+    camera_ret = OV5640_Min_InitRGB565_160x120_RealImage();
+#else
+    camera_ret = OV5640_Min_InitRGB565_160x120_TestBar();
+#endif
+    if (camera_ret != 0U)
+    {
+      LOG_ERROR("OV5640 160x120 init failed, ret = %u", camera_ret);
+      continue;
+    }
+
+    Camera_DCMI_Init();
+    Camera_DCMI_ClearSnapshotDone();
+
+    snapshot_ret = Camera_DCMI_StartSnapshotToBuffer(
+        Camera_PC_Dump_GetBufferAddress(),
+        Camera_PC_Dump_GetWordCount());
+    if (snapshot_ret != 0U)
+    {
+      Camera_DCMI_Stop();
+      LOG_ERROR("DCMI snapshot start failed, ret = %u", snapshot_ret);
+      continue;
+    }
+
+    snapshot_start_tick = HAL_GetTick();
+    while (Camera_DCMI_IsSnapshotDone() == 0U)
+    {
+      if ((HAL_GetTick() - snapshot_start_tick) > 3000U)
+      {
+        break;
+      }
+    }
+
+    if (Camera_DCMI_IsSnapshotDone() == 0U)
+    {
+      Camera_DCMI_Stop();
+      LOG_ERROR("DCMI snapshot timeout");
+      continue;
+    }
+
+    Camera_DCMI_Stop();
+
+    log_set_level(LOG_LEVEL_NONE);
+    dump_ret = Camera_PC_Dump_SendFrame(&huart1, pc_dump_frame_id);
+    log_set_level(LOG_LEVEL_DEBUG);
+
+    if (dump_ret != 0U)
+    {
+      LOG_ERROR("PC RGB565 frame send failed, ret = %u", dump_ret);
+      continue;
+    }
+
+    LOG_RAW("[PC_DUMP] done\r\n");
+    pc_dump_frame_id++;
+  }
+#else
   Camera_DCMI_DMA_ConfigToLCD((uint32_t)LCD_MCU_GetRAMAddress());
 
   /*
@@ -191,6 +270,7 @@ int main(void)
 #else
 #error "Unsupported CAMERA_MODE"
 #endif
+#endif /* CAMERA_MODE_PC_DUMP_RGB565 */
   HAL_Delay(100);
 
   LOG_INFO("DCMI CR   = 0x%08lX", DCMI->CR);

@@ -358,6 +358,54 @@ uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void)
     return 0;
 }
 
+uint8_t OV5640_Min_InitRGB565_160x120_TestBar(void)
+{
+    uint8_t ret = OV5640_Min_InitRGB565_QVGA_TestBar();
+
+    if (ret != 0U)
+    {
+        return ret;
+    }
+
+    ret = OV5640_Min_OutSize_Set(4U, 0U, 160U, 120U);
+    if (ret != 0U)
+    {
+        LOG_ERROR("OV5640 160x120 outsize set failed, ret = %d", ret);
+        return 10U;
+    }
+
+    LOG_INFO("OV5640 RGB565 160x120 testbar init done");
+    return 0U;
+}
+
+uint8_t OV5640_Min_InitRGB565_160x120_RealImage(void)
+{
+    uint8_t ret = OV5640_Min_InitRGB565_160x120_TestBar();
+
+    if (ret != 0U)
+    {
+        return ret;
+    }
+
+    ret = OV5640_Min_EnableTestBar(0U);
+    if (ret != 0U)
+    {
+        LOG_ERROR("OV5640 disable 160x120 test pattern failed");
+        return 11U;
+    }
+
+    ret = OV5640_Min_WriteReg(0x3503U, 0x00U);
+    if (ret != 0U)
+    {
+        LOG_ERROR("OV5640 enable 160x120 AEC/AGC failed");
+        return 12U;
+    }
+
+    HAL_Delay(200U);
+    LOG_INFO("OV5640 RGB565 160x120 real image init done");
+    return 0U;
+}
+
 uint8_t OV5640_Min_InitRGB565_480x320_TestBar(void)
 {
     // 先确认 SCCB 通信和芯片 ID 正常

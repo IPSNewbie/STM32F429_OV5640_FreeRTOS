@@ -30,6 +30,11 @@ void Camera_DCMI_GPIO_Init(void);
  */
 void Camera_DCMI_Init(void);
 
+/* Capture exactly one frame from DCMI into a word-aligned SRAM buffer. */
+uint8_t Camera_DCMI_StartSnapshotToBuffer(uint32_t buffer_addr, uint32_t word_count);
+uint8_t Camera_DCMI_IsSnapshotDone(void);
+void Camera_DCMI_ClearSnapshotDone(void);
+
 /* 配置 DMA，让 DCMI 接收到的数据直接写入 LCD GRAM
  * lcd_ram_addr 是 LCD 数据口地址，例如：
  * (uint32_t)LCD_MCU_GetRAMAddress()
