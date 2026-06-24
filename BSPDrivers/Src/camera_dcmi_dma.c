@@ -75,70 +75,89 @@ void Camera_DCMI_Init(void)        // 初始化DCMI外设
     HAL_NVIC_EnableIRQ(DCMI_IRQn);          // 使能DCMI中断
 }
 
+//启动 DCMI 快照，将一帧图像通过 DMA 保存到内存缓冲区
 uint8_t Camera_DCMI_StartSnapshotToBuffer(uint32_t buffer_addr, uint32_t word_count)
 {
+    // 检查缓冲区地址非空、4 字节对齐，且传输数量不为 0
     if ((buffer_addr == 0U) || ((buffer_addr & 0x3U) != 0U) || (word_count == 0U))
     {
         return 1U;
     }
 
-    __HAL_RCC_DMA2_CLK_ENABLE();
+    __HAL_RCC_DMA2_CLK_ENABLE();  // 使能 DMA2 时钟
 
-    g_camera_dma.Instance = DMA2_Stream1;
-    g_camera_dma.Init.Channel = DMA_CHANNEL_1;
-    g_camera_dma.Init.Direction = DMA_PERIPH_TO_MEMORY;
-    g_camera_dma.Init.PeriphInc = DMA_PINC_DISABLE;
-    g_camera_dma.Init.MemInc = DMA_MINC_ENABLE;
-    g_camera_dma.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
-    g_camera_dma.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
-    g_camera_dma.Init.Mode = DMA_NORMAL;
-    g_camera_dma.Init.Priority = DMA_PRIORITY_HIGH;
-    g_camera_dma.Init.FIFOMode = DMA_FIFOMODE_ENABLE;
-    g_camera_dma.Init.FIFOThreshold = DMA_FIFO_THRESHOLD_HALFFULL;
-    g_camera_dma.Init.MemBurst = DMA_MBURST_SINGLE;
-    g_camera_dma.Init.PeriphBurst = DMA_PBURST_SINGLE;
+    g_camera_dma.Instance = DMA2_Stream1;                 // 选择 DMA2 数据流 1
+    g_camera_dma.Init.Channel = DMA_CHANNEL_1;            // 选择 DMA 通道 1，对应 DCMI 请求
+    g_camera_dma.Init.Direction = DMA_PERIPH_TO_MEMORY;   // 数据方向：外设到内存
+    g_camera_dma.Init.PeriphInc = DMA_PINC_DISABLE;       // 外设地址不递增，固定读 DCMI->DR
 
+    /* 关键点：
+     * 目标是内存缓冲区，需要依次填充，因此地址必须递增。
+     * DCMI->DR 是 32 位寄存器，为了一次性接收两个 RGB565 像素并保证效率，
+     * 外设和内存数据宽度都设为 WORD。
+     */
+    g_camera_dma.Init.MemInc = DMA_MINC_ENABLE;              // 目标地址递增，按字填充缓冲区
+    g_camera_dma.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;     // 外设数据宽度：32 位
+    g_camera_dma.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;        // 内存数据宽度：32 位
+    g_camera_dma.Init.Mode = DMA_NORMAL;                     // DMA 正常模式，传输指定字数后停止
+    g_camera_dma.Init.Priority = DMA_PRIORITY_HIGH;          // 设置 DMA 高优先级
+    g_camera_dma.Init.FIFOMode = DMA_FIFOMODE_ENABLE;        // 使能 DMA FIFO
+    g_camera_dma.Init.FIFOThreshold = DMA_FIFO_THRESHOLD_HALFFULL;  // FIFO 半满触发传输
+    g_camera_dma.Init.MemBurst = DMA_MBURST_SINGLE;          // 内存单次突发
+    g_camera_dma.Init.PeriphBurst = DMA_PBURST_SINGLE;       // 外设单次突发
+
+    // 先反初始化 DMA，清除可能残留的旧配置
     if (HAL_DMA_DeInit(&g_camera_dma) != HAL_OK)
     {
         return 2U;
     }
 
+    // 初始化 DMA
     if (HAL_DMA_Init(&g_camera_dma) != HAL_OK)
     {
         return 3U;
     }
 
-    __HAL_LINKDMA(&g_camera_dcmi, DMA_Handle, g_camera_dma);
+    __HAL_LINKDMA(&g_camera_dcmi, DMA_Handle, g_camera_dma);  // 把 DMA 句柄绑定到 DCMI 句柄
 
-    HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 2, 1);
-    HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
+    // 配置并使能 DMA 传输完成中断，用于通知 CPU 一帧接收完毕
+    HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 2, 1);   // 设置中断优先级
+    HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);           // 使能 DMA 中断
 
-    s_camera_snapshot_done = 0U;
-    s_camera_snapshot_active = 1U;
+    s_camera_snapshot_done = 0U;      // 复位快照完成标志
+    s_camera_snapshot_active = 1U;    // 置位快照进行标志
 
+    /*
+     * 启动 DCMI 快照模式，DCMI 会自动打开 DMA 请求。
+     * 传输长度为 word_count，DMA 将 DCMI->DR 中的数据逐字搬入 buffer_addr 开始的缓冲区。
+     * 当传输达到 word_count 次后，DMA 自动停止并触发完成中断。
+     */
     if (HAL_DCMI_Start_DMA(&g_camera_dcmi,
                            DCMI_MODE_SNAPSHOT,
                            buffer_addr,
                            word_count) != HAL_OK)
     {
-        s_camera_snapshot_active = 0U;
+        s_camera_snapshot_active = 0U;   // 启动失败，清除活动标志
         return 4U;
     }
 
     return 0U;
 }
 
+//查询 DCMI 快照是否传输完成
 uint8_t Camera_DCMI_IsSnapshotDone(void)
 {
     return s_camera_snapshot_done;
 }
 
+//清除快照完成标志
 void Camera_DCMI_ClearSnapshotDone(void)
 {
-    s_camera_snapshot_done = 0U;
+    s_camera_snapshot_done = 0U;   // 复位标志，表示未完成
 }
 
-void Camera_DCMI_DMA_ConfigToLCD(uint32_t lcd_ram_addr)  // 配置DMA把DCMI数据搬到LCD
+// 配置DMA把DCMI数据搬到LCD
+void Camera_DCMI_DMA_ConfigToLCD(uint32_t lcd_ram_addr)
 {
     __HAL_RCC_DMA2_CLK_ENABLE();  // 使能DMA2时钟
 
@@ -180,7 +199,8 @@ void Camera_DCMI_DMA_ConfigToLCD(uint32_t lcd_ram_addr)  // 配置DMA把DCMI数�
                   1);                   // 传输长度，即传输计数器为1个单位
 }
 
-void Camera_DCMI_StartToLCD(uint16_t x, uint16_t y, uint16_t w, uint16_t h)  // 启动DCMI采集并显示到LCD
+// 启动DCMI采集并显示到LCD
+void Camera_DCMI_StartToLCD(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
     LCD_MCU_SetWindow(x, y, w, h);  // 设置LCD显示窗口
     LCD_MCU_BeginWriteGRAM();       // 发送LCD写GRAM命令

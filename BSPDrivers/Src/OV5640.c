@@ -8,7 +8,7 @@
 
 /*
  * 本文件只做“最小可视化调试配置”。
- * 当前目标：RGB565 + QVGA + 测试彩条输出到 DCMI/LCD
+ * 当前目标：RGB565 + QVGA/480x320/320x240/160x120 + 彩条/RealImage
  * 复杂画质、曝光、AWB、AF 后面再接完整寄存器表。
  */
 
@@ -91,52 +91,70 @@ uint8_t OV5640_Min_EnableTestBar(uint8_t enable)
     return OV5640_Min_WriteReg(0x4741, enable ? 0x05 : 0x00);
 }
 
-// Set the scaled DVP output size and ISP offset.
+// 设置缩放后的 DVP 输出尺寸和 ISP 偏移
 uint8_t OV5640_Min_OutSize_Set(uint16_t offx, uint16_t offy, uint16_t width, uint16_t height)
 {
+    // 配置 ISP 控制寄存器，允许修改相关参数（解锁写保护）
     if (SCCB_WriteReg(0x3212, 0x03) != 0) return 1;
 
+    // 设置最终输出图像的宽度（高 8 位和低 8 位）
     if (SCCB_WriteReg(0x3808, (uint8_t)(width >> 8)) != 0) return 2;
     if (SCCB_WriteReg(0x3809, (uint8_t)(width & 0xFF)) != 0) return 3;
+
+    // 设置最终输出图像的高度（高 8 位和低 8 位）
     if (SCCB_WriteReg(0x380A, (uint8_t)(height >> 8)) != 0) return 4;
     if (SCCB_WriteReg(0x380B, (uint8_t)(height & 0xFF)) != 0) return 5;
 
+    // 设置 ISP 内部 X 方向偏移（高 8 位和低 8 位）
     if (SCCB_WriteReg(0x3810, (uint8_t)(offx >> 8)) != 0) return 6;
     if (SCCB_WriteReg(0x3811, (uint8_t)(offx & 0xFF)) != 0) return 7;
+
+    // 设置 ISP 内部 Y 方向偏移（高 8 位和低 8 位）
     if (SCCB_WriteReg(0x3812, (uint8_t)(offy >> 8)) != 0) return 8;
     if (SCCB_WriteReg(0x3813, (uint8_t)(offy & 0xFF)) != 0) return 9;
 
+    // 锁定参数并启动 ISP 处理
     if (SCCB_WriteReg(0x3212, 0x13) != 0) return 10;
     if (SCCB_WriteReg(0x3212, 0xA3) != 0) return 11;
 
     return 0;
 }
 
-// Set the sensor/ISP image window used before output scaling.
+// 设置输出缩放前使用的传感器/ISP 图像窗口
 uint8_t OV5640_Min_ImageWindow_Set(uint16_t offx, uint16_t offy, uint16_t width, uint16_t height)
 {
+    // 计算输入窗口的起始和结束坐标
     uint16_t xst = offx;
     uint16_t yst = offy;
     uint16_t xend = offx + width - 1;
     uint16_t yend = offy + height - 1;
 
+    // 配置 ISP 控制寄存器，允许修改相关参数
     if (SCCB_WriteReg(0x3212, 0x03) != 0) return 1;
 
+    // 设置输入窗口起始 X 坐标（高 8 位和低 8 位）
     if (SCCB_WriteReg(0x3800, (uint8_t)(xst >> 8)) != 0) return 2;
     if (SCCB_WriteReg(0x3801, (uint8_t)(xst & 0xFF)) != 0) return 3;
+
+    // 设置输入窗口起始 Y 坐标（高 8 位和低 8 位）
     if (SCCB_WriteReg(0x3802, (uint8_t)(yst >> 8)) != 0) return 4;
     if (SCCB_WriteReg(0x3803, (uint8_t)(yst & 0xFF)) != 0) return 5;
 
+    // 设置输入窗口结束 X 坐标（高 8 位和低 8 位）
     if (SCCB_WriteReg(0x3804, (uint8_t)(xend >> 8)) != 0) return 6;
     if (SCCB_WriteReg(0x3805, (uint8_t)(xend & 0xFF)) != 0) return 7;
+
+    // 设置输入窗口结束 Y 坐标（高 8 位和低 8 位）
     if (SCCB_WriteReg(0x3806, (uint8_t)(yend >> 8)) != 0) return 8;
     if (SCCB_WriteReg(0x3807, (uint8_t)(yend & 0xFF)) != 0) return 9;
 
+    // 锁定参数并启动 ISP 处理
     if (SCCB_WriteReg(0x3212, 0x13) != 0) return 10;
     if (SCCB_WriteReg(0x3212, 0xA3) != 0) return 11;
 
     return 0;
 }
+
 
 // 初始化 OV5640 为 RGB565 + QVGA + 测试彩条
 uint8_t OV5640_Min_InitRGB565_QVGA_TestBar(void)
@@ -242,32 +260,35 @@ uint8_t OV5640_Min_ReadBackDebug(void)
     return 0;
 }
 
+//回读 OV5640 时序相关的全部寄存器，用于详细调试与确认配置完整性
 uint8_t OV5640_Min_ReadBackTimingDebug(const char *tag)
 {
+    // 需要回读的时序相关寄存器列表
     static const uint16_t regs[] =
     {
-        0x3034, 0x3035, 0x3036, 0x3037,
-        0x3108,
-        0x3800, 0x3801,
-        0x3802, 0x3803,
-        0x3804, 0x3805,
-        0x3806, 0x3807,
-        0x3808, 0x3809,
-        0x380A, 0x380B,
-        0x380C, 0x380D,
-        0x380E, 0x380F,
-        0x3810, 0x3811,
-        0x3812, 0x3813,
-        0x3814, 0x3815,
-        0x3820, 0x3821,
-        0x3824,
-        0x4741,
-        0x5001
+        0x3034, 0x3035, 0x3036, 0x3037,   // PLL 控制
+        0x3108,                            // 系统时钟相关
+        0x3800, 0x3801,                    // 输入窗口起始 X
+        0x3802, 0x3803,                    // 输入窗口起始 Y
+        0x3804, 0x3805,                    // 输入窗口结束 X
+        0x3806, 0x3807,                    // 输入窗口结束 Y
+        0x3808, 0x3809,                    // 输出宽度
+        0x380A, 0x380B,                    // 输出高度
+        0x380C, 0x380D,                    // 水平时序（HB/HS）
+        0x380E, 0x380F,                    // 垂直时序（VB/VS）
+        0x3810, 0x3811,                    // ISP X 偏移
+        0x3812, 0x3813,                    // ISP Y 偏移
+        0x3814, 0x3815,                    // 缩放/偏移配置
+        0x3820, 0x3821,                    // 传感器/ISP 模式
+        0x3824,                            // PCLK 分频
+        0x4741,                            // 测试彩条
+        0x5001                             // ISP 控制（裁剪/缩放使能）
     };
     uint8_t val = 0;
 
     LOG_INFO("OV5640 timing readback begin: %s", tag);
 
+    // 遍历整个寄存器列表，逐一回读并输出
     for (uint32_t i = 0; i < (sizeof(regs) / sizeof(regs[0])); i++)
     {
         if (OV5640_Min_ReadReg(regs[i], &val))
@@ -284,19 +305,13 @@ uint8_t OV5640_Min_ReadBackTimingDebug(const char *tag)
     return 0;
 }
 
+//关闭彩条测试，输出传感器的分辨率 QVGA 的图像至LCD
 uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void)
 {
     uint8_t ret = 0;
     uint8_t val = 0;
 
-    /*
-     * 1. 先复用已经验证成功的完整 RGB565 + QVGA 初始化流程
-     *    这一步会写：
-     *    ov5640_init_reg_tbl
-     *    ov5640_rgb565_reg_tbl
-     *    LCD 全屏输出 480x320
-     *    并临时打开测试彩条
-     */
+   //先复用已经验证成功的完整 RGB565 + QVGA 初始化流程
     ret = OV5640_Min_InitRGB565_QVGA_TestBar();
     if (ret != 0)
     {
@@ -304,13 +319,7 @@ uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void)
         return ret;
     }
 
-    /*
-     * 2. 关闭 OV5640 测试图案，切换为真实图像输出
-     *
-     * 0x4741:
-     * bit[2] = 1: enable test pattern
-     * bit[2] = 0: disable test pattern
-     */
+    //关闭 OV5640 测试图案，切换为真实图像输出
     ret = SCCB_WriteReg(0x4741, 0x00);
     if (ret != 0)
     {
@@ -320,9 +329,7 @@ uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void)
 
     HAL_Delay(20);
 
-    /*
-     * 3. 确认测试图案已经关闭
-     */
+    //确认测试图案已经关闭
     ret = SCCB_ReadReg(0x4741, &val);
     if (ret != 0)
     {
@@ -332,15 +339,11 @@ uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void)
 
     LOG_INFO("OV5640 0x4741 = 0x%02X", val);
 
-    /*
-     * 4. 确保自动曝光/自动增益打开
-     *
-     * 0x3503:
-     * bit[0] AEC manual enable
-     * bit[1] AGC manual enable
-     *
-     * 写 0x00 表示让 AEC/AGC 自动工作。
-     */
+    // 确保自动曝光/自动增益打开
+    // 0x3503::
+    //bit[0] AEC manual enable
+    // bit[1] AGC manual enable
+    // 写 0x00 表示让 AEC/AGC 自动工作。
     ret = SCCB_WriteReg(0x3503, 0x00);
     if (ret != 0)
     {
@@ -348,18 +351,18 @@ uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void)
         return 12;
     }
 
-    /*
-     * 5. 等待自动曝光稳定几帧
-     */
+    // 等待自动曝光稳定几帧
     HAL_Delay(200);
 
     LOG_INFO("OV5640 RGB565 320x240 real image init done");
-    
+
     return 0;
 }
 
+// 初始化 OV5640 为 RGB565 + 160x120 + 测试彩条
 uint8_t OV5640_Min_InitRGB565_160x120_TestBar(void)
 {
+    // 先完成 RGB565 QVGA 测试彩条的基础初始化
     uint8_t ret = OV5640_Min_InitRGB565_QVGA_TestBar();
 
     if (ret != 0U)
@@ -367,6 +370,7 @@ uint8_t OV5640_Min_InitRGB565_160x120_TestBar(void)
         return ret;
     }
 
+    // 设置缩放后的输出尺寸为 160x120，并配置 ISP 偏移
     ret = OV5640_Min_OutSize_Set(4U, 0U, 160U, 120U);
     if (ret != 0U)
     {
@@ -378,8 +382,10 @@ uint8_t OV5640_Min_InitRGB565_160x120_TestBar(void)
     return 0U;
 }
 
+//关闭彩条测试，输出传感器的分辨率 160x120 的图像至LCD
 uint8_t OV5640_Min_InitRGB565_160x120_RealImage(void)
 {
+    // 先完成 160x120 测试彩条的基础初始化（含尺寸缩小）
     uint8_t ret = OV5640_Min_InitRGB565_160x120_TestBar();
 
     if (ret != 0U)
@@ -387,6 +393,7 @@ uint8_t OV5640_Min_InitRGB565_160x120_RealImage(void)
         return ret;
     }
 
+    // 关闭测试彩条
     ret = OV5640_Min_EnableTestBar(0U);
     if (ret != 0U)
     {
@@ -394,6 +401,7 @@ uint8_t OV5640_Min_InitRGB565_160x120_RealImage(void)
         return 11U;
     }
 
+    // 开启自动曝光/自动增益
     ret = OV5640_Min_WriteReg(0x3503U, 0x00U);
     if (ret != 0U)
     {
@@ -401,11 +409,13 @@ uint8_t OV5640_Min_InitRGB565_160x120_RealImage(void)
         return 12U;
     }
 
+    // 等待曝光稳定
     HAL_Delay(200U);
     LOG_INFO("OV5640 RGB565 160x120 real image init done");
     return 0U;
 }
 
+// 初始化 OV5640 为 RGB565 + 480x320 + 测试彩条
 uint8_t OV5640_Min_InitRGB565_480x320_TestBar(void)
 {
     // 先确认 SCCB 通信和芯片 ID 正常
@@ -414,7 +424,7 @@ uint8_t OV5640_Min_InitRGB565_480x320_TestBar(void)
         return 1;
     }
 
-    // 1. 写基础初始化表。
+    // 1. 写基础初始化表（时钟、PLL、IO 等通用配置）
     if (OV5640_Min_WriteTable(ov5640_init_reg_tbl,
                               sizeof(ov5640_init_reg_tbl) / sizeof(ov5640_init_reg_tbl[0])) != 0)
     {
@@ -422,7 +432,7 @@ uint8_t OV5640_Min_InitRGB565_480x320_TestBar(void)
     }
     HAL_Delay(50);
 
-    // 2. 写 RGB565 模式表。
+    // 2. 写 RGB565 模式表（设置像素格式为 RGB565、关闭 JPEG 等）
     if (OV5640_Min_WriteTable(ov5640_rgb565_reg_tbl,
                               sizeof(ov5640_rgb565_reg_tbl) / sizeof(ov5640_rgb565_reg_tbl[0])) != 0)
     {
@@ -430,32 +440,33 @@ uint8_t OV5640_Min_InitRGB565_480x320_TestBar(void)
     }
     HAL_Delay(50);
 
-    // 3. Keep the RGB565 table's default full image window.
+    // 3. 保留 RGB565 表默认的完整图像窗口（约 2624x1706）
+    //    通过 OV5640_Min_ImageWindow_Set 设置传感器/ISP 输入窗口起始和结束坐标
     if (OV5640_Min_ImageWindow_Set(0, 0, 0x0A40, 0x06AA)) return 4;
 
-    // 4. 覆盖 DVP 输出尺寸为 480x320。
+    // 4. 覆盖 DVP 输出尺寸为 480x320，ISP 会自动缩放到此尺寸
     if (OV5640_Min_OutSize_Set(4, 0, 480, 320)) return 5;
 
-    // 5. 确保 DVP 输出格式是 RGB565。
+    // 5. 确保 DVP 输出格式是 RGB565
     if (OV5640_Min_WriteReg(0x501F, 0x01)) return 8;
 
-    // 6. 最后开启内部测试彩条。
+    // 6. 开启内部测试彩条，便于检查数据通路和显示
     if (OV5640_Min_EnableTestBar(1)) return 9;
 
     LOG_INFO("OV5640 full table RGB565 480x320 testbar init done");
+    // 回读关键时序寄存器，确认配置写入
     (void)OV5640_Min_ReadBackTimingDebug("480X320_TESTBAR");
 
     return 0;
 }
 
+//关闭彩条测试，输出传感器的分辨率 480x320 的图像至LCD
 uint8_t OV5640_Min_InitRGB565_480x320_RealImage(void)
 {
     uint8_t ret = 0;
     uint8_t val = 0;
 
-    /*
-     * 1. 先复用 480x320 RGB565 测试图初始化流程。
-     */
+    //复用 480x320 RGB565 测试彩条初始化流程，该流程已包含基础配置、RGB565模式、窗口、输出尺寸等
     ret = OV5640_Min_InitRGB565_480x320_TestBar();
     if (ret != 0)
     {
@@ -463,6 +474,7 @@ uint8_t OV5640_Min_InitRGB565_480x320_RealImage(void)
         return ret;
     }
 
+    // 再次设置输出尺寸为 480x320，防止测试彩条流程中可能被覆盖
     ret = OV5640_Min_OutSize_Set(4, 0, 480, 320);
     if (ret != 0)
     {
@@ -470,9 +482,7 @@ uint8_t OV5640_Min_InitRGB565_480x320_RealImage(void)
         return 13;
     }
 
-    /*
-     * 2. 关闭 OV5640 测试图案，切换为真实图像输出。
-     */
+    // 关闭 OV5640 测试图案，切换为真实图像输出
     ret = SCCB_WriteReg(0x4741, 0x00);
     if (ret != 0)
     {
@@ -482,9 +492,7 @@ uint8_t OV5640_Min_InitRGB565_480x320_RealImage(void)
 
     HAL_Delay(20);
 
-    /*
-     * 3. 确认测试图案已经关闭。
-     */
+    // 回读确认测试图案已经关闭
     ret = SCCB_ReadReg(0x4741, &val);
     if (ret != 0)
     {
@@ -494,9 +502,9 @@ uint8_t OV5640_Min_InitRGB565_480x320_RealImage(void)
 
     LOG_INFO("OV5640 0x4741 = 0x%02X", val);
 
-    /*
-     * 4. 确保自动曝光/自动增益打开。
-     */
+    //确保自动曝光/自动增益打开
+    //    寄存器 0x3503 bit[0]=AEC手动使能, bit[1]=AGC手动使能
+    //    写 0x00 让 AEC/AGC 自动工作
     ret = SCCB_WriteReg(0x3503, 0x00);
     if (ret != 0)
     {
@@ -504,9 +512,7 @@ uint8_t OV5640_Min_InitRGB565_480x320_RealImage(void)
         return 12;
     }
 
-    /*
-     * 5. 等待自动曝光稳定几帧。
-     */
+    // 等待自动曝光稳定（几帧时间）
     HAL_Delay(200);
 
     LOG_INFO("OV5640 RGB565 480x320 real image init done");
