@@ -16,6 +16,13 @@ typedef struct
     uint8_t aec_bpt2;
 } OV5640_Tuning_AecTargetCfg;
 
+typedef struct
+{
+    uint16_t r_gain;
+    uint16_t g_gain;
+    uint16_t b_gain;
+} OV5640_Tuning_AwbGainCfg;
+
 enum
 {
     AEC_REG_EXPOSURE_H = 0,
@@ -56,6 +63,18 @@ static const OV5640_Tuning_AecTargetCfg s_aec_target_cfg[] =
     {0x30U, 0x28U, 0x30U, 0x26U},
     {0x2CU, 0x24U, 0x2CU, 0x22U},
     {0x28U, 0x20U, 0x28U, 0x1EU}
+};
+
+/*
+ * Manual AWB gain presets for OV5640 0x3400~0x3406.
+ * These are initial light-mode gain presets and must be validated by PC Dump.
+ */
+static const OV5640_Tuning_AwbGainCfg s_awb_manual_gain_cfg[] =
+{
+    {0x061CU, 0x0400U, 0x04F3U},  /* sunny */
+    {0x0648U, 0x0400U, 0x04D3U},  /* cloudy */
+    {0x0548U, 0x0400U, 0x07CFU},  /* office */
+    {0x0410U, 0x0400U, 0x0840U}   /* home */
 };
 
 static uint32_t OV5640_Tuning_ComposeExposureRaw(uint8_t high,
@@ -176,4 +195,70 @@ uint8_t OV5640_Tuning_SetAecTarget(OV5640_AecTargetLevel_t level)
     if (SCCB_WriteReg(0x3A1EU, cfg->aec_bpt2) != 0U) return 5U;
 
     return OV5640_Tuning_DumpAECRegs();
+}
+
+static uint8_t OV5640_Tuning_WriteAwbGain(uint16_t r_gain,
+                                          uint16_t g_gain,
+                                          uint16_t b_gain)
+{
+    if (SCCB_WriteReg(0x3400U, (uint8_t)((r_gain >> 8) & 0x0FU)) != 0U) return 1U;
+    if (SCCB_WriteReg(0x3401U, (uint8_t)(r_gain & 0xFFU)) != 0U) return 2U;
+    if (SCCB_WriteReg(0x3402U, (uint8_t)((g_gain >> 8) & 0x0FU)) != 0U) return 3U;
+    if (SCCB_WriteReg(0x3403U, (uint8_t)(g_gain & 0xFFU)) != 0U) return 4U;
+    if (SCCB_WriteReg(0x3404U, (uint8_t)((b_gain >> 8) & 0x0FU)) != 0U) return 5U;
+    if (SCCB_WriteReg(0x3405U, (uint8_t)(b_gain & 0xFFU)) != 0U) return 6U;
+    return 0U;
+}
+
+uint8_t OV5640_Tuning_SetAWBMode(OV5640_AwbMode_t mode)
+{
+    const OV5640_Tuning_AwbGainCfg *cfg;
+    uint8_t ret;
+
+    if (mode == OV5640_AWB_MODE_AUTO)
+    {
+        return SCCB_WriteReg(0x3406U, 0x00U);
+    }
+
+    if ((mode < OV5640_AWB_MODE_SUNNY) || (mode > OV5640_AWB_MODE_HOME))
+    {
+        return 1U;
+    }
+
+    cfg = &s_awb_manual_gain_cfg[(uint32_t)mode - 1U];
+    ret = OV5640_Tuning_WriteAwbGain(cfg->r_gain, cfg->g_gain, cfg->b_gain);
+    if (ret != 0U)
+    {
+        return (uint8_t)(ret + 1U);
+    }
+
+    if (SCCB_WriteReg(0x3406U, 0x01U) != 0U)
+    {
+        return 8U;
+    }
+
+    return 0U;
+}
+
+void OV5640_Tuning_DumpAWBRegs(void)
+{
+    static const uint16_t regs[] =
+    {
+        0x3400U, 0x3401U, 0x3402U, 0x3403U, 0x3404U, 0x3405U, 0x3406U
+    };
+    uint8_t val;
+
+    LOG_RAW("========== OV5640 AWB DUMP ==========\r\n");
+    for (uint32_t i = 0U; i < (sizeof(regs) / sizeof(regs[0])); ++i)
+    {
+        if (SCCB_ReadReg(regs[i], &val) != 0U)
+        {
+            LOG_RAW("AWB reg 0x%04X read failed\r\n", (unsigned int)regs[i]);
+            continue;
+        }
+        LOG_RAW("AWB reg 0x%04X = 0x%02X\r\n",
+                (unsigned int)regs[i],
+                (unsigned int)val);
+    }
+    LOG_RAW("=====================================\r\n");
 }

@@ -52,6 +52,8 @@
 #define PC_DUMP_USE_REAL_IMAGE         1U
 #define OV5640_AEC_TUNING_ENABLE       1U
 #define OV5640_AEC_TUNING_LEVEL        OV5640_AEC_TARGET_BASELINE
+#define OV5640_AWB_TUNING_ENABLE       1U
+#define OV5640_AWB_TUNING_MODE         OV5640_AWB_MODE_AUTO
 
 /* USER CODE END PD */
 
@@ -180,6 +182,13 @@ int main(void)
     uint8_t aec_target_ret = OV5640_Tuning_SetAecTarget(OV5640_AEC_TUNING_LEVEL);
     LOG_INFO("OV5640 AEC target set ret = %u", aec_target_ret);
     HAL_Delay(1000U);
+  }
+#endif
+#if OV5640_AWB_TUNING_ENABLE
+  if (ret == 0U)
+  {
+    uint8_t awb_mode_ret = OV5640_Tuning_SetAWBMode(OV5640_AWB_TUNING_MODE);
+    LOG_INFO("OV5640 AWB mode set ret = %u", awb_mode_ret);
   }
 #endif
 #elif CAMERA_MODE == CAMERA_MODE_480X320_REAL
