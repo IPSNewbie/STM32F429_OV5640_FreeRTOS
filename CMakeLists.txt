@@ -62,7 +62,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
 )
 
-file(GLOB_RECURSE BSPDRIVERS "BSPDrivers/Src/*.c")
+file(GLOB_RECURSE BSPDRIVERS CONFIGURE_DEPENDS "BSPDrivers/Src/*.c")
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         # Add user sources here

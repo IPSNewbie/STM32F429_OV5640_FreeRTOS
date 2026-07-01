@@ -33,6 +33,7 @@
 #include "camera_dcmi_dma.h"
 #include "camera_pc_dump.h"
 #include "OV5640.h"
+#include "ov5640_tuning.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,8 +48,8 @@
 #define CAMERA_MODE_320X240_REAL       2
 #define CAMERA_MODE_PC_DUMP_RGB565     3
 
-#define CAMERA_MODE                    CAMERA_MODE_480X320_REAL
-#define PC_DUMP_USE_REAL_IMAGE         0U
+#define CAMERA_MODE                    CAMERA_MODE_PC_DUMP_RGB565
+#define PC_DUMP_USE_REAL_IMAGE         1U
 
 /* USER CODE END PD */
 
@@ -165,7 +166,12 @@ int main(void)
    * 6. Configure OV5640 output mode.
    */
 #if CAMERA_MODE == CAMERA_MODE_PC_DUMP_RGB565
-  /* OV5640 initialization is deferred until the host sends DUMP. */
+#if PC_DUMP_USE_REAL_IMAGE
+  uint8_t ret = OV5640_Min_InitRGB565_160x120_RealImage();
+#else
+  uint8_t ret = OV5640_Min_InitRGB565_160x120_TestBar();
+#endif
+  LOG_INFO("OV5640 PC dump 160x120 init ret = %d", ret);
 #elif CAMERA_MODE == CAMERA_MODE_480X320_REAL
   uint8_t ret = OV5640_Min_InitRGB565_480x320_RealImage();
   LOG_INFO("OV5640 480x320 real image init ret = %d", ret);
@@ -181,9 +187,7 @@ int main(void)
   /*
    * 7. 初始化 DCMI
    */
-#if CAMERA_MODE != CAMERA_MODE_PC_DUMP_RGB565
   Camera_DCMI_Init();
-#endif
 
   /*
    * 8. 配置 DMA：DCMI 数据直接写 LCD GRAM
@@ -195,25 +199,24 @@ int main(void)
 
   while (1)
   {
-    uint8_t camera_ret;
     uint8_t snapshot_ret;
     uint8_t dump_ret;
+    uint8_t pc_command;
     uint32_t snapshot_start_tick;
 
-    (void)Camera_PC_Dump_WaitForDumpCommand(&huart1);
-
-#if PC_DUMP_USE_REAL_IMAGE
-    camera_ret = OV5640_Min_InitRGB565_160x120_RealImage();
-#else
-    camera_ret = OV5640_Min_InitRGB565_160x120_TestBar();
-#endif
-    if (camera_ret != 0U)
+    pc_command = Camera_PC_Dump_WaitForCommand(&huart1);
+    if ((pc_command != CAMERA_PC_DUMP_CMD_AEC) &&
+        (pc_command != CAMERA_PC_DUMP_CMD_DUMP))
     {
-      LOG_ERROR("OV5640 160x120 init failed, ret = %u", camera_ret);
       continue;
     }
 
-    Camera_DCMI_Init();
+    if (pc_command == CAMERA_PC_DUMP_CMD_AEC)
+    {
+      (void)OV5640_Tuning_DumpAECRegs();
+      continue;
+    }
+
     Camera_DCMI_ClearSnapshotDone();
 
     snapshot_ret = Camera_DCMI_StartSnapshotToBuffer(
@@ -254,7 +257,6 @@ int main(void)
       continue;
     }
 
-    LOG_RAW("[PC_DUMP] done\r\n");
     pc_dump_frame_id++;
   }
 #else

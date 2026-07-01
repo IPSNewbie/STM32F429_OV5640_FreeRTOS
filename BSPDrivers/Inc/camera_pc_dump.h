@@ -9,6 +9,10 @@
 #define PC_DUMP_WORD_COUNT  (PC_DUMP_WIDTH * PC_DUMP_HEIGHT / 2U)
 #define PC_DUMP_PAYLOAD_LEN (PC_DUMP_WIDTH * PC_DUMP_HEIGHT * 2U)
 
+#define CAMERA_PC_DUMP_CMD_NONE  0U
+#define CAMERA_PC_DUMP_CMD_DUMP  1U
+#define CAMERA_PC_DUMP_CMD_AEC   2U
+
 /**
  * @brief  获取图像帧缓冲区的 32 位起始地址
  *         用于配置 DCMI DMA 的目标地址
@@ -20,6 +24,8 @@ uint32_t Camera_PC_Dump_GetBufferAddress(void);
  *         用于配置 DCMI DMA 的传输数量
  */
 uint32_t Camera_PC_Dump_GetWordCount(void);
+
+uint8_t Camera_PC_Dump_WaitForCommand(UART_HandleTypeDef *huart);
 
 /**
  * @brief  等待 PC 通过 UART 发送 "DUMP" 命令

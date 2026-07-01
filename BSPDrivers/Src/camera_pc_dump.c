@@ -72,29 +72,32 @@ uint32_t Camera_PC_Dump_GetWordCount(void)
     return PC_DUMP_WORD_COUNT;
 }
 
-//等待 PC 通过 UART 发送 "DUMP" 命令
-uint8_t Camera_PC_Dump_WaitForDumpCommand(UART_HandleTypeDef *huart)
+//等待 PC 通过 UART 发送命令行
+uint8_t Camera_PC_Dump_WaitForCommand(UART_HandleTypeDef *huart)
 {
-    uint8_t line[8];        // 接收行缓冲区，最多 8 字节
+    uint8_t line[8];
     uint8_t line_length = 0U;
     uint8_t byte;
 
     if (huart == NULL)
     {
-        return 0U;
+        return CAMERA_PC_DUMP_CMD_NONE;
+    }
+
+    if (__HAL_UART_GET_FLAG(huart, UART_FLAG_ORE) != RESET)
+    {
+        __HAL_UART_CLEAR_OREFLAG(huart);
     }
 
     for (;;)
     {
-        // 单字节接收，超时 100ms
         HAL_StatusTypeDef status = HAL_UART_Receive(huart, &byte, 1U, 100U);
 
         if (status == HAL_TIMEOUT)
         {
-            continue;      // 超时则继续等待
+            continue;
         }
 
-        // 接收错误处理：若有溢出标志，清除后重置接收状态
         if (status != HAL_OK)
         {
             if (__HAL_UART_GET_FLAG(huart, UART_FLAG_ORE) != RESET)
@@ -105,29 +108,34 @@ uint8_t Camera_PC_Dump_WaitForDumpCommand(UART_HandleTypeDef *huart)
             continue;
         }
 
-        // 忽略回车符
-        if (byte == '\r')
+        if ((byte == '\r') || (byte == '\n'))
         {
-            continue;
-        }
+            if (line_length == 0U)
+            {
+                continue;
+            }
 
-        // 换行符表示一行结束，检查是否为 "DUMP"
-        if (byte == '\n')
-        {
             if ((line_length == 4U) &&
                 (line[0] == 'D') &&
                 (line[1] == 'U') &&
                 (line[2] == 'M') &&
                 (line[3] == 'P'))
             {
-                return 1U;   // 收到有效命令
+                return CAMERA_PC_DUMP_CMD_DUMP;
             }
 
-            line_length = 0U;  // 行内容不符，重置
+            if ((line_length == 3U) &&
+                (line[0] == 'A') &&
+                (line[1] == 'E') &&
+                (line[2] == 'C'))
+            {
+                return CAMERA_PC_DUMP_CMD_AEC;
+            }
+
+            line_length = 0U;
             continue;
         }
 
-        // 暂存接收字符，若超出缓冲区长度则重置（防止非命令长行干扰）
         if (line_length < sizeof(line))
         {
             line[line_length++] = byte;
@@ -137,6 +145,18 @@ uint8_t Camera_PC_Dump_WaitForDumpCommand(UART_HandleTypeDef *huart)
             line_length = 0U;
         }
     }
+}
+
+uint8_t Camera_PC_Dump_WaitForDumpCommand(UART_HandleTypeDef *huart)
+{
+    uint8_t command;
+
+    do
+    {
+        command = Camera_PC_Dump_WaitForCommand(huart);
+    } while (command == CAMERA_PC_DUMP_CMD_AEC);
+
+    return (command == CAMERA_PC_DUMP_CMD_DUMP) ? 1U : 0U;
 }
 
 //将一帧图像数据打包并通过 UART 发送给 PC
