@@ -50,6 +50,8 @@
 
 #define CAMERA_MODE                    CAMERA_MODE_PC_DUMP_RGB565
 #define PC_DUMP_USE_REAL_IMAGE         1U
+#define OV5640_AEC_TUNING_ENABLE       1U
+#define OV5640_AEC_TUNING_LEVEL        OV5640_AEC_TARGET_BASELINE
 
 /* USER CODE END PD */
 
@@ -172,6 +174,14 @@ int main(void)
   uint8_t ret = OV5640_Min_InitRGB565_160x120_TestBar();
 #endif
   LOG_INFO("OV5640 PC dump 160x120 init ret = %d", ret);
+#if OV5640_AEC_TUNING_ENABLE
+  if (ret == 0U)
+  {
+    uint8_t aec_target_ret = OV5640_Tuning_SetAecTarget(OV5640_AEC_TUNING_LEVEL);
+    LOG_INFO("OV5640 AEC target set ret = %u", aec_target_ret);
+    HAL_Delay(1000U);
+  }
+#endif
 #elif CAMERA_MODE == CAMERA_MODE_480X320_REAL
   uint8_t ret = OV5640_Min_InitRGB565_480x320_RealImage();
   LOG_INFO("OV5640 480x320 real image init ret = %d", ret);

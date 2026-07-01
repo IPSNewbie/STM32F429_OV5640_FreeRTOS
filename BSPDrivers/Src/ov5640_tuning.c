@@ -8,6 +8,14 @@ typedef struct
     const char *name;
 } OV5640_Tuning_RegDesc;
 
+typedef struct
+{
+    uint8_t aec_wpt;
+    uint8_t aec_bpt;
+    uint8_t aec_wpt2;
+    uint8_t aec_bpt2;
+} OV5640_Tuning_AecTargetCfg;
+
 enum
 {
     AEC_REG_EXPOSURE_H = 0,
@@ -41,6 +49,13 @@ static const OV5640_Tuning_RegDesc s_aec_regs[AEC_REG_COUNT] =
     {0x3A1EU, "AEC_BPT2    "},
     {0x3A18U, "GAIN_CEIL_H "},
     {0x3A19U, "GAIN_CEIL_L "}
+};
+
+static const OV5640_Tuning_AecTargetCfg s_aec_target_cfg[] =
+{
+    {0x30U, 0x28U, 0x30U, 0x26U},
+    {0x2CU, 0x24U, 0x2CU, 0x22U},
+    {0x28U, 0x20U, 0x28U, 0x1EU}
 };
 
 static uint32_t OV5640_Tuning_ComposeExposureRaw(uint8_t high,
@@ -142,4 +157,23 @@ uint8_t OV5640_Tuning_DumpAECRegs(void)
 
     LOG_RAW("=========================================\r\n");
     return 0U;
+}
+
+uint8_t OV5640_Tuning_SetAecTarget(OV5640_AecTargetLevel_t level)
+{
+    const OV5640_Tuning_AecTargetCfg *cfg;
+
+    if ((uint32_t)level >= (sizeof(s_aec_target_cfg) / sizeof(s_aec_target_cfg[0])))
+    {
+        return 1U;
+    }
+
+    cfg = &s_aec_target_cfg[(uint32_t)level];
+
+    if (SCCB_WriteReg(0x3A0FU, cfg->aec_wpt) != 0U) return 2U;
+    if (SCCB_WriteReg(0x3A10U, cfg->aec_bpt) != 0U) return 3U;
+    if (SCCB_WriteReg(0x3A1BU, cfg->aec_wpt2) != 0U) return 4U;
+    if (SCCB_WriteReg(0x3A1EU, cfg->aec_bpt2) != 0U) return 5U;
+
+    return OV5640_Tuning_DumpAECRegs();
 }
