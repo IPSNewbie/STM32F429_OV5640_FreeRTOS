@@ -23,6 +23,36 @@ typedef struct
     uint16_t b_gain;
 } OV5640_Tuning_AwbGainCfg;
 
+typedef struct
+{
+    uint8_t offset;
+    uint8_t sign;
+} OV5640_Tuning_BrightnessCfg;
+
+typedef struct
+{
+    uint8_t center;
+    uint8_t gain;
+} OV5640_Tuning_ContrastCfg;
+
+typedef struct
+{
+    uint8_t u_gain;
+    uint8_t v_gain;
+} OV5640_Tuning_SaturationCfg;
+
+typedef struct
+{
+    uint8_t mt_th1;
+    uint8_t mt_th2;
+    uint8_t mt_offset1;
+    uint8_t mt_offset2;
+    uint8_t th_th1;
+    uint8_t th_th2;
+    uint8_t th_offset1;
+    uint8_t th_offset2;
+} OV5640_Tuning_SharpnessCfg;
+
 enum
 {
     AEC_REG_EXPOSURE_H = 0,
@@ -75,6 +105,38 @@ static const OV5640_Tuning_AwbGainCfg s_awb_manual_gain_cfg[] =
     {0x0648U, 0x0400U, 0x04D3U},  /* cloudy */
     {0x0548U, 0x0400U, 0x07CFU},  /* office */
     {0x0410U, 0x0400U, 0x0840U}   /* home */
+};
+
+/*
+ * Initial SDE/CIP presets. No exact project-specific tuning table exists yet;
+ * validate these values with PC Dump before selecting a final default.
+ */
+static const OV5640_Tuning_BrightnessCfg s_brightness_cfg[] =
+{
+    {0x10U, 0x09U},  /* -1 */
+    {0x00U, 0x01U},  /*  0 */
+    {0x10U, 0x01U}   /* +1 */
+};
+
+static const OV5640_Tuning_ContrastCfg s_contrast_cfg[] =
+{
+    {0x18U, 0x18U},  /* -1 */
+    {0x20U, 0x20U},  /*  0 */
+    {0x28U, 0x28U}   /* +1 */
+};
+
+static const OV5640_Tuning_SaturationCfg s_saturation_cfg[] =
+{
+    {0x30U, 0x30U},  /* 0 */
+    {0x40U, 0x40U},  /* 1 */
+    {0x60U, 0x60U}   /* 2 */
+};
+
+static const OV5640_Tuning_SharpnessCfg s_sharpness_cfg[] =
+{
+    {0x08U, 0x30U, 0x10U, 0x00U, 0x08U, 0x30U, 0x04U, 0x06U},  /* 0 */
+    {0x08U, 0x20U, 0x18U, 0x04U, 0x08U, 0x20U, 0x08U, 0x08U},  /* 1 */
+    {0x06U, 0x18U, 0x20U, 0x08U, 0x06U, 0x18U, 0x0CU, 0x0AU}   /* 2 */
 };
 
 static uint32_t OV5640_Tuning_ComposeExposureRaw(uint8_t high,
@@ -261,4 +323,106 @@ void OV5640_Tuning_DumpAWBRegs(void)
                 (unsigned int)val);
     }
     LOG_RAW("=====================================\r\n");
+}
+
+static uint8_t OV5640_Tuning_LevelToIndex(int8_t level, uint32_t *index)
+{
+    if (index == 0)
+    {
+        return 1U;
+    }
+
+    if (level == (int8_t)OV5640_IMAGE_PARAM_MINUS_1)
+    {
+        *index = 0U;
+        return 0U;
+    }
+    if (level == (int8_t)OV5640_IMAGE_PARAM_DEFAULT)
+    {
+        *index = 1U;
+        return 0U;
+    }
+    if (level == (int8_t)OV5640_IMAGE_PARAM_PLUS_1)
+    {
+        *index = 2U;
+        return 0U;
+    }
+
+    return 2U;
+}
+
+uint8_t OV5640_Tuning_SetBrightness(int8_t level)
+{
+    uint32_t index;
+    const OV5640_Tuning_BrightnessCfg *cfg;
+
+    if (OV5640_Tuning_LevelToIndex(level, &index) != 0U)
+    {
+        return 1U;
+    }
+
+    cfg = &s_brightness_cfg[index];
+    if (SCCB_WriteReg(0x5580U, 0x06U) != 0U) return 2U;
+    if (SCCB_WriteReg(0x5587U, cfg->offset) != 0U) return 3U;
+    if (SCCB_WriteReg(0x5588U, cfg->sign) != 0U) return 4U;
+
+    return 0U;
+}
+
+uint8_t OV5640_Tuning_SetContrast(int8_t level)
+{
+    uint32_t index;
+    const OV5640_Tuning_ContrastCfg *cfg;
+
+    if (OV5640_Tuning_LevelToIndex(level, &index) != 0U)
+    {
+        return 1U;
+    }
+
+    cfg = &s_contrast_cfg[index];
+    if (SCCB_WriteReg(0x5580U, 0x06U) != 0U) return 2U;
+    if (SCCB_WriteReg(0x5585U, cfg->center) != 0U) return 3U;
+    if (SCCB_WriteReg(0x5586U, cfg->gain) != 0U) return 4U;
+    if (SCCB_WriteReg(0x501DU, 0x40U) != 0U) return 5U;
+
+    return 0U;
+}
+
+uint8_t OV5640_Tuning_SetSaturation(int8_t level)
+{
+    const OV5640_Tuning_SaturationCfg *cfg;
+
+    if ((level < 0) || (level > 2))
+    {
+        return 1U;
+    }
+
+    cfg = &s_saturation_cfg[(uint32_t)level];
+    if (SCCB_WriteReg(0x5580U, 0x06U) != 0U) return 2U;
+    if (SCCB_WriteReg(0x5583U, cfg->u_gain) != 0U) return 3U;
+    if (SCCB_WriteReg(0x5584U, cfg->v_gain) != 0U) return 4U;
+
+    return 0U;
+}
+
+uint8_t OV5640_Tuning_SetSharpness(uint8_t level)
+{
+    const OV5640_Tuning_SharpnessCfg *cfg;
+
+    if (level > 2U)
+    {
+        return 1U;
+    }
+
+    cfg = &s_sharpness_cfg[level];
+    if (SCCB_WriteReg(0x5300U, cfg->mt_th1) != 0U) return 2U;
+    if (SCCB_WriteReg(0x5301U, cfg->mt_th2) != 0U) return 3U;
+    if (SCCB_WriteReg(0x5302U, cfg->mt_offset1) != 0U) return 4U;
+    if (SCCB_WriteReg(0x5303U, cfg->mt_offset2) != 0U) return 5U;
+    if (SCCB_WriteReg(0x5309U, cfg->th_th1) != 0U) return 6U;
+    if (SCCB_WriteReg(0x530AU, cfg->th_th2) != 0U) return 7U;
+    if (SCCB_WriteReg(0x530BU, cfg->th_offset1) != 0U) return 8U;
+    if (SCCB_WriteReg(0x530CU, cfg->th_offset2) != 0U) return 9U;
+
+    return 0U;
 }

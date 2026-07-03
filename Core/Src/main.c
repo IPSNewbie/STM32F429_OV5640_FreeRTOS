@@ -54,6 +54,11 @@
 #define OV5640_AEC_TUNING_LEVEL        OV5640_AEC_TARGET_BASELINE
 #define OV5640_AWB_TUNING_ENABLE       1U
 #define OV5640_AWB_TUNING_MODE         OV5640_AWB_MODE_AUTO
+#define OV5640_IMAGE_TUNING_ENABLE     1U
+#define OV5640_BRIGHTNESS_LEVEL        1
+#define OV5640_CONTRAST_LEVEL          0
+#define OV5640_SATURATION_LEVEL        1
+#define OV5640_SHARPNESS_LEVEL         0
 
 /* USER CODE END PD */
 
@@ -189,6 +194,20 @@ int main(void)
   {
     uint8_t awb_mode_ret = OV5640_Tuning_SetAWBMode(OV5640_AWB_TUNING_MODE);
     LOG_INFO("OV5640 AWB mode set ret = %u", awb_mode_ret);
+  }
+#endif
+#if OV5640_IMAGE_TUNING_ENABLE
+  if (ret == 0U)
+  {
+    uint8_t brightness_ret = OV5640_Tuning_SetBrightness(OV5640_BRIGHTNESS_LEVEL);
+    uint8_t contrast_ret = OV5640_Tuning_SetContrast(OV5640_CONTRAST_LEVEL);
+    uint8_t saturation_ret = OV5640_Tuning_SetSaturation(OV5640_SATURATION_LEVEL);
+    uint8_t sharpness_ret = OV5640_Tuning_SetSharpness(OV5640_SHARPNESS_LEVEL);
+    LOG_INFO("OV5640 image tuning ret B=%u C=%u S=%u H=%u",
+             brightness_ret,
+             contrast_ret,
+             saturation_ret,
+             sharpness_ret);
   }
 #endif
 #elif CAMERA_MODE == CAMERA_MODE_480X320_REAL
