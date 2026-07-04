@@ -32,6 +32,7 @@
 #include "lcd_mcu.h"
 #include "camera_dcmi_dma.h"
 #include "camera_frame_buffer.h"
+#include "camera_image_process.h"
 #include "camera_pc_dump.h"
 #include "OV5640.h"
 #include "ov5640_tuning.h"
@@ -61,6 +62,14 @@
 #define OV5640_SATURATION_LEVEL        1
 #define OV5640_SHARPNESS_LEVEL         0
 #define CAMERA_FRAME_BUFFER_ENABLE     1U
+#define CAMERA_IMAGE_PROCESS_ENABLE    1U
+
+#define CAMERA_PROCESS_MODE_BYPASS     0
+#define CAMERA_PROCESS_MODE_GRAYSCALE  1
+#define CAMERA_PROCESS_MODE_BINARY     2
+
+#define CAMERA_PROCESS_MODE            CAMERA_PROCESS_MODE_BYPASS
+#define CAMERA_BINARY_THRESHOLD        128U
 
 /* USER CODE END PD */
 
@@ -293,6 +302,20 @@ int main(void)
 
     Camera_DCMI_Stop();
     (void)Camera_FrameBuffer_CommitBackBuffer();
+
+#if CAMERA_IMAGE_PROCESS_ENABLE
+    {
+      CameraImageProcessStatus_t process_ret;
+
+      process_ret = Camera_ImageProcess_ApplyToFrameBuffer((CameraProcessMode_t)CAMERA_PROCESS_MODE,
+                                                           (uint8_t)CAMERA_BINARY_THRESHOLD);
+      if (process_ret != CAMERA_PROCESS_OK)
+      {
+        LOG_ERROR("Image process failed, ret = %u", (unsigned int)process_ret);
+        continue;
+      }
+    }
+#endif
 
     log_set_level(LOG_LEVEL_NONE);
     dump_ret = Camera_PC_Dump_SendFrame(&huart1, pc_dump_frame_id);
