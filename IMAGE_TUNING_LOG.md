@@ -1,5 +1,372 @@
 # OV5640 Image Parameter Tuning Log
 
+# Stage 3 简明总结：亮度 / 对比度 / 饱和度 / 锐度调试
+
+## 这一阶段做了什么？
+
+```
+调 OV5640 摄像头内部 ISP 的基础画质参数。
+```
+
+测试下面 4 个参数：
+
+```
+1. Brightness  亮度
+2. Contrast    对比度
+3. Saturation  饱和度
+4. Sharpness   锐度
+```
+
+目的是找出当前画面下比较合适的默认参数。
+
+本阶段没有修改：
+
+```
+1. SCCB 软件 IIC 底层
+2. OV5640 GPIO 引脚
+3. PCF8574 / PWDN / RESET
+4. LCD_MCU 驱动
+5. FMC/LCD 写时序
+6. DCMI + DMA 主链路
+7. PC Dump 的 OV56RGB5 图像包协议
+8. Python 工具
+9. AEC 曝光目标
+10. AWB 默认模式
+```
+
+## 测试方法
+
+每次只改一个参数，然后重新编译下载、复位开发板，再用 Python Dump 保存图像和统计指标。
+
+Python 命令示例：
+
+```
+python tools/pc_dump_rgb565.py --port COM3 --baud 115200 --tag real_img_default
+python tools/pc_dump_rgb565.py --port COM3 --baud 115200 --tag real_bright_plus1
+python tools/pc_dump_rgb565.py --port COM3 --baud 115200 --tag real_contrast_plus1
+python tools/pc_dump_rgb565.py --port COM3 --baud 115200 --tag real_sat_plus1
+python tools/pc_dump_rgb565.py --port COM3 --baud 115200 --tag real_sharp_1
+python tools/pc_dump_rgb565.py --port COM3 --baud 115200 --tag real_bright_plus1_sat_plus1
+```
+
+## 主要指标怎么理解？
+
+### mean_brightness
+
+平均亮度。
+
+```
+太低：画面偏暗
+太高：画面偏亮，可能过曝
+```
+
+当前希望大概在：
+
+```
+90 ~ 130
+```
+
+### shadow_ratio
+
+暗部比例。
+
+```
+越高，说明黑的区域越多。
+```
+
+### highlight_ratio
+
+高光比例。
+
+```
+越高，说明白色过曝区域越多。
+```
+
+之前希望尽量控制在：
+
+```
+3% ~ 5%
+```
+
+但实际场景里不一定能完全达到。
+
+### B/R ratio
+
+蓝色和红色的比例。
+
+```
+接近 1：颜色比较平衡
+明显大于 1：可能偏蓝
+明显小于 1：可能偏红
+```
+
+当前可接受范围：
+
+```
+0.9 ~ 1.15
+```
+
+### Laplacian variance
+
+清晰度指标。
+
+```
+一般越大，说明边缘变化越明显，图像可能越清晰。
+```
+
+但这个指标不是越大越好，因为噪声也可能让它变大。
+
+## 测试结果汇总
+
+| 测试项                        | Brightness | Contrast | Saturation | Sharpness | Mean brightness | Shadow ratio | Highlight ratio | B/R ratio | Laplacian variance | 结论                   |
+| ----------------------------- | ---------- | -------- | ---------- | --------- | --------------- | ------------ | --------------- | --------- | ------------------ | ---------------------- |
+| Default                       | 0          | 0        | 1          | 0         | 84.106302       | 14.010417%   | 6.635417%       | 1.063033  | 883.653465         | 偏暗                   |
+| Brightness +1                 | +1         | 0        | 1          | 0         | 99.207865       | 0.000000%    | 8.515625%       | 1.058910  | 841.923733         | 推荐                   |
+| Contrast +1                   | 0          | +1       | 1          | 0         | 92.178646       | 25.166667%   | 13.151042%      | 1.027181  | 1123.033387        | 不推荐                 |
+| Saturation +1                 | 0          | 0        | 2          | 0         | 84.027031       | 12.114583%   | 6.427083%       | 1.041239  | 872.941699         | 安全但仍偏暗           |
+| Sharpness 1                   | 0          | 0        | 1          | 1         | 85.850313       | 12.817708%   | 6.953125%       | 1.064948  | 874.972616         | 不推荐                 |
+| Brightness +1 + Saturation +1 | +1         | 0        | 2          | 0         | 100.566302      | 0.000000%    | 8.640625%       | 1.080900  | 822.510609         | 不如单独 Brightness +1 |
+
+## 每个参数的结论
+
+### 1. Brightness +1
+
+效果：
+
+```
+mean_brightness 从 84.106302 提升到 99.207865
+shadow_ratio 从 14.010417% 降到 0.000000%
+```
+
+说明：
+
+```
+Brightness +1 能明显改善画面偏暗问题。
+```
+
+缺点：
+
+```
+highlight_ratio 从 6.635417% 上升到 8.515625%
+```
+
+说明：
+
+```
+亮度提高后，高光过曝也增加了。
+```
+
+结论：
+
+```
+Brightness +1 是当前最有价值的调节项。
+```
+
+### 2. Contrast +1
+
+效果：
+
+```
+Laplacian variance 从 883.653465 提升到 1123.033387
+```
+
+说明：
+
+```
+图像边缘变化更强，看起来可能更硬、更锐。
+```
+
+缺点：
+
+```
+shadow_ratio 从 14.010417% 上升到 25.166667%
+highlight_ratio 从 6.635417% 上升到 13.151042%
+```
+
+说明：
+
+```
+暗部更黑，亮部更白，细节损失严重。
+```
+
+结论：
+
+```
+Contrast +1 不推荐。
+```
+
+### 3. Saturation +1
+
+效果：
+
+```
+B/R ratio 从 1.063033 变为 1.041239
+```
+
+说明：
+
+```
+颜色比例更接近 1，颜色平衡略好。
+```
+
+缺点：
+
+```
+mean_brightness 仍然只有 84.027031
+```
+
+说明：
+
+```
+饱和度 +1 不能解决画面偏暗。
+```
+
+结论：
+
+```
+Saturation +1 比较安全，但不适合作为本阶段主要改进项。
+```
+
+### 4. Sharpness 1
+
+效果：
+
+```
+Laplacian variance 从 883.653465 变为 874.972616
+```
+
+说明：
+
+```
+Sharpness 1 没有提升清晰度指标。
+```
+
+结论：
+
+```
+Sharpness 1 不推荐。
+```
+
+### 5. Brightness +1 + Saturation +1
+
+效果：
+
+```
+mean_brightness = 100.566302
+shadow_ratio = 0.000000%
+```
+
+说明：
+
+```
+亮度和暗部表现正常。
+```
+
+缺点：
+
+```
+highlight_ratio = 8.640625%
+B/R ratio = 1.080900
+Laplacian variance = 822.510609
+```
+
+说明：
+
+```
+相比单独 Brightness +1，高光略差，颜色略偏蓝，清晰度指标更低。
+```
+
+结论：
+
+```
+组合不如单独 Brightness +1。
+```
+
+## 最终推荐参数
+
+当前推荐使用：
+
+```
+#define OV5640_IMAGE_TUNING_ENABLE       1U
+
+#define OV5640_BRIGHTNESS_LEVEL          1
+#define OV5640_CONTRAST_LEVEL            0
+#define OV5640_SATURATION_LEVEL          1
+#define OV5640_SHARPNESS_LEVEL           0
+```
+
+对应含义：
+
+```
+Brightness = +1
+Contrast   = 0
+Saturation = 1
+Sharpness  = 0
+```
+
+## 为什么这样选？
+
+原因：
+
+```
+1. 原始默认画面偏暗。
+2. Brightness +1 能把平均亮度拉回正常范围。
+3. Brightness +1 能明显减少暗部。
+4. Contrast +1 会让画面过度剪切。
+5. Saturation +1 安全，但不能解决偏暗。
+6. Sharpness 1 没有提升清晰度。
+7. Brightness +1 + Saturation +1 不如单独 Brightness +1。
+```
+
+## 当前参数的缺点
+
+Brightness +1 有一个缺点：
+
+```
+highlight_ratio 从 6.635417% 上升到 8.515625%
+```
+
+也就是说：
+
+```
+画面变亮了，但高光更容易过曝。
+```
+
+所以这是一个工程取舍：
+
+```
+为了改善整体偏暗和暗部问题，暂时接受高光比例升高。
+```
+
+## 本阶段最终结论
+
+```
+Stage 3 完成。
+当前默认画质参数选择 Brightness +1。
+Contrast +1、Sharpness 1 不采用。
+Saturation +1 保留为候选，但当前不作为默认。
+```
+
+## 下一阶段
+
+下一阶段进入：
+
+```
+Stage 4 - 帧缓存管理 / 双缓冲
+```
+
+下一阶段不再继续调曝光、白平衡、亮度、对比度、饱和度、锐度。
+
+下一阶段重点是：
+
+```
+1. 建立 frame buffer 概念
+2. 区分采集缓冲和显示缓冲
+3. 先从 160x120 RGB565 小分辨率开始
+4. 不破坏当前 480x320 LCD 实时显示路径
+5. 不破坏 PC Dump 功能
+```
+
 ## Stage
 
 Stage 3 - Brightness / Contrast / Saturation / Sharpness
