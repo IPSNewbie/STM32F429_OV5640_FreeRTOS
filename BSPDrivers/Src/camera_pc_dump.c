@@ -1,4 +1,5 @@
 #include "camera_pc_dump.h"
+#include "camera_frame_buffer.h"
 
 /**
  * @file    camera_pc_dump.c
@@ -9,14 +10,6 @@
 
 /* UART 每次发送的最大字节数，避免长时间占用总线 */
 #define PC_DUMP_UART_CHUNK_SIZE  1024U
-
-/*
- * 存放一帧图像数据的全局缓冲区。
- * 类型为 uint32_t，与 DCMI DMA 的 WORD 对齐要求一致。
- * 使用 __attribute__((aligned(4))) 确保 4 字节对齐。
- * 大小 PC_DUMP_WORD_COUNT 由外部宏定义（通常 = 宽度 * 高度 / 2）。
- */
-static uint32_t s_pc_dump_frame_buffer[PC_DUMP_WORD_COUNT] __attribute__((aligned(4)));
 
 /**
  * @brief  将 uint16_t 以小端序写入字节数组
@@ -63,7 +56,7 @@ static uint32_t Camera_PC_Dump_CRC32(const uint8_t *data, uint32_t length)
 //获取图像帧缓冲区的 32 位起始地址，用于配置 DCMI DMA 的目标地址
 uint32_t Camera_PC_Dump_GetBufferAddress(void)
 {
-    return (uint32_t)s_pc_dump_frame_buffer;
+    return (uint32_t)Camera_FrameBuffer_GetBackBuffer();
 }
 
 //获取图像帧缓冲区的字数（32 位为单位）， 用于配置 DCMI DMA 的传输数量
@@ -166,7 +159,8 @@ uint8_t Camera_PC_Dump_SendFrame(UART_HandleTypeDef *huart, uint32_t frame_id)
     static const uint8_t magic[8] = {'O', 'V', '5', '6', 'R', 'G', 'B', '5'};
     uint8_t header[22];             // 完整帧头 22 字节
     uint8_t crc_bytes[4];           // CRC 值存储
-    const uint8_t *payload = (const uint8_t *)s_pc_dump_frame_buffer;
+    CameraFrame_t frame;
+    const uint8_t *payload;
     uint32_t offset = 0U;
     uint32_t crc;
 
@@ -174,6 +168,17 @@ uint8_t Camera_PC_Dump_SendFrame(UART_HandleTypeDef *huart, uint32_t frame_id)
     {
         return 1U;
     }
+
+    if ((Camera_FrameBuffer_GetFrontFrame(&frame) != CAMERA_FB_OK) ||
+        (frame.data == NULL) ||
+        (frame.width != PC_DUMP_WIDTH) ||
+        (frame.height != PC_DUMP_HEIGHT) ||
+        (frame.size_bytes != PC_DUMP_PAYLOAD_LEN))
+    {
+        return 5U;
+    }
+
+    payload = (const uint8_t *)frame.data;
 
     /* 组装帧头 */
     for (uint32_t i = 0U; i < sizeof(magic); ++i)

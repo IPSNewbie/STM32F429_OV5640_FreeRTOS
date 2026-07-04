@@ -47,6 +47,7 @@ uint8_t Camera_PC_Dump_WaitForDumpCommand(UART_HandleTypeDef *huart);
  *         2 : 帧头发送失败
  *         3 : 有效载荷分块发送失败
  *         4 : CRC 校验值发送失败
+ *         5 : frame buffer state or size invalid
  * @note   数据格式：
  *         8B  魔数 "OV56RGB5"  (标识 OV5640 RGB565 帧)
  *         1B  版本号 = 1

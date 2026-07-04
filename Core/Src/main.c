@@ -31,6 +31,7 @@
 #include "bsp_sccb.h"
 #include "lcd_mcu.h"
 #include "camera_dcmi_dma.h"
+#include "camera_frame_buffer.h"
 #include "camera_pc_dump.h"
 #include "OV5640.h"
 #include "ov5640_tuning.h"
@@ -59,6 +60,7 @@
 #define OV5640_CONTRAST_LEVEL          0
 #define OV5640_SATURATION_LEVEL        1
 #define OV5640_SHARPNESS_LEVEL         0
+#define CAMERA_FRAME_BUFFER_ENABLE     1U
 
 /* USER CODE END PD */
 
@@ -223,6 +225,12 @@ int main(void)
 #error "Unsupported CAMERA_MODE"
 #endif
   /*
+   * Prepare the 160x120 RGB565 front/back buffers before PC Dump capture.
+   */
+#if (CAMERA_FRAME_BUFFER_ENABLE != 0U)
+  Camera_FrameBuffer_Init();
+#endif
+  /*
    * 7. 初始化 DCMI
    */
   Camera_DCMI_Init();
@@ -284,6 +292,7 @@ int main(void)
     }
 
     Camera_DCMI_Stop();
+    (void)Camera_FrameBuffer_CommitBackBuffer();
 
     log_set_level(LOG_LEVEL_NONE);
     dump_ret = Camera_PC_Dump_SendFrame(&huart1, pc_dump_frame_id);
