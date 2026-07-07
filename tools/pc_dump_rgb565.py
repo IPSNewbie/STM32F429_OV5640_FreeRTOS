@@ -36,6 +36,48 @@ SUMMARY_FIELDS = [
 ]
 
 
+def open_camera_serial_port(port_name: str, baudrate: int, timeout_s: float) -> serial.Serial:
+    """
+    Open serial port with explicit RTS/DTR safe state.
+
+    On the ATK STM32F429 + CH340 auto-download circuit:
+    - RTS may affect BOOT0.
+    - DTR may affect RESET.
+    - The tested safe pySerial state is RTS=False and DTR=False.
+
+    Do not use `with serial.Serial(...) as port` here, because that opens
+    the COM port before we explicitly set RTS/DTR.
+    """
+    port = serial.Serial()
+    port.port = port_name
+    port.baudrate = baudrate
+    port.timeout = timeout_s
+    port.write_timeout = 3.0
+
+    # Set safe control-line state before opening the port.
+    # For this board, tested result:
+    #   RTS=False: BOOT0 is not forced into ISP boot state.
+    #   DTR=False: RESET is not forced active.
+    port.rts = False
+    port.dtr = False
+
+    port.open()
+
+    # Confirm safe state again after opening, because some drivers may
+    # briefly initialize control lines during open().
+    port.setRTS(False)
+    port.setDTR(False)
+
+    # Give MCU and USB-UART control lines time to settle.
+    time.sleep(0.1)
+
+    # Clear old boot logs or stale bytes before sending DUMP.
+    port.reset_input_buffer()
+    port.reset_output_buffer()
+
+    return port
+
+
 def read_exact(port: serial.Serial, size: int) -> bytes:
     data = bytearray()
     while len(data) < size:
@@ -161,7 +203,7 @@ def next_capture_number(captures_dir: Path) -> int:
 
 
 def create_capture_paths(
-    captures_dir: Path, tag: str, capture_time: datetime
+        captures_dir: Path, tag: str, capture_time: datetime
 ) -> dict[str, Path]:
     capture_number = next_capture_number(captures_dir)
     timestamp = capture_time.strftime("%Y%m%d_%H%M%S")
@@ -175,12 +217,12 @@ def create_capture_paths(
 
 
 def append_summary(
-    summary_path: Path,
-    frame_id: int,
-    timestamp: str,
-    tag: str,
-    image_file: Path,
-    metrics: dict[str, float],
+        summary_path: Path,
+        frame_id: int,
+        timestamp: str,
+        tag: str,
+        image_file: Path,
+        metrics: dict[str, float],
 ) -> None:
     write_header = not summary_path.exists() or summary_path.stat().st_size == 0
     row = {
@@ -208,15 +250,15 @@ def append_summary(
 
 
 def build_report(
-    frame_id: int,
-    width: int,
-    height: int,
-    payload_len: int,
-    crc32: int,
-    timestamp: str,
-    tag: str,
-    output_files: dict[str, Path],
-    metrics: dict[str, float],
+        frame_id: int,
+        width: int,
+        height: int,
+        payload_len: int,
+        crc32: int,
+        timestamp: str,
+        tag: str,
+        output_files: dict[str, Path],
+        metrics: dict[str, float],
 ) -> str:
     warnings = []
     if metrics["highlight_ratio"] > 5.0:
@@ -282,7 +324,7 @@ Assessment
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Receive one OV5640 RGB565 frame")
-    parser.add_argument("--port", required=True, help="serial port, for example COM5")
+    parser.add_argument("--port", required=True, help="serial port, for example COM6")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--tag", default="capture", help="capture label used in filenames")
@@ -292,15 +334,21 @@ def main() -> None:
     captures_dir.mkdir(parents=True, exist_ok=True)
     capture_tag = sanitize_tag(args.tag)
 
-    with serial.Serial(
-        args.port,
-        args.baud,
-        timeout=args.timeout,
-        write_timeout=3.0,
-    ) as port:
+    port = open_camera_serial_port(args.port, args.baud, args.timeout)
+
+    try:
         magic_found = False
         for attempt in range(1, 4):
             print(f"Sending DUMP command, attempt {attempt}/3...")
+
+            # Keep control lines in safe state before each DUMP attempt.
+            port.setRTS(False)
+            port.setDTR(False)
+            time.sleep(0.02)
+
+            # Clear stale bytes before a new request.
+            port.reset_input_buffer()
+
             port.write(b"DUMP\n")
             port.flush()
 
@@ -335,6 +383,9 @@ def main() -> None:
                 f"CRC32 mismatch: received=0x{received_crc:08X}, "
                 f"calculated=0x{calculated_crc:08X}"
             )
+
+    finally:
+        port.close()
 
     image = rgb565_to_bgr(payload, width, height)
     gray, metrics = analyze_image(image)
@@ -376,7 +427,7 @@ def main() -> None:
         capture_tag,
         output_files["image"],
         metrics,
-    )
+        )
 
     print(
         f"Frame {frame_id}: {width}x{height}, {payload_len} bytes, "

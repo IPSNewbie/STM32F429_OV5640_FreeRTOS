@@ -31,6 +31,7 @@
 #include "bsp_sccb.h"
 #include "lcd_mcu.h"
 #include "camera_dcmi_dma.h"
+#include "camera_cli.h"
 #include "camera_frame_buffer.h"
 #include "camera_image_process.h"
 #include "camera_pc_dump.h"
@@ -70,6 +71,7 @@
 
 #define CAMERA_PROCESS_MODE            CAMERA_PROCESS_MODE_BYPASS
 #define CAMERA_BINARY_THRESHOLD        128U
+#define CAMERA_CLI_ENABLE              1U
 
 /* USER CODE END PD */
 
@@ -239,6 +241,9 @@ int main(void)
 #if (CAMERA_FRAME_BUFFER_ENABLE != 0U)
   Camera_FrameBuffer_Init();
 #endif
+#if (CAMERA_CLI_ENABLE != 0U)
+  Camera_CLI_Init();
+#endif
   /*
    * 7. 初始化 DCMI
    */
@@ -306,13 +311,21 @@ int main(void)
 #if CAMERA_IMAGE_PROCESS_ENABLE
     {
       CameraImageProcessStatus_t process_ret;
+      CameraProcessMode_t process_mode;
+      uint8_t binary_threshold;
 
-      process_ret = Camera_ImageProcess_ApplyToFrameBuffer((CameraProcessMode_t)CAMERA_PROCESS_MODE,
-                                                           (uint8_t)CAMERA_BINARY_THRESHOLD);
+#if (CAMERA_CLI_ENABLE != 0U)
+      process_mode = Camera_CLI_GetProcessMode();
+      binary_threshold = Camera_CLI_GetBinaryThreshold();
+#else
+      process_mode = (CameraProcessMode_t)CAMERA_PROCESS_MODE;
+      binary_threshold = (uint8_t)CAMERA_BINARY_THRESHOLD;
+#endif
+
+      process_ret = Camera_ImageProcess_ApplyToFrameBuffer(process_mode, binary_threshold);
       if (process_ret != CAMERA_PROCESS_OK)
       {
-        LOG_ERROR("Image process failed, ret = %u", (unsigned int)process_ret);
-        continue;
+        (void)Camera_ImageProcess_ApplyToFrameBuffer(CAMERA_PROCESS_MODE_BYPASS, binary_threshold);
       }
     }
 #endif

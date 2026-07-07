@@ -1,5 +1,8 @@
 #include "camera_pc_dump.h"
+#include "camera_cli.h"
 #include "camera_frame_buffer.h"
+
+#include <string.h>
 
 /**
  * @file    camera_pc_dump.c
@@ -10,6 +13,134 @@
 
 /* UART 每次发送的最大字节数，避免长时间占用总线 */
 #define PC_DUMP_UART_CHUNK_SIZE  1024U
+#define PC_DUMP_COMMAND_LINE_LEN 32U
+
+static char Camera_PC_Dump_ToUpper(char ch)
+{
+    if ((ch >= 'a') && (ch <= 'z'))
+    {
+        return (char)(ch - ('a' - 'A'));
+    }
+
+    return ch;
+}
+
+static uint8_t Camera_PC_Dump_IsSpace(char ch)
+{
+    return ((ch == ' ') || (ch == '\t')) ? 1U : 0U;
+}
+
+static const char *Camera_PC_Dump_TrimLeft(const char *line)
+{
+    while ((line != NULL) && (Camera_PC_Dump_IsSpace(*line) != 0U))
+    {
+        ++line;
+    }
+
+    return line;
+}
+
+static uint32_t Camera_PC_Dump_TrimmedLength(const char *line)
+{
+    uint32_t len = 0U;
+
+    if (line == NULL)
+    {
+        return 0U;
+    }
+
+    while (line[len] != '\0')
+    {
+        ++len;
+    }
+
+    while ((len > 0U) && (Camera_PC_Dump_IsSpace(line[len - 1U]) != 0U))
+    {
+        --len;
+    }
+
+    return len;
+}
+
+static uint8_t Camera_PC_Dump_LineEquals(const char *line, const char *token)
+{
+    const char *trimmed = Camera_PC_Dump_TrimLeft(line);
+    uint32_t len = Camera_PC_Dump_TrimmedLength(trimmed);
+    uint32_t i = 0U;
+
+    while (token[i] != '\0')
+    {
+        if (i >= len)
+        {
+            return 0U;
+        }
+
+        if (Camera_PC_Dump_ToUpper(trimmed[i]) != token[i])
+        {
+            return 0U;
+        }
+
+        ++i;
+    }
+
+    return (i == len) ? 1U : 0U;
+}
+
+static void Camera_PC_Dump_ClearUartErrors(UART_HandleTypeDef *huart)
+{
+    if (huart == NULL)
+    {
+        return;
+    }
+
+#ifdef UART_FLAG_PE
+    if (__HAL_UART_GET_FLAG(huart, UART_FLAG_PE) != RESET)
+    {
+        __HAL_UART_CLEAR_PEFLAG(huart);
+    }
+#endif
+#ifdef UART_FLAG_FE
+    if (__HAL_UART_GET_FLAG(huart, UART_FLAG_FE) != RESET)
+    {
+        __HAL_UART_CLEAR_FEFLAG(huart);
+    }
+#endif
+#ifdef UART_FLAG_NE
+    if (__HAL_UART_GET_FLAG(huart, UART_FLAG_NE) != RESET)
+    {
+        __HAL_UART_CLEAR_NEFLAG(huart);
+    }
+#endif
+#ifdef UART_FLAG_ORE
+    if (__HAL_UART_GET_FLAG(huart, UART_FLAG_ORE) != RESET)
+    {
+        __HAL_UART_CLEAR_OREFLAG(huart);
+    }
+#endif
+
+    huart->ErrorCode = HAL_UART_ERROR_NONE;
+}
+
+static void Camera_PC_Dump_ResetLine(char *line,
+                                     uint32_t line_size,
+                                     uint8_t *line_length,
+                                     uint8_t *line_overflow)
+{
+    if ((line != NULL) && (line_size > 0U))
+    {
+        (void)memset(line, 0, line_size);
+    }
+
+    if (line_length != NULL)
+    {
+        *line_length = 0U;
+    }
+
+    if (line_overflow != NULL)
+    {
+        *line_overflow = 0U;
+    }
+}
 
 /**
  * @brief  将 uint16_t 以小端序写入字节数组
@@ -68,8 +199,9 @@ uint32_t Camera_PC_Dump_GetWordCount(void)
 //等待 PC 通过 UART 发送命令行
 uint8_t Camera_PC_Dump_WaitForCommand(UART_HandleTypeDef *huart)
 {
-    uint8_t line[8];
+    char line[PC_DUMP_COMMAND_LINE_LEN];
     uint8_t line_length = 0U;
+    uint8_t line_overflow = 0U;
     uint8_t byte;
 
     if (huart == NULL)
@@ -77,13 +209,12 @@ uint8_t Camera_PC_Dump_WaitForCommand(UART_HandleTypeDef *huart)
         return CAMERA_PC_DUMP_CMD_NONE;
     }
 
-    if (__HAL_UART_GET_FLAG(huart, UART_FLAG_ORE) != RESET)
-    {
-        __HAL_UART_CLEAR_OREFLAG(huart);
-    }
+    Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, &line_overflow);
+    Camera_PC_Dump_ClearUartErrors(huart);
 
     for (;;)
     {
+        Camera_PC_Dump_ClearUartErrors(huart);
         HAL_StatusTypeDef status = HAL_UART_Receive(huart, &byte, 1U, 100U);
 
         if (status == HAL_TIMEOUT)
@@ -93,49 +224,57 @@ uint8_t Camera_PC_Dump_WaitForCommand(UART_HandleTypeDef *huart)
 
         if (status != HAL_OK)
         {
-            if (__HAL_UART_GET_FLAG(huart, UART_FLAG_ORE) != RESET)
-            {
-                __HAL_UART_CLEAR_OREFLAG(huart);
-            }
-            line_length = 0U;
+            Camera_PC_Dump_ClearUartErrors(huart);
+            Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, &line_overflow);
             continue;
         }
 
         if ((byte == '\r') || (byte == '\n'))
         {
-            if (line_length == 0U)
+            if (line_overflow != 0U)
             {
+                (void)Camera_CLI_HandleLine(huart, "UNKNOWN");
+                Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, &line_overflow);
                 continue;
             }
 
-            if ((line_length == 4U) &&
-                (line[0] == 'D') &&
-                (line[1] == 'U') &&
-                (line[2] == 'M') &&
-                (line[3] == 'P'))
+            if (line_length == 0U)
             {
+                Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, &line_overflow);
+                continue;
+            }
+
+            line[line_length] = '\0';
+
+            if (Camera_PC_Dump_LineEquals(line, "DUMP") != 0U)
+            {
+                Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, &line_overflow);
                 return CAMERA_PC_DUMP_CMD_DUMP;
             }
 
-            if ((line_length == 3U) &&
-                (line[0] == 'A') &&
-                (line[1] == 'E') &&
-                (line[2] == 'C'))
-            {
-                return CAMERA_PC_DUMP_CMD_AEC;
-            }
-
-            line_length = 0U;
+            (void)Camera_CLI_HandleLine(huart, line);
+            Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, &line_overflow);
             continue;
         }
 
-        if (line_length < sizeof(line))
+        if (((byte < 0x20U) && (byte != '\t')) || (byte == 0x7FU))
         {
-            line[line_length++] = byte;
+            continue;
+        }
+
+        if (line_overflow != 0U)
+        {
+            continue;
+        }
+
+        if (line_length < (uint8_t)(sizeof(line) - 1U))
+        {
+            line[line_length++] = (char)byte;
         }
         else
         {
-            line_length = 0U;
+            Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, NULL);
+            line_overflow = 1U;
         }
     }
 }
