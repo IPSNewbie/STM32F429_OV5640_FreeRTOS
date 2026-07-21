@@ -45,6 +45,12 @@ add_executable(${CMAKE_PROJECT_NAME}
         BSPDrivers/Src/delay_tim.c
         BSPDrivers/Inc/camera_dcmi_dma.h
         BSPDrivers/Src/camera_dcmi_dma.c
+        BSPDrivers/Inc/camera_cli.h
+        BSPDrivers/Src/camera_cli.c
+        BSPDrivers/Inc/camera_frame_buffer.h
+        BSPDrivers/Src/camera_frame_buffer.c
+        BSPDrivers/Inc/camera_image_process.h
+        BSPDrivers/Src/camera_image_process.c
         BSPDrivers/Inc/lcd_mcu.h
         BSPDrivers/Src/lcd_mcu.c
         BSPDrivers/Inc/OV5640.h
@@ -62,7 +68,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
 )
 
-file(GLOB_RECURSE BSPDRIVERS "BSPDrivers/Src/*.c")
+file(GLOB_RECURSE BSPDRIVERS CONFIGURE_DEPENDS "BSPDrivers/Src/*.c")
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         # Add user sources here

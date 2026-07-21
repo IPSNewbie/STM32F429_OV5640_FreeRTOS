@@ -8,10 +8,6 @@
 #include "stm32f4xx_hal.h"
 #include <stdint.h>
 
-/* 摄像头当前测试输出尺寸：QVGA = 320 x 240 */
-#define CAMERA_QVGA_WIDTH       320U
-#define CAMERA_QVGA_HEIGHT      240U
-
 /* DCMI 句柄：管理 DCMI 外设的初始化参数、状态和寄存器操作 */
 extern DCMI_HandleTypeDef g_camera_dcmi;
 
@@ -29,6 +25,28 @@ void Camera_DCMI_GPIO_Init(void);
  * 8 位数据宽度、帧中断和 NVIC
  */
 void Camera_DCMI_Init(void);
+
+/* Capture exactly one frame from DCMI into a word-aligned SRAM buffer. */
+/**
+ * @brief  启动 DCMI 快照，将一帧图像通过 DMA 保存到内存缓冲区
+ * @param  buffer_addr : 目标缓冲区地址（必须 4 字节对齐）
+ * @param  word_count  : 要传输的 32 位字数（一帧总像素数 / 2）
+ * @retval 0:成功, 1:参数错误, 2:DMA 反初始化失败, 3:DMA 初始化失败, 4:启动失败
+ */
+uint8_t Camera_DCMI_StartSnapshotToBuffer(uint32_t buffer_addr, uint32_t word_count);
+
+/**
+ * @brief  查询 DCMI 快照是否传输完成
+ * @retval 0: 未完成，仍在传输中
+ *         非 0: 已触发 DMA 传输完成中断，快照完成
+ */
+uint8_t Camera_DCMI_IsSnapshotDone(void);
+
+/**
+ * @brief  清除快照完成标志
+ * @note   准备开始下一次快照前必须调用，否则状态会残留
+ */
+void Camera_DCMI_ClearSnapshotDone(void);
 
 /* 配置 DMA，让 DCMI 接收到的数据直接写入 LCD GRAM
  * lcd_ram_addr 是 LCD 数据口地址，例如：

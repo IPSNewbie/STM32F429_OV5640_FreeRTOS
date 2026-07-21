@@ -24,6 +24,9 @@ LCD_MCU_Device_t g_lcd_mcu = {0};        // LCD 全局参数结构体，保存 I
 
 static SRAM_HandleTypeDef s_lcd_sram;    // FMC SRAM 句柄，LCD 在 STM32 里按外部 SRAM 方式访问
 
+#define LCD_MCU_WRITE_ADDRESS_SETUP       6
+#define LCD_MCU_WRITE_DATA_SETUP          6
+
 /* ---------------- low level ---------------- */
 
 void LCD_MCU_WriteReg(uint16_t reg)
@@ -162,6 +165,52 @@ static void LCD_MCU_GPIO_FMC_Init(void)
     HAL_Delay(50);                                       // 等待 LCD/FMC 时序稳定
 }
 
+static void LCD_MCU_ApplyFastWriteTimingIfNeeded(void)
+{
+    // 定义一个写时序配置结构体并初始化为零
+    FMC_NORSRAM_TimingTypeDef timing_write = {0};
+
+    // 仅对 NT35310 型号应用快速写时序，其他液晶驱动直接返回
+    if (g_lcd_mcu.id != LCD_MCU_ID_NT35310)
+    {
+        return;
+    }
+
+    /*
+     * NT35310 写时序，用于 DCMI-DMA 直接写入 LCD GRAM。
+     * 测试记录：15/15 和 10/10 在 480x320 下出现雪花，
+     * 8/8、6/6、4/4、3/3 均稳定，选用 6/6 作为默认值。
+     */
+
+    // 写地址建立时间（由宏 LCD_MCU_WRITE_ADDRESS_SETUP 指定，例如 6）=(6+1)×5.56≈38.9ns
+    timing_write.AddressSetupTime = LCD_MCU_WRITE_ADDRESS_SETUP;
+
+    // 地址保持时间设为 0=(0+1)×5.56=5.56ns
+    timing_write.AddressHoldTime = 0;
+
+    // 写数据建立时间（由宏 LCD_MCU_WRITE_DATA_SETUP 指定，例如 6）=(6+1)×5.56≈38.9ns
+    timing_write.DataSetupTime = LCD_MCU_WRITE_DATA_SETUP;
+
+    // 总线周转时间设为 0=(0+1)×5.56=5.56ns
+    timing_write.BusTurnAroundDuration = 0;
+
+    // FMC 时钟分频系数，影响读写速度
+    timing_write.CLKDivision = 2;
+
+    // 数据延迟周期数
+    timing_write.DataLatency = 2;
+
+    // 访问模式设为模式 A
+    timing_write.AccessMode = FMC_ACCESS_MODE_A;
+
+    // 将上述写时序配置写入 FMC 的扩展模式寄存器，
+    // 作用于当前 LCD 所映射到的存储块和扩展模式。
+    (void)FMC_NORSRAM_Extended_Timing_Init(s_lcd_sram.Extended,
+                                           &timing_write,
+                                           s_lcd_sram.Init.NSBank,
+                                           s_lcd_sram.Init.ExtendedMode);
+}
+
 /* ---------------- ID ---------------- */
 
 uint16_t LCD_MCU_ReadID(void)
@@ -252,6 +301,7 @@ void LCD_MCU_Init(void)
     g_lcd_mcu.id = id;                                    // 保存读到的 LCD ID
 
     LCD_MCU_NT35310_RegInit();                            // 执行 NT35310 厂家初始化序列
+    LCD_MCU_ApplyFastWriteTimingIfNeeded();               // Apply verified fast write timing for NT35310.
     LCD_MCU_DisplayDir(1);                                // 设置为横屏，480x320
 
     LCD_MCU_Fill(0, 0, g_lcd_mcu.width, g_lcd_mcu.height, LCD_COLOR_WHITE); // 初始化完成后清白屏

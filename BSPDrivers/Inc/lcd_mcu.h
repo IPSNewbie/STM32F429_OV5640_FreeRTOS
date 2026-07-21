@@ -47,8 +47,8 @@
  */
 typedef struct
 {
-    volatile uint16_t REG;
-    volatile uint16_t RAM;
+    volatile uint16_t REG;//REG 地址0x6007FFFE（访问时 RS = 0，写入命令）
+    volatile uint16_t RAM;//RAM 地址0x6007FFFE + 2 = 0x60080000（访问时 RS = 1，写入数据）
 } LCD_MCU_TypeDef;
 
 /*
