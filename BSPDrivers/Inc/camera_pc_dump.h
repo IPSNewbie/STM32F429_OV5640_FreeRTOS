@@ -4,51 +4,94 @@
 #include "stm32f4xx_hal.h"
 #include <stdint.h>
 
+//============================================================================
+// @file    isp_ov5640_camera_pc_dump.h
+// @brief   OV5640 摄像头 PC 端图像导出模块（UART 传输）
+// @note    用于将 160x120 RGB565 图像帧通过 UART 发送到 PC 上位机。
+//          支持 "DUMP" 和 "AEC" 两个串口命令，数据包包含帧头、有效载荷和 CRC32 校验。
+//============================================================================
+
+
+//============================================================================
+// 图像尺寸及数据包长度宏定义
+//============================================================================
+
+// 图像宽度（像素）
 #define PC_DUMP_WIDTH       160U
+
+// 图像高度（像素）
 #define PC_DUMP_HEIGHT      120U
+
+// DMA 传输所需的 32 位字数（总像素数 / 2，因两个 16 位像素组成一个 32 位字）
 #define PC_DUMP_WORD_COUNT  (PC_DUMP_WIDTH * PC_DUMP_HEIGHT / 2U)
+
+// 有效载荷字节数（图像数据总长度：宽度 × 高度 × 每像素 2 字节）
 #define PC_DUMP_PAYLOAD_LEN (PC_DUMP_WIDTH * PC_DUMP_HEIGHT * 2U)
 
+//============================================================================
+// 串口命令码定义
+//============================================================================
+
+// 无命令
 #define CAMERA_PC_DUMP_CMD_NONE  0U
+
+// 要求传输一帧图像数据
 #define CAMERA_PC_DUMP_CMD_DUMP  1U
+
+// 要求打印 AEC/AGC 寄存器值（调试用）
 #define CAMERA_PC_DUMP_CMD_AEC   2U
+
+//============================================================================
+// 公开函数声明
+//============================================================================
 
 /**
  * @brief  获取图像帧缓冲区的 32 位起始地址
  *         用于配置 DCMI DMA 的目标地址
+ * @return 帧缓冲区首地址（指向后台缓冲区的指针）
  */
 uint32_t Camera_PC_Dump_GetBufferAddress(void);
 
 /**
  * @brief  获取图像帧缓冲区的字数（32 位为单位）
  *         用于配置 DCMI DMA 的传输数量
+ * @return 固定值 PC_DUMP_WORD_COUNT（9600）
  */
 uint32_t Camera_PC_Dump_GetWordCount(void);
 
+/**
+ * @brief  等待 PC 通过 UART 发送任意命令（DUMP 或 AEC）
+ * @param  huart 使用的 UART 句柄
+ * @retval CAMERA_PC_DUMP_CMD_DUMP  收到 "DUMP\n" 命令
+ * @retval CAMERA_PC_DUMP_CMD_AEC   收到 "AEC\n" 命令
+ * @retval CAMERA_PC_DUMP_CMD_NONE  参数无效（huart == NULL）或超时/错误
+ * @note   该函数会阻塞，逐字节接收 UART 数据。
+ *         忽略 '\r'，以 '\n' 为行结束符。
+ *         支持 "DUMP" 和 "AEC" 两个命令（不区分大小写）。
+ */
 uint8_t Camera_PC_Dump_WaitForCommand(UART_HandleTypeDef *huart);
 
 /**
- * @brief  等待 PC 通过 UART 发送 "DUMP" 命令
- * @param  huart : 使用的 UART 句柄
- * @retval 1 : 收到有效 "DUMP" 命令
- *         0 : 参数无效（huart == NULL）
- * @note   该函数会阻塞，逐字节接收 UART 数据。
- *         忽略 '\r'，以 '\n' 为行结束符。
- *         当接收到 "DUMP\n" 时返回 1；其他行或错误后重置接收状态。
+ * @brief  等待 PC 通过 UART 发送 "DUMP" 命令（专用版本）
+ * @param  huart 使用的 UART 句柄
+ * @retval 1 收到有效 "DUMP" 命令
+ * @retval 0 参数无效（huart == NULL）或收到其他命令（如 AEC）
+ * @note   该函数会阻塞，内部调用 @ref Camera_PC_Dump_WaitForCommand，
+ *         若收到 AEC 命令则继续等待，直到收到 DUMP 或出错。
  */
 uint8_t Camera_PC_Dump_WaitForDumpCommand(UART_HandleTypeDef *huart);
 
 /**
  * @brief  将一帧图像数据打包并通过 UART 发送给 PC
- * @param  huart    : UART 句柄
- * @param  frame_id : 帧序号，PC 端可用于排序或丢弃重复帧
- * @retval 0 : 发送成功
- *         1 : huart 为空
- *         2 : 帧头发送失败
- *         3 : 有效载荷分块发送失败
- *         4 : CRC 校验值发送失败
- *         5 : frame buffer state or size invalid
- * @note   数据格式：
+ * @param  huart    UART 句柄
+ * @param  frame_id 帧序号，PC 端可用于排序或丢弃重复帧
+ * @retval 0 发送成功
+ * @retval 1 huart 为空
+ * @retval 2 帧头发送失败
+ * @retval 3 有效载荷分块发送失败
+ * @retval 4 CRC 校验值发送失败
+ * @retval 5 帧缓冲区状态或大小无效（数据指针为空或尺寸不匹配）
+ * @note   数据格式（小端）：
  *         8B  魔数 "OV56RGB5"  (标识 OV5640 RGB565 帧)
  *         1B  版本号 = 1
  *         1B  保留 = 1
