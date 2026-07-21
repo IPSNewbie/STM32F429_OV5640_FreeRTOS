@@ -31,3 +31,11 @@ Listings/
 *.uvoptx.bak
 *.uvprojx.bak
 .idea/
+
+# PC dump generated outputs
+captures/
+ov5640_dump.png
+ov5640_gray.png
+ov5640_hist.png
+ov5640_report.txt
+frame.png

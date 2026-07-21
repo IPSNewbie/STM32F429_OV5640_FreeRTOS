@@ -31,7 +31,12 @@
 #include "bsp_sccb.h"
 #include "lcd_mcu.h"
 #include "camera_dcmi_dma.h"
+#include "camera_cli.h"
+#include "camera_frame_buffer.h"
+#include "camera_image_process.h"
+#include "camera_pc_dump.h"
 #include "OV5640.h"
+#include "ov5640_tuning.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,6 +46,32 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define CAMERA_MODE_480X320_REAL       0
+#define CAMERA_MODE_480X320_TESTBAR    1
+#define CAMERA_MODE_320X240_REAL       2
+#define CAMERA_MODE_PC_DUMP_RGB565     3
+
+#define CAMERA_MODE                    CAMERA_MODE_PC_DUMP_RGB565
+#define PC_DUMP_USE_REAL_IMAGE         1U
+#define OV5640_AEC_TUNING_ENABLE       1U
+#define OV5640_AEC_TUNING_LEVEL        OV5640_AEC_TARGET_BASELINE
+#define OV5640_AWB_TUNING_ENABLE       1U
+#define OV5640_AWB_TUNING_MODE         OV5640_AWB_MODE_AUTO
+#define OV5640_IMAGE_TUNING_ENABLE     1U
+#define OV5640_BRIGHTNESS_LEVEL        1
+#define OV5640_CONTRAST_LEVEL          0
+#define OV5640_SATURATION_LEVEL        1
+#define OV5640_SHARPNESS_LEVEL         0
+#define CAMERA_FRAME_BUFFER_ENABLE     1U
+#define CAMERA_IMAGE_PROCESS_ENABLE    1U
+
+#define CAMERA_PROCESS_MODE_BYPASS     0
+#define CAMERA_PROCESS_MODE_GRAYSCALE  1
+#define CAMERA_PROCESS_MODE_BINARY     2
+
+#define CAMERA_PROCESS_MODE            CAMERA_PROCESS_MODE_BYPASS
+#define CAMERA_BINARY_THRESHOLD        128U
+#define CAMERA_CLI_ENABLE              1U
 
 /* USER CODE END PD */
 
@@ -146,16 +177,73 @@ int main(void)
   /*
     * 5. LCD 初始化，本地彩条验证
     */
+#if CAMERA_MODE != CAMERA_MODE_PC_DUMP_RGB565
   LCD_MCU_Init();
-  LCD_MCU_TestSequence();
+  //关闭LCD彩条测试
+  // LCD_MCU_TestSequence();
   HAL_Delay(1000);
+#endif
 
   /*
-   * 6. 配置 OV5640：RGB565 + QVGA + 测试彩条
+   * 6. Configure OV5640 output mode.
    */
-  uint8_t ret = OV5640_Min_InitRGB565_QVGA_TestBar();
-  LOG_INFO("OV5640 testbar init ret = %d", ret);
-
+#if CAMERA_MODE == CAMERA_MODE_PC_DUMP_RGB565
+#if PC_DUMP_USE_REAL_IMAGE
+  uint8_t ret = OV5640_Min_InitRGB565_160x120_RealImage();
+#else
+  uint8_t ret = OV5640_Min_InitRGB565_160x120_TestBar();
+#endif
+  LOG_INFO("OV5640 PC dump 160x120 init ret = %d", ret);
+#if OV5640_AEC_TUNING_ENABLE
+  if (ret == 0U)
+  {
+    uint8_t aec_target_ret = OV5640_Tuning_SetAecTarget(OV5640_AEC_TUNING_LEVEL);
+    LOG_INFO("OV5640 AEC target set ret = %u", aec_target_ret);
+    HAL_Delay(1000U);
+  }
+#endif
+#if OV5640_AWB_TUNING_ENABLE
+  if (ret == 0U)
+  {
+    uint8_t awb_mode_ret = OV5640_Tuning_SetAWBMode(OV5640_AWB_TUNING_MODE);
+    LOG_INFO("OV5640 AWB mode set ret = %u", awb_mode_ret);
+  }
+#endif
+#if OV5640_IMAGE_TUNING_ENABLE
+  if (ret == 0U)
+  {
+    uint8_t brightness_ret = OV5640_Tuning_SetBrightness(OV5640_BRIGHTNESS_LEVEL);
+    uint8_t contrast_ret = OV5640_Tuning_SetContrast(OV5640_CONTRAST_LEVEL);
+    uint8_t saturation_ret = OV5640_Tuning_SetSaturation(OV5640_SATURATION_LEVEL);
+    uint8_t sharpness_ret = OV5640_Tuning_SetSharpness(OV5640_SHARPNESS_LEVEL);
+    LOG_INFO("OV5640 image tuning ret B=%u C=%u S=%u H=%u",
+             brightness_ret,
+             contrast_ret,
+             saturation_ret,
+             sharpness_ret);
+  }
+#endif
+#elif CAMERA_MODE == CAMERA_MODE_480X320_REAL
+  uint8_t ret = OV5640_Min_InitRGB565_480x320_RealImage();
+  LOG_INFO("OV5640 480x320 real image init ret = %d", ret);
+#elif CAMERA_MODE == CAMERA_MODE_480X320_TESTBAR
+  uint8_t ret = OV5640_Min_InitRGB565_480x320_TestBar();
+  LOG_INFO("OV5640 480x320 testbar init ret = %d", ret);
+#elif CAMERA_MODE == CAMERA_MODE_320X240_REAL
+  uint8_t ret = OV5640_Min_InitRGB565_QVGA_RealImage();
+  LOG_INFO("OV5640 320x240 real image init ret = %d", ret);
+#else
+#error "Unsupported CAMERA_MODE"
+#endif
+  /*
+   * Prepare the 160x120 RGB565 front/back buffers before PC Dump capture.
+   */
+#if (CAMERA_FRAME_BUFFER_ENABLE != 0U)
+  Camera_FrameBuffer_Init();
+#endif
+#if (CAMERA_CLI_ENABLE != 0U)
+  Camera_CLI_Init();
+#endif
   /*
    * 7. 初始化 DCMI
    */
@@ -164,13 +252,110 @@ int main(void)
   /*
    * 8. 配置 DMA：DCMI 数据直接写 LCD GRAM
    */
+#if CAMERA_MODE == CAMERA_MODE_PC_DUMP_RGB565
+  uint32_t pc_dump_frame_id = 1U;
+
+  LOG_RAW("[PC_DUMP] ready, send DUMP to capture frame\r\n");
+
+  while (1)
+  {
+    uint8_t snapshot_ret;
+    uint8_t dump_ret;
+    uint8_t pc_command;
+    uint32_t snapshot_start_tick;
+
+    pc_command = Camera_PC_Dump_WaitForCommand(&huart1);
+    if ((pc_command != CAMERA_PC_DUMP_CMD_AEC) &&
+        (pc_command != CAMERA_PC_DUMP_CMD_DUMP))
+    {
+      continue;
+    }
+
+    if (pc_command == CAMERA_PC_DUMP_CMD_AEC)
+    {
+      (void)OV5640_Tuning_DumpAECRegs();
+      continue;
+    }
+
+    Camera_DCMI_ClearSnapshotDone();
+
+    snapshot_ret = Camera_DCMI_StartSnapshotToBuffer(
+        Camera_PC_Dump_GetBufferAddress(),
+        Camera_PC_Dump_GetWordCount());
+    if (snapshot_ret != 0U)
+    {
+      Camera_DCMI_Stop();
+      LOG_ERROR("DCMI snapshot start failed, ret = %u", snapshot_ret);
+      continue;
+    }
+
+    snapshot_start_tick = HAL_GetTick();
+    while (Camera_DCMI_IsSnapshotDone() == 0U)
+    {
+      if ((HAL_GetTick() - snapshot_start_tick) > 3000U)
+      {
+        break;
+      }
+    }
+
+    if (Camera_DCMI_IsSnapshotDone() == 0U)
+    {
+      Camera_DCMI_Stop();
+      LOG_ERROR("DCMI snapshot timeout");
+      continue;
+    }
+
+    Camera_DCMI_Stop();
+    (void)Camera_FrameBuffer_CommitBackBuffer();
+
+#if CAMERA_IMAGE_PROCESS_ENABLE
+    {
+      CameraImageProcessStatus_t process_ret;
+      CameraProcessMode_t process_mode;
+      uint8_t binary_threshold;
+
+#if (CAMERA_CLI_ENABLE != 0U)
+      process_mode = Camera_CLI_GetProcessMode();
+      binary_threshold = Camera_CLI_GetBinaryThreshold();
+#else
+      process_mode = (CameraProcessMode_t)CAMERA_PROCESS_MODE;
+      binary_threshold = (uint8_t)CAMERA_BINARY_THRESHOLD;
+#endif
+
+      process_ret = Camera_ImageProcess_ApplyToFrameBuffer(process_mode, binary_threshold);
+      if (process_ret != CAMERA_PROCESS_OK)
+      {
+        (void)Camera_ImageProcess_ApplyToFrameBuffer(CAMERA_PROCESS_MODE_BYPASS, binary_threshold);
+      }
+    }
+#endif
+
+    log_set_level(LOG_LEVEL_NONE);
+    dump_ret = Camera_PC_Dump_SendFrame(&huart1, pc_dump_frame_id);
+    log_set_level(LOG_LEVEL_DEBUG);
+
+    if (dump_ret != 0U)
+    {
+      LOG_ERROR("PC RGB565 frame send failed, ret = %u", dump_ret);
+      continue;
+    }
+
+    pc_dump_frame_id++;
+  }
+#else
   Camera_DCMI_DMA_ConfigToLCD((uint32_t)LCD_MCU_GetRAMAddress());
 
   /*
-   * 9. 设置 LCD 显示窗口，并启动 DCMI 捕获
-   *    QVGA 320x240 显示在屏幕左上角
+   * 9. Set LCD window and start DCMI capture.
    */
+#if (CAMERA_MODE == CAMERA_MODE_480X320_REAL) || (CAMERA_MODE == CAMERA_MODE_480X320_TESTBAR)
+  Camera_DCMI_StartToLCD(0, 0, 480, 320);
+#elif CAMERA_MODE == CAMERA_MODE_320X240_REAL
   Camera_DCMI_StartToLCD(0, 0, 320, 240);
+#else
+#error "Unsupported CAMERA_MODE"
+#endif
+#endif /* CAMERA_MODE_PC_DUMP_RGB565 */
   HAL_Delay(100);
 
   LOG_INFO("DCMI CR   = 0x%08lX", DCMI->CR);
@@ -192,7 +377,7 @@ int main(void)
     // LOG_ERROR("Sensor read failed, error = 0x%02X", err);
     //LOG_RAW("This is raw text without any prefix\r\n");
     //PCF8574_WriteBit(PCF8574_IO_P0, 0);   /* 设置 P0 引脚为低电平，测试蜂鸣器 */
-    
+
     //PCF8574_WriteBit(PCF8574_OV_PWDN_IO, 0);   /* 连接摄像头电源引脚到地，开启摄像头 */
 
   }

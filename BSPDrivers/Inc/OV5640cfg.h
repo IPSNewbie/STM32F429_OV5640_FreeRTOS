@@ -119,13 +119,17 @@ const uint16_t ov5640_rgb565_reg_tbl[][2] =
     0x3814, 0x31, /* timing X inc */
     0x3815, 0x31, /* timing Y inc */
 
-    // 输入窗口起点
+    // 输入传感器窗口起点
+    //X_start = 0x0000 = 0
+    //Y_start = 0x0000 = 0
     0x3800, 0x00, /* HS */
     0x3801, 0x00, /* HS */
     0x3802, 0x00, /* VS */
     0x3803, 0x00, /* VS */
 
-    // 输入窗口终点，决定从 sensor 原始阵列中取多大区域
+    // 输入传感器窗口终点，决定从 sensor 原始阵列中取多大区域
+    //X_end   = 0x0A3F = 2623
+    //Y_end   = 0x06A9 = 1705
     0x3804, 0x0a, /* HW (HE) */
     0x3805, 0x3f, /* HW (HE) */
     0x3806, 0x06, /* VH (VE) */
@@ -194,7 +198,8 @@ const uint16_t ov5640_init_reg_tbl[][2] =
 {
     /* 24MHz input clock, 24MHz PCLK */
 
-    // 退出软件掉电，bit[6] 控制 software power down
+    // 退出软件掉电，bit[6] 控制 software power down。此模式与PWDN不同，PWDN硬件掉电，传感器进入低功耗，SCCB 通常不能正常访问；
+    // 而软件掉电则是通过寄存器控制，SCCB 仍可访问寄存器，适合在运行时临时降低功耗。
     0x3008, 0x42, /* software power down, bit[6] */
 
     // 系统时钟来源配置
