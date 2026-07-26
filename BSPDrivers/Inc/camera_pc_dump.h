@@ -41,6 +41,12 @@
 // 要求打印 AEC/AGC 寄存器值（调试用）
 #define CAMERA_PC_DUMP_CMD_AEC   2U
 
+// 已处理完整的文本 CLI 命令
+#define CAMERA_PC_DUMP_CMD_CLI   3U
+
+// 已消耗一个命令字节，但行尚未完整接收
+#define CAMERA_PC_DUMP_CMD_PENDING 4U
+
 //============================================================================
 // 公开函数声明
 //============================================================================
@@ -60,26 +66,29 @@ uint32_t Camera_PC_Dump_GetBufferAddress(void);
 uint32_t Camera_PC_Dump_GetWordCount(void);
 
 /**
- * @brief  等待 PC 通过 UART 发送任意命令（DUMP 或 AEC）
- * @param  huart 使用的 UART 句柄
- * @retval CAMERA_PC_DUMP_CMD_DUMP  收到 "DUMP\n" 命令
- * @retval CAMERA_PC_DUMP_CMD_AEC   收到 "AEC\n" 命令
- * @retval CAMERA_PC_DUMP_CMD_NONE  参数无效（huart == NULL）或超时/错误
- * @note   该函数会阻塞，逐字节接收 UART 数据。
- *         忽略 '\r'，以 '\n' 为行结束符。
- *         支持 "DUMP" 和 "AEC" 两个命令（不区分大小写）。
+ * @brief  轮询方式接收 PC 串口命令（非阻塞，适合 RTOS 任务）
+ * @param  huart UART 句柄，用于命令接收及 CLI 文本响应
+ * @retval CAMERA_PC_DUMP_CMD_NONE     当前无完整命令可用
+ * @retval CAMERA_PC_DUMP_CMD_DUMP     接收到完整的 "DUMP" 命令
+ * @retval CAMERA_PC_DUMP_CMD_CLI      接收到完整的文本 CLI 命令并已处理
+ * @retval CAMERA_PC_DUMP_CMD_PENDING  正在缓存部分命令（尚未完整）
+ * @note   该函数调用后立即返回，不会阻塞。每次调用尝试接收一个字节，
+ *         若超时则返回 NONE，RTOS 任务可安全地让出 CPU 而不丢失已缓存的行。
+ *         内部使用静态变量维护当前行的接收状态。
  */
-uint8_t Camera_PC_Dump_WaitForCommand(UART_HandleTypeDef *huart);
+uint8_t Camera_PC_Dump_PollCommand(UART_HandleTypeDef *huart);
 
-/**
- * @brief  等待 PC 通过 UART 发送 "DUMP" 命令（专用版本）
- * @param  huart 使用的 UART 句柄
- * @retval 1 收到有效 "DUMP" 命令
- * @retval 0 参数无效（huart == NULL）或收到其他命令（如 AEC）
- * @note   该函数会阻塞，内部调用 @ref Camera_PC_Dump_WaitForCommand，
- *         若收到 AEC 命令则继续等待，直到收到 DUMP 或出错。
- */
-uint8_t Camera_PC_Dump_WaitForDumpCommand(UART_HandleTypeDef *huart);
+// /**
+//  * @brief  等待 PC 通过 UART 发送任意命令（DUMP 或 AEC）
+//  * @param  huart 使用的 UART 句柄
+//  * @retval CAMERA_PC_DUMP_CMD_DUMP  收到 "DUMP\n" 命令
+//  * @retval CAMERA_PC_DUMP_CMD_AEC   收到 "AEC\n" 命令
+//  * @retval CAMERA_PC_DUMP_CMD_NONE  参数无效（huart == NULL）或超时/错误
+//  * @note   该函数会阻塞，逐字节接收 UART 数据。
+//  *         忽略 '\r'，以 '\n' 为行结束符。
+//  *         支持 "DUMP" 和 "AEC" 两个命令（不区分大小写）。
+//  */
+// uint8_t Camera_PC_Dump_WaitForCommand(UART_HandleTypeDef *huart);
 
 /**
  * @brief  将一帧图像数据打包并通过 UART 发送给 PC

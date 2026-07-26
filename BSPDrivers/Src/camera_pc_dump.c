@@ -17,6 +17,11 @@
 // 用于接收串口命令行的最大长度（32 字节，含终止符）
 #define PC_DUMP_COMMAND_LINE_LEN 32U
 
+static char s_camera_pc_dump_line[PC_DUMP_COMMAND_LINE_LEN];
+static uint8_t s_camera_pc_dump_line_length;
+static uint8_t s_camera_pc_dump_line_overflow;
+static UART_HandleTypeDef *s_camera_pc_dump_command_uart;
+
 // 将小写字母转换为大写（仅处理 a-z）
 static char Camera_PC_Dump_ToUpper(char ch)
 {
@@ -184,106 +189,135 @@ uint32_t Camera_PC_Dump_GetWordCount(void)
     return PC_DUMP_WORD_COUNT;
 }
 
-// 等待 PC 通过 UART 发送命令行（阻塞，支持 DUMP 和 AEC 命令，其余交给 CLI 处理）
-uint8_t Camera_PC_Dump_WaitForCommand(UART_HandleTypeDef *huart)
+// 轮询方式接收 PC 串口命令（单字节有限超时版本）
+// 参数：huart - UART 句柄
+// 返回值：
+//   CAMERA_PC_DUMP_CMD_DUMP   - 收到完整 "DUMP" 命令
+//   CAMERA_PC_DUMP_CMD_CLI    - 收到其他完整命令行（已交由 CLI 处理）
+//   CAMERA_PC_DUMP_CMD_PENDING - 正在接收命令（尚未完整）
+//   CAMERA_PC_DUMP_CMD_NONE   - 无数据或错误
+// 说明：使用静态变量缓存当前行状态，支持逐字节组装，行结束符为 '\n' 或 '\r'。
+uint8_t Camera_PC_Dump_PollCommand(UART_HandleTypeDef *huart)
 {
-    char line[PC_DUMP_COMMAND_LINE_LEN];   // 行缓存
-    uint8_t line_length = 0U;              // 当前已接收字符数
-    uint8_t line_overflow = 0U;            // 溢出标志（行太长）
-    uint8_t byte;                          // 接收到的单字节
+    uint8_t byte;
+    HAL_StatusTypeDef status;
 
+    // 无效句柄直接返回无命令
     if (huart == NULL)
     {
         return CAMERA_PC_DUMP_CMD_NONE;
     }
 
-    // 重置状态
-    Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, &line_overflow);
-    Camera_PC_Dump_ClearUartErrors(huart);
-
-    for (;;)  // 无限循环，直到收到有效命令
+    // 若 UART 句柄发生变化，重置状态（用于切换串口）
+    if (s_camera_pc_dump_command_uart != huart)
     {
-        Camera_PC_Dump_ClearUartErrors(huart);          // 每次循环前清除错误
-        HAL_StatusTypeDef status = HAL_UART_Receive(huart, &byte, 1U, 100U);
-
-        if (status == HAL_TIMEOUT)
-        {
-            continue;   // 超时则继续等待
-        }
-
-        if (status != HAL_OK)  // 接收出错
-        {
-            Camera_PC_Dump_ClearUartErrors(huart);
-            Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, &line_overflow);
-            continue;
-        }
-
-        // 处理行结束符（\r 或 \n）
-        if ((byte == '\r') || (byte == '\n'))
-        {
-            if (line_overflow != 0U)  // 如果之前行溢出，通知 CLI 并重置
-            {
-                (void)Camera_CLI_HandleLine(huart, "UNKNOWN");
-                Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, &line_overflow);
-                continue;
-            }
-
-            if (line_length == 0U)  // 空行则忽略
-            {
-                Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, &line_overflow);
-                continue;
-            }
-
-            line[line_length] = '\0';  // 添加字符串终止符
-
-            // 检查是否为 "DUMP" 命令
-            if (Camera_PC_Dump_LineEquals(line, "DUMP") != 0U)
-            {
-                Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, &line_overflow);
-                return CAMERA_PC_DUMP_CMD_DUMP;
-            }
-
-            // 非 DUMP 命令（包括 AEC 和其他 CLI 命令）交给 CLI 模块处理
-            (void)Camera_CLI_HandleLine(huart, line);
-            Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, &line_overflow);
-            continue;
-        }
-
-        // 过滤不可打印字符（保留制表符，删除 0x7F）
-        if (((byte < 0x20U) && (byte != '\t')) || (byte == 0x7FU))
-        {
-            continue;
-        }
-
-        // 如果已溢出，则丢弃后续字符直到行结束
-        if (line_overflow != 0U)
-        {
-            continue;
-        }
-
-        // 将字符存入缓存（留一个位置给终止符）
-        if (line_length < (uint8_t)(sizeof(line) - 1U))
-        {
-            line[line_length++] = (char)byte;
-        }
-        else
-        {
-            // 缓存已满，标记溢出并丢弃
-            Camera_PC_Dump_ResetLine(line, sizeof(line), &line_length, NULL);
-            line_overflow = 1U;
-        }
+        s_camera_pc_dump_command_uart = huart;
+        Camera_PC_Dump_ResetLine(s_camera_pc_dump_line,
+                                 sizeof(s_camera_pc_dump_line),
+                                 &s_camera_pc_dump_line_length,
+                                 &s_camera_pc_dump_line_overflow);
     }
-}
 
-// 等待 PC 发送 "DUMP" 命令（忽略 AEC 等命令，只对 DUMP 返回 1）
-uint8_t Camera_PC_Dump_WaitForDumpCommand(UART_HandleTypeDef *huart)
-{
-    uint8_t command;
-    do
+    // 尝试接收 1 字节。不要在接收前清 UART 错误，避免误丢正常字节。
+    status = HAL_UART_Receive(huart, &byte, 1U, 1U);
+    if (status == HAL_TIMEOUT)
     {
-        command = Camera_PC_Dump_WaitForCommand(huart);
-    } while (command == CAMERA_PC_DUMP_CMD_AEC);  // 若收到 AEC，则继续等待
-    return (command == CAMERA_PC_DUMP_CMD_DUMP) ? 1U : 0U;
+        // 超时表示当前无新数据，返回“等待中”
+        return CAMERA_PC_DUMP_CMD_NONE;
+    }
+
+    if (status == HAL_ERROR)
+    {
+        // 接收出错，清除错误并重置行缓存，返回无命令
+        Camera_PC_Dump_ClearUartErrors(huart);
+        Camera_PC_Dump_ResetLine(s_camera_pc_dump_line,
+                                 sizeof(s_camera_pc_dump_line),
+                                 &s_camera_pc_dump_line_length,
+                                 &s_camera_pc_dump_line_overflow);
+        return CAMERA_PC_DUMP_CMD_NONE;
+    }
+
+    if (status != HAL_OK)
+    {
+        // HAL_BUSY 等非错误状态不清 UART 错误，也不丢弃已接收的行缓存
+        return CAMERA_PC_DUMP_CMD_NONE;
+    }
+
+    // 处理行结束符（\r 或 \n）
+    if ((byte == '\r') || (byte == '\n'))
+    {
+        // 如果之前发生了行溢出，告知 CLI 有未知命令并重置
+        if (s_camera_pc_dump_line_overflow != 0U)
+        {
+            (void)Camera_CLI_HandleLine(huart, "UNKNOWN");
+            Camera_PC_Dump_ResetLine(s_camera_pc_dump_line,
+                                     sizeof(s_camera_pc_dump_line),
+                                     &s_camera_pc_dump_line_length,
+                                     &s_camera_pc_dump_line_overflow);
+            return CAMERA_PC_DUMP_CMD_CLI;
+        }
+
+        // 空行忽略，返回“等待中”
+        if (s_camera_pc_dump_line_length == 0U)
+        {
+            Camera_PC_Dump_ResetLine(s_camera_pc_dump_line,
+                                     sizeof(s_camera_pc_dump_line),
+                                     &s_camera_pc_dump_line_length,
+                                     &s_camera_pc_dump_line_overflow);
+            return CAMERA_PC_DUMP_CMD_PENDING;
+        }
+
+        // 添加字符串结束符
+        s_camera_pc_dump_line[s_camera_pc_dump_line_length] = '\0';
+
+        // 检查是否为 "DUMP" 命令
+        if (Camera_PC_Dump_LineEquals(s_camera_pc_dump_line, "DUMP") != 0U)
+        {
+            Camera_PC_Dump_ResetLine(s_camera_pc_dump_line,
+                                     sizeof(s_camera_pc_dump_line),
+                                     &s_camera_pc_dump_line_length,
+                                     &s_camera_pc_dump_line_overflow);
+            return CAMERA_PC_DUMP_CMD_DUMP;
+        }
+
+        // 其他命令交给 CLI 模块处理
+        (void)Camera_CLI_HandleLine(huart, s_camera_pc_dump_line);
+        Camera_PC_Dump_ResetLine(s_camera_pc_dump_line,
+                                 sizeof(s_camera_pc_dump_line),
+                                 &s_camera_pc_dump_line_length,
+                                 &s_camera_pc_dump_line_overflow);
+        return CAMERA_PC_DUMP_CMD_CLI;
+    }
+
+    // 过滤不可打印字符（保留制表符，删除 0x7F 及小于 0x20 的字符）
+    if (((byte < 0x20U) && (byte != '\t')) || (byte == 0x7FU))
+    {
+        return CAMERA_PC_DUMP_CMD_PENDING;
+    }
+
+    // 如果之前已溢出，则丢弃后续字符直到行结束
+    if (s_camera_pc_dump_line_overflow != 0U)
+    {
+        return CAMERA_PC_DUMP_CMD_PENDING;
+    }
+
+    // 将有效字符存入缓存（留一个位置给终止符）
+    if (s_camera_pc_dump_line_length < (uint8_t)(sizeof(s_camera_pc_dump_line) - 1U))
+    {
+        s_camera_pc_dump_line[s_camera_pc_dump_line_length++] = (char)byte;
+    }
+    else
+    {
+        // 缓存已满，标记溢出并重置长度（保留已接收内容，但后续将丢弃直至行结束）
+        Camera_PC_Dump_ResetLine(s_camera_pc_dump_line,
+                                 sizeof(s_camera_pc_dump_line),
+                                 &s_camera_pc_dump_line_length,
+                                 NULL);
+        s_camera_pc_dump_line_overflow = 1U;
+    }
+
+    // 尚未收到行结束符，返回“等待中”
+    return CAMERA_PC_DUMP_CMD_PENDING;
 }
 
 // 将一帧图像数据打包并通过 UART 发送给 PC

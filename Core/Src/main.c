@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 #include "i2c.h"
 #include "tim.h"
 #include "usart.h"
@@ -35,6 +36,7 @@
 #include "camera_frame_buffer.h"
 #include "camera_image_process.h"
 #include "camera_pc_dump.h"
+#include "camera_rtos.h"
 #include "OV5640.h"
 #include "ov5640_tuning.h"
 /* USER CODE END Includes */
@@ -88,8 +90,9 @@
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void Camera_Application_Init(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -133,253 +136,26 @@ int main(void)
   log_init(&huart1);
   log_set_level(LOG_LEVEL_DEBUG);   // 输出 DEBUG 及以上等级
   Delay_TIM7_Init();
+  Camera_Application_Init();
+  Camera_RTOS_Init(&huart1);
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
+  MX_FREERTOS_Init();
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  if (PCF8574_Init())
-  {
-    LOG_ERROR("PCF8574 initialization failed, check I2C connection");
-    HAL_Delay(100);
-  }
-  else
-  {
-    LOG_INFO("PCF8574 initialized successfully");
-  }
-
-  /* 1. 先退出掉电模式：PWDN = 0 */
-  // MyI2C_Init();在MX_I2C2_Init完成了硬件IIC初始化，用于PCF8574通信
-  PCF8574_WriteBit(PCF8574_OV_PWDN_IO, 0);
-  HAL_Delay(20);
-
-  /* 2. 再硬复位 OV5640 */
-  HAL_GPIO_WritePin(OV_RESET_GPIO_Port, OV_RESET_Pin, GPIO_PIN_RESET);
-  HAL_Delay(20);
-
-  HAL_GPIO_WritePin(OV_RESET_GPIO_Port, OV_RESET_Pin, GPIO_PIN_SET);
-  HAL_Delay(50);
-
-  /* 3. 初始化软件 SCCB GPIO */
-  //MX_GPIO_Init();在MX_GPIO_Init完成了SCCB GPIO的初始化，OV_SDA和OV_SCL已经配置为开漏输出，并上拉
-
-  /* 4. 读取 ID */
-  uint16_t ov_id = OV5640_ReadID();
-
-  if (ov_id == 0x5640)
-  {
-    LOG_INFO("OV5640 OK, ID = 0x%04X", ov_id);
-  }
-  else
-  {
-    LOG_ERROR("OV5640 ERROR, ID = 0x%04X", ov_id);
-  }
-
-  /*
-    * 5. LCD 初始化，本地彩条验证
-    */
-#if CAMERA_MODE != CAMERA_MODE_PC_DUMP_RGB565
-  LCD_MCU_Init();
-  //关闭LCD彩条测试
-  // LCD_MCU_TestSequence();
-  HAL_Delay(1000);
-#endif
-
-  /*
-   * 6. Configure OV5640 output mode.
-   */
-#if CAMERA_MODE == CAMERA_MODE_PC_DUMP_RGB565
-#if PC_DUMP_USE_REAL_IMAGE
-  uint8_t ret = OV5640_Min_InitRGB565_160x120_RealImage();
-#else
-  uint8_t ret = OV5640_Min_InitRGB565_160x120_TestBar();
-#endif
-  LOG_INFO("OV5640 PC dump 160x120 init ret = %d", ret);
-#if OV5640_AEC_TUNING_ENABLE
-  if (ret == 0U)
-  {
-    uint8_t aec_target_ret = OV5640_Tuning_SetAecTarget(OV5640_AEC_TUNING_LEVEL);
-    LOG_INFO("OV5640 AEC target set ret = %u", aec_target_ret);
-    HAL_Delay(1000U);
-  }
-#endif
-#if OV5640_AWB_TUNING_ENABLE
-  if (ret == 0U)
-  {
-    uint8_t awb_mode_ret = OV5640_Tuning_SetAWBMode(OV5640_AWB_TUNING_MODE);
-    LOG_INFO("OV5640 AWB mode set ret = %u", awb_mode_ret);
-  }
-#endif
-#if OV5640_IMAGE_TUNING_ENABLE
-  if (ret == 0U)
-  {
-    uint8_t brightness_ret = OV5640_Tuning_SetBrightness(OV5640_BRIGHTNESS_LEVEL);
-    uint8_t contrast_ret = OV5640_Tuning_SetContrast(OV5640_CONTRAST_LEVEL);
-    uint8_t saturation_ret = OV5640_Tuning_SetSaturation(OV5640_SATURATION_LEVEL);
-    uint8_t sharpness_ret = OV5640_Tuning_SetSharpness(OV5640_SHARPNESS_LEVEL);
-    LOG_INFO("OV5640 image tuning ret B=%u C=%u S=%u H=%u",
-             brightness_ret,
-             contrast_ret,
-             saturation_ret,
-             sharpness_ret);
-  }
-#endif
-#elif CAMERA_MODE == CAMERA_MODE_480X320_REAL
-  uint8_t ret = OV5640_Min_InitRGB565_480x320_RealImage();
-  LOG_INFO("OV5640 480x320 real image init ret = %d", ret);
-#elif CAMERA_MODE == CAMERA_MODE_480X320_TESTBAR
-  uint8_t ret = OV5640_Min_InitRGB565_480x320_TestBar();
-  LOG_INFO("OV5640 480x320 testbar init ret = %d", ret);
-#elif CAMERA_MODE == CAMERA_MODE_320X240_REAL
-  uint8_t ret = OV5640_Min_InitRGB565_QVGA_RealImage();
-  LOG_INFO("OV5640 320x240 real image init ret = %d", ret);
-#else
-#error "Unsupported CAMERA_MODE"
-#endif
-  /*
-   * Prepare the 160x120 RGB565 front/back buffers before PC Dump capture.
-   */
-#if (CAMERA_FRAME_BUFFER_ENABLE != 0U)
-  Camera_FrameBuffer_Init();
-#endif
-#if (CAMERA_CLI_ENABLE != 0U)
-  Camera_CLI_Init();
-#endif
-  /*
-   * 7. 初始化 DCMI
-   */
-  Camera_DCMI_Init();
-
-  /*
-   * 8. 配置 DMA：DCMI 数据直接写 LCD GRAM
-   */
-#if CAMERA_MODE == CAMERA_MODE_PC_DUMP_RGB565
-  uint32_t pc_dump_frame_id = 1U;
-
-  LOG_RAW("[PC_DUMP] ready, send DUMP to capture frame\r\n");
-
-  while (1)
-  {
-    uint8_t snapshot_ret;
-    uint8_t dump_ret;
-    uint8_t pc_command;
-    uint32_t snapshot_start_tick;
-
-    pc_command = Camera_PC_Dump_WaitForCommand(&huart1);
-    if ((pc_command != CAMERA_PC_DUMP_CMD_AEC) &&
-        (pc_command != CAMERA_PC_DUMP_CMD_DUMP))
-    {
-      continue;
-    }
-
-    if (pc_command == CAMERA_PC_DUMP_CMD_AEC)
-    {
-      (void)OV5640_Tuning_DumpAECRegs();
-      continue;
-    }
-
-    Camera_DCMI_ClearSnapshotDone();
-
-    snapshot_ret = Camera_DCMI_StartSnapshotToBuffer(
-        Camera_PC_Dump_GetBufferAddress(),
-        Camera_PC_Dump_GetWordCount());
-    if (snapshot_ret != 0U)
-    {
-      Camera_DCMI_Stop();
-      LOG_ERROR("DCMI snapshot start failed, ret = %u", snapshot_ret);
-      continue;
-    }
-
-    snapshot_start_tick = HAL_GetTick();
-    while (Camera_DCMI_IsSnapshotDone() == 0U)
-    {
-      if ((HAL_GetTick() - snapshot_start_tick) > 3000U)
-      {
-        break;
-      }
-    }
-
-    if (Camera_DCMI_IsSnapshotDone() == 0U)
-    {
-      Camera_DCMI_Stop();
-      LOG_ERROR("DCMI snapshot timeout");
-      continue;
-    }
-
-    Camera_DCMI_Stop();
-    (void)Camera_FrameBuffer_CommitBackBuffer();
-
-#if CAMERA_IMAGE_PROCESS_ENABLE
-    {
-      CameraImageProcessStatus_t process_ret;
-      CameraProcessMode_t process_mode;
-      uint8_t binary_threshold;
-
-#if (CAMERA_CLI_ENABLE != 0U)
-      process_mode = Camera_CLI_GetProcessMode();
-      binary_threshold = Camera_CLI_GetBinaryThreshold();
-#else
-      process_mode = (CameraProcessMode_t)CAMERA_PROCESS_MODE;
-      binary_threshold = (uint8_t)CAMERA_BINARY_THRESHOLD;
-#endif
-
-      process_ret = Camera_ImageProcess_ApplyToFrameBuffer(process_mode, binary_threshold);
-      if (process_ret != CAMERA_PROCESS_OK)
-      {
-        (void)Camera_ImageProcess_ApplyToFrameBuffer(CAMERA_PROCESS_MODE_BYPASS, binary_threshold);
-      }
-    }
-#endif
-
-    log_set_level(LOG_LEVEL_NONE);
-    dump_ret = Camera_PC_Dump_SendFrame(&huart1, pc_dump_frame_id);
-    log_set_level(LOG_LEVEL_DEBUG);
-
-    if (dump_ret != 0U)
-    {
-      LOG_ERROR("PC RGB565 frame send failed, ret = %u", dump_ret);
-      continue;
-    }
-
-    pc_dump_frame_id++;
-  }
-#else
-  Camera_DCMI_DMA_ConfigToLCD((uint32_t)LCD_MCU_GetRAMAddress());
-
-  /*
-   * 9. Set LCD window and start DCMI capture.
-   */
-#if (CAMERA_MODE == CAMERA_MODE_480X320_REAL) || (CAMERA_MODE == CAMERA_MODE_480X320_TESTBAR)
-  Camera_DCMI_StartToLCD(0, 0, 480, 320);
-#elif CAMERA_MODE == CAMERA_MODE_320X240_REAL
-  Camera_DCMI_StartToLCD(0, 0, 320, 240);
-#else
-#error "Unsupported CAMERA_MODE"
-#endif
-#endif /* CAMERA_MODE_PC_DUMP_RGB565 */
-  HAL_Delay(100);
-
-  LOG_INFO("DCMI CR   = 0x%08lX", DCMI->CR);
-  LOG_INFO("DCMI SR   = 0x%08lX", DCMI->SR);
-  LOG_INFO("DCMI RISR = 0x%08lX", DCMI->RISR);
-  LOG_INFO("DCMI MISR = 0x%08lX", DCMI->MISR);
-  LOG_INFO("DCMI IER  = 0x%08lX", DCMI->IER);
-
-  LOG_INFO("DMA2_Stream1 CR   = 0x%08lX", DMA2_Stream1->CR);
-  LOG_INFO("DMA2_Stream1 NDTR = %lu", DMA2_Stream1->NDTR);
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    // LOG_DEBUG("System boot, tick = %lu", HAL_GetTick());
-    // LOG_INFO("Temperature = %.2f", temp);
-    // LOG_WARN("Battery low: %d%%", percentage);
-    // LOG_ERROR("Sensor read failed, error = 0x%02X", err);
-    //LOG_RAW("This is raw text without any prefix\r\n");
-    //PCF8574_WriteBit(PCF8574_IO_P0, 0);   /* 设置 P0 引脚为低电平，测试蜂鸣器 */
-
-    //PCF8574_WriteBit(PCF8574_OV_PWDN_IO, 0);   /* 连接摄像头电源引脚到地，开启摄像头 */
-
   }
   /* USER CODE END 3 */
 }
@@ -439,7 +215,148 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
+static void Camera_Application_Init(void)
+{
+  uint16_t ov_id;
+  uint8_t ret;
+
+  if (PCF8574_Init())
+  {
+    LOG_ERROR("PCF8574 initialization failed, check I2C connection");
+    HAL_Delay(100);
+  }
+  else
+  {
+    LOG_INFO("PCF8574 initialized successfully");
+  }
+
+  /* Leave camera power-down mode before applying the hardware reset. */
+  PCF8574_WriteBit(PCF8574_OV_PWDN_IO, 0);
+  HAL_Delay(20);
+
+  HAL_GPIO_WritePin(OV_RESET_GPIO_Port, OV_RESET_Pin, GPIO_PIN_RESET);
+  HAL_Delay(20);
+  HAL_GPIO_WritePin(OV_RESET_GPIO_Port, OV_RESET_Pin, GPIO_PIN_SET);
+  HAL_Delay(50);
+
+  ov_id = OV5640_ReadID();
+  if (ov_id == 0x5640)
+  {
+    LOG_INFO("OV5640 OK, ID = 0x%04X", ov_id);
+  }
+  else
+  {
+    LOG_ERROR("OV5640 ERROR, ID = 0x%04X", ov_id);
+  }
+
+#if CAMERA_MODE != CAMERA_MODE_PC_DUMP_RGB565
+  LCD_MCU_Init();
+  HAL_Delay(1000);
+#endif
+
+#if CAMERA_MODE == CAMERA_MODE_PC_DUMP_RGB565
+#if PC_DUMP_USE_REAL_IMAGE
+  ret = OV5640_Min_InitRGB565_160x120_RealImage();
+#else
+  ret = OV5640_Min_InitRGB565_160x120_TestBar();
+#endif
+  LOG_INFO("OV5640 PC dump 160x120 init ret = %d", ret);
+#if OV5640_AEC_TUNING_ENABLE
+  if (ret == 0U)
+  {
+    uint8_t aec_target_ret = OV5640_Tuning_SetAecTarget(OV5640_AEC_TUNING_LEVEL);
+    LOG_INFO("OV5640 AEC target set ret = %u", aec_target_ret);
+    HAL_Delay(1000U);
+  }
+#endif
+#if OV5640_AWB_TUNING_ENABLE
+  if (ret == 0U)
+  {
+    uint8_t awb_mode_ret = OV5640_Tuning_SetAWBMode(OV5640_AWB_TUNING_MODE);
+    LOG_INFO("OV5640 AWB mode set ret = %u", awb_mode_ret);
+  }
+#endif
+#if OV5640_IMAGE_TUNING_ENABLE
+  if (ret == 0U)
+  {
+    uint8_t brightness_ret = OV5640_Tuning_SetBrightness(OV5640_BRIGHTNESS_LEVEL);
+    uint8_t contrast_ret = OV5640_Tuning_SetContrast(OV5640_CONTRAST_LEVEL);
+    uint8_t saturation_ret = OV5640_Tuning_SetSaturation(OV5640_SATURATION_LEVEL);
+    uint8_t sharpness_ret = OV5640_Tuning_SetSharpness(OV5640_SHARPNESS_LEVEL);
+    LOG_INFO("OV5640 image tuning ret B=%u C=%u S=%u H=%u",
+             brightness_ret,
+             contrast_ret,
+             saturation_ret,
+             sharpness_ret);
+  }
+#endif
+#elif CAMERA_MODE == CAMERA_MODE_480X320_REAL
+  ret = OV5640_Min_InitRGB565_480x320_RealImage();
+  LOG_INFO("OV5640 480x320 real image init ret = %d", ret);
+#elif CAMERA_MODE == CAMERA_MODE_480X320_TESTBAR
+  ret = OV5640_Min_InitRGB565_480x320_TestBar();
+  LOG_INFO("OV5640 480x320 testbar init ret = %d", ret);
+#elif CAMERA_MODE == CAMERA_MODE_320X240_REAL
+  ret = OV5640_Min_InitRGB565_QVGA_RealImage();
+  LOG_INFO("OV5640 320x240 real image init ret = %d", ret);
+#else
+#error "Unsupported CAMERA_MODE"
+#endif
+
+#if (CAMERA_FRAME_BUFFER_ENABLE != 0U)
+  Camera_FrameBuffer_Init();
+#endif
+#if (CAMERA_CLI_ENABLE != 0U)
+  Camera_CLI_Init();
+#endif
+
+  Camera_DCMI_Init();
+
+#if CAMERA_MODE != CAMERA_MODE_PC_DUMP_RGB565
+  Camera_DCMI_DMA_ConfigToLCD((uint32_t)LCD_MCU_GetRAMAddress());
+
+#if (CAMERA_MODE == CAMERA_MODE_480X320_REAL) || (CAMERA_MODE == CAMERA_MODE_480X320_TESTBAR)
+  Camera_DCMI_StartToLCD(0, 0, 480, 320);
+#elif CAMERA_MODE == CAMERA_MODE_320X240_REAL
+  Camera_DCMI_StartToLCD(0, 0, 320, 240);
+#else
+#error "Unsupported CAMERA_MODE"
+#endif
+
+  HAL_Delay(100);
+  LOG_INFO("DCMI CR   = 0x%08lX", DCMI->CR);
+  LOG_INFO("DCMI SR   = 0x%08lX", DCMI->SR);
+  LOG_INFO("DCMI RISR = 0x%08lX", DCMI->RISR);
+  LOG_INFO("DCMI MISR = 0x%08lX", DCMI->MISR);
+  LOG_INFO("DCMI IER  = 0x%08lX", DCMI->IER);
+  LOG_INFO("DMA2_Stream1 CR   = 0x%08lX", DMA2_Stream1->CR);
+  LOG_INFO("DMA2_Stream1 NDTR = %lu", DMA2_Stream1->NDTR);
+#endif
+}
+
 /* USER CODE END 4 */
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
