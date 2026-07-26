@@ -1,5 +1,6 @@
 #include "camera_cli.h"
 #include "camera_frame_buffer.h"
+#include "camera_rtos.h"
 
 #include <stddef.h>
 
@@ -151,6 +152,18 @@ static void Camera_CLI_WriteLine(UART_HandleTypeDef *huart, const char *text)
     Camera_CLI_WriteText(huart, "\r\n");
 }
 
+// 通过 UART 输出一行 RTOS 统计字段
+static void Camera_CLI_WriteStatLine(UART_HandleTypeDef *huart,
+                                     const char *name,
+                                     uint32_t value)
+{
+    Camera_CLI_WriteText(huart, "  ");
+    Camera_CLI_WriteText(huart, name);
+    Camera_CLI_WriteText(huart, "=");
+    Camera_CLI_WriteU32(huart, value);
+    Camera_CLI_WriteText(huart, "\r\n");
+}
+
 // 解析字符串（指定长度）为 8 位无符号整数（0~255）
 static uint8_t Camera_CLI_ParseU8(const char *text, uint32_t len, uint8_t *value)
 {
@@ -228,6 +241,11 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart)
 // 打印当前完整状态（处理模式、阈值、AEC/AWB 设置、图像尺寸等）
 static void Camera_CLI_PrintStatus(UART_HandleTypeDef *huart)
 {
+    const CameraRtosStats_t *stats;
+
+    Camera_RTOS_RecordStatus(HAL_GetTick());
+    stats = Camera_RTOS_GetStats();
+
     Camera_CLI_WriteText(huart, "process mode: ");
     Camera_CLI_WriteLine(huart, Camera_CLI_ModeName(s_camera_cli_config.process_mode));
     Camera_CLI_WriteText(huart, "binary threshold: ");
@@ -241,6 +259,29 @@ static void Camera_CLI_PrintStatus(UART_HandleTypeDef *huart)
     Camera_CLI_WriteText(huart, "x");
     Camera_CLI_WriteU32(huart, CAMERA_FB_HEIGHT);
     Camera_CLI_WriteText(huart, "\r\n");
+
+    if (stats == NULL)
+    {
+        return;
+    }
+
+    Camera_CLI_WriteLine(huart, "RTOS:");
+    Camera_CLI_WriteStatLine(huart,
+                             "camera_service_loop_count",
+                             stats->camera_service_loop_count);
+    Camera_CLI_WriteStatLine(huart, "monitor_tick_count", stats->monitor_tick_count);
+    Camera_CLI_WriteStatLine(huart, "uptime_ms", stats->uptime_ms);
+    Camera_CLI_WriteStatLine(huart, "cli_command_count", stats->cli_command_count);
+    Camera_CLI_WriteStatLine(huart, "cli_unknown_count", stats->cli_unknown_count);
+    Camera_CLI_WriteStatLine(huart, "dump_request_count", stats->dump_request_count);
+    Camera_CLI_WriteStatLine(huart, "dump_success_count", stats->dump_success_count);
+    Camera_CLI_WriteStatLine(huart, "dump_error_count", stats->dump_error_count);
+    Camera_CLI_WriteStatLine(huart, "uart_none_count", stats->uart_none_count);
+    Camera_CLI_WriteStatLine(huart, "uart_pending_count", stats->uart_pending_count);
+    Camera_CLI_WriteStatLine(huart, "uart_error_count", stats->uart_error_count);
+    Camera_CLI_WriteStatLine(huart, "last_error_code", stats->last_error_code);
+    Camera_CLI_WriteStatLine(huart, "last_dump_time_ms", stats->last_dump_time_ms);
+    Camera_CLI_WriteStatLine(huart, "last_status_time_ms", stats->last_status_time_ms);
 }
 
 // 处理 "PROC" 命令（显示/设置处理模式）
@@ -334,6 +375,8 @@ CameraCliStatus_t Camera_CLI_HandleLine(UART_HandleTypeDef *huart, const char *l
         return CAMERA_CLI_OK;  // 空行直接忽略
     }
 
+    Camera_RTOS_RecordCliCommand();
+
     // 提取命令部分（第一个单词）
     while ((cmd_len < len) && (Camera_CLI_IsSpace(trimmed[cmd_len]) == 0U))
     {
@@ -375,6 +418,7 @@ CameraCliStatus_t Camera_CLI_HandleLine(UART_HandleTypeDef *huart, const char *l
     }
 
     // 未知命令
+    Camera_RTOS_RecordCliUnknown();
     Camera_CLI_WriteLine(huart, "ERR unknown command");
     return CAMERA_CLI_ERROR_UNKNOWN_CMD;
 }

@@ -195,7 +195,8 @@ uint32_t Camera_PC_Dump_GetWordCount(void)
 //   CAMERA_PC_DUMP_CMD_DUMP   - 收到完整 "DUMP" 命令
 //   CAMERA_PC_DUMP_CMD_CLI    - 收到其他完整命令行（已交由 CLI 处理）
 //   CAMERA_PC_DUMP_CMD_PENDING - 正在接收命令（尚未完整）
-//   CAMERA_PC_DUMP_CMD_NONE   - 无数据或错误
+//   CAMERA_PC_DUMP_CMD_NONE   - 本轮没有收到数据
+//   CAMERA_PC_DUMP_CMD_UART_ERROR - UART 接收发生错误
 // 说明：使用静态变量缓存当前行状态，支持逐字节组装，行结束符为 '\n' 或 '\r'。
 uint8_t Camera_PC_Dump_PollCommand(UART_HandleTypeDef *huart)
 {
@@ -228,13 +229,13 @@ uint8_t Camera_PC_Dump_PollCommand(UART_HandleTypeDef *huart)
 
     if (status == HAL_ERROR)
     {
-        // 接收出错，清除错误并重置行缓存，返回无命令
+        // 接收出错，清除错误并重置行缓存，返回独立错误状态
         Camera_PC_Dump_ClearUartErrors(huart);
         Camera_PC_Dump_ResetLine(s_camera_pc_dump_line,
                                  sizeof(s_camera_pc_dump_line),
                                  &s_camera_pc_dump_line_length,
                                  &s_camera_pc_dump_line_overflow);
-        return CAMERA_PC_DUMP_CMD_NONE;
+        return CAMERA_PC_DUMP_CMD_UART_ERROR;
     }
 
     if (status != HAL_OK)

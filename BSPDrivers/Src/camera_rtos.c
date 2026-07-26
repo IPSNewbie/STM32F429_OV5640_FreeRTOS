@@ -19,27 +19,6 @@
 // 等待 DCMI 快照完成的最大超时时间（毫秒）
 #define CAMERA_RTOS_SNAPSHOT_TIMEOUT_MS          3000U
 
-// 错误码定义（无错误）
-#define CAMERA_RTOS_ERROR_NONE                   0x00000000U
-
-// UART 句柄为空
-#define CAMERA_RTOS_ERROR_UART_NULL              0x00000001U
-
-// 快照启动失败的基础错误码（低 8 位为子错误码）
-#define CAMERA_RTOS_ERROR_SNAPSHOT_START_BASE    0x00000100U
-
-// 快照超时错误
-#define CAMERA_RTOS_ERROR_SNAPSHOT_TIMEOUT       0x00000200U
-
-// 提交后台缓冲区失败的基础错误码
-#define CAMERA_RTOS_ERROR_CAPTURE_COMMIT_BASE    0x00000300U
-
-// 图像处理失败的基础错误码
-#define CAMERA_RTOS_ERROR_IMAGE_PROCESS_BASE     0x00000400U
-
-// PC Dump 发送失败的基础错误码
-#define CAMERA_RTOS_ERROR_DUMP_SEND_BASE         0x00000500U
-
 // 静态变量：保存 UART 句柄（用于日志和 PC 通信）
 static UART_HandleTypeDef *s_camera_rtos_uart;
 
@@ -53,10 +32,78 @@ static uint32_t s_camera_rtos_frame_id = 1U;
 static void Camera_RTOS_ClearStats(void)
 {
     s_camera_rtos_stats.camera_service_loop_count = 0U;
+    s_camera_rtos_stats.monitor_tick_count = 0U;
+    s_camera_rtos_stats.cli_command_count = 0U;
+    s_camera_rtos_stats.cli_unknown_count = 0U;
+    s_camera_rtos_stats.dump_request_count = 0U;
     s_camera_rtos_stats.dump_success_count = 0U;
     s_camera_rtos_stats.dump_error_count = 0U;
-    s_camera_rtos_stats.monitor_tick_count = 0U;
-    s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERROR_NONE;
+    s_camera_rtos_stats.uart_none_count = 0U;
+    s_camera_rtos_stats.uart_pending_count = 0U;
+    s_camera_rtos_stats.uart_error_count = 0U;
+    s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_NONE;
+    s_camera_rtos_stats.last_dump_time_ms = 0U;
+    s_camera_rtos_stats.last_status_time_ms = 0U;
+    s_camera_rtos_stats.uptime_ms = 0U;
+}
+
+// 记录一条完整 CLI 命令
+void Camera_RTOS_RecordCliCommand(void)
+{
+    s_camera_rtos_stats.cli_command_count++;
+}
+
+// 记录一条未知 CLI 命令
+void Camera_RTOS_RecordCliUnknown(void)
+{
+    s_camera_rtos_stats.cli_unknown_count++;
+    s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_UNKNOWN_CMD;
+}
+
+// 记录一次 DUMP 请求
+void Camera_RTOS_RecordDumpRequest(void)
+{
+    s_camera_rtos_stats.dump_request_count++;
+}
+
+// 记录一次成功 DUMP 及其耗时
+void Camera_RTOS_RecordDumpSuccess(uint32_t elapsed_ms)
+{
+    s_camera_rtos_stats.dump_success_count++;
+    s_camera_rtos_stats.last_dump_time_ms = elapsed_ms;
+}
+
+// 记录一次失败 DUMP 及其错误码
+void Camera_RTOS_RecordDumpError(uint32_t error_code)
+{
+    s_camera_rtos_stats.dump_error_count++;
+    s_camera_rtos_stats.last_error_code =
+        (error_code == CAMERA_RTOS_ERR_NONE) ? CAMERA_RTOS_ERR_DUMP_FAILED : error_code;
+}
+
+// 记录一次 UART 无数据状态
+void Camera_RTOS_RecordUartNone(void)
+{
+    s_camera_rtos_stats.uart_none_count++;
+}
+
+// 记录一次 UART 命令接收中状态
+void Camera_RTOS_RecordUartPending(void)
+{
+    s_camera_rtos_stats.uart_pending_count++;
+}
+
+// 记录一次 UART 接收错误
+void Camera_RTOS_RecordUartError(void)
+{
+    s_camera_rtos_stats.uart_error_count++;
+    s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_BAD_STATE;
+}
+
+// 记录最近一次 STATUS 命令执行时间
+void Camera_RTOS_RecordStatus(uint32_t time_ms)
+{
+    s_camera_rtos_stats.last_status_time_ms = time_ms;
 }
 
 // 执行完整的“捕获 → 图像处理 → 发送”流程，返回错误码（0 表示成功）
@@ -81,7 +128,7 @@ static uint32_t Camera_RTOS_CaptureProcessAndSend(void)
     {
         Camera_DCMI_Stop();
         // 返回错误码：基础码 + 子错误码
-        return CAMERA_RTOS_ERROR_SNAPSHOT_START_BASE | (uint32_t)snapshot_ret;
+        return CAMERA_RTOS_ERR_SNAPSHOT_START_BASE | (uint32_t)snapshot_ret;
     }
 
     // 等待快照完成，超时则停止并返回错误
@@ -91,7 +138,7 @@ static uint32_t Camera_RTOS_CaptureProcessAndSend(void)
         if ((HAL_GetTick() - snapshot_start_tick) > CAMERA_RTOS_SNAPSHOT_TIMEOUT_MS)
         {
             Camera_DCMI_Stop();
-            return CAMERA_RTOS_ERROR_SNAPSHOT_TIMEOUT;
+            return CAMERA_RTOS_ERR_SNAPSHOT_TIMEOUT;
         }
         (void)osDelay(1U);  // 让出 CPU，避免忙等
     }
@@ -102,7 +149,7 @@ static uint32_t Camera_RTOS_CaptureProcessAndSend(void)
     commit_ret = Camera_FrameBuffer_CommitBackBuffer();
     if (commit_ret != CAMERA_FB_OK)
     {
-        return CAMERA_RTOS_ERROR_CAPTURE_COMMIT_BASE | (uint32_t)commit_ret;
+        return CAMERA_RTOS_ERR_CAPTURE_COMMIT_BASE | (uint32_t)commit_ret;
     }
 
     // 获取当前 CLI 配置的处理模式和二值化阈值
@@ -119,7 +166,7 @@ static uint32_t Camera_RTOS_CaptureProcessAndSend(void)
             binary_threshold);
         if (process_ret != CAMERA_PROCESS_OK)
         {
-            return CAMERA_RTOS_ERROR_IMAGE_PROCESS_BASE | (uint32_t)process_ret;
+            return CAMERA_RTOS_ERR_IMAGE_PROCESS_BASE | (uint32_t)process_ret;
         }
     }
 
@@ -127,12 +174,12 @@ static uint32_t Camera_RTOS_CaptureProcessAndSend(void)
     dump_ret = Camera_PC_Dump_SendFrame(s_camera_rtos_uart, s_camera_rtos_frame_id);
     if (dump_ret != 0U)
     {
-        return CAMERA_RTOS_ERROR_DUMP_SEND_BASE | (uint32_t)dump_ret;
+        return CAMERA_RTOS_ERR_DUMP_SEND_BASE | (uint32_t)dump_ret;
     }
 
     // 成功发送后递增帧序号
     s_camera_rtos_frame_id++;
-    return CAMERA_RTOS_ERROR_NONE;
+    return CAMERA_RTOS_ERR_NONE;
 }
 
 // 初始化摄像头 RTOS 模块（保存 UART 句柄，重置统计和帧号）
@@ -144,7 +191,7 @@ void Camera_RTOS_Init(UART_HandleTypeDef *huart)
 
     if (huart == NULL)
     {
-        s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERROR_UART_NULL;
+        s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_UART_NULL;
         return;
     }
 
@@ -156,15 +203,20 @@ void Camera_RTOS_CameraServiceTask(void *argument)
 {
     uint8_t command;
     uint32_t error_code;
+    uint32_t dump_start_tick;
+    uint32_t dump_elapsed_ms;
 
     (void)argument;  // 未使用的参数
 
     for (;;)
     {
+        // 每轮服务循环都更新计数
+        s_camera_rtos_stats.camera_service_loop_count++;
+
         // 如果 UART 句柄无效，记录错误并延时
         if (s_camera_rtos_uart == NULL)
         {
-            s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERROR_UART_NULL;
+            s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_UART_NULL;
             (void)osDelay(1U);
             continue;
         }
@@ -173,6 +225,7 @@ void Camera_RTOS_CameraServiceTask(void *argument)
         command = Camera_PC_Dump_PollCommand(s_camera_rtos_uart);
         if (command == CAMERA_PC_DUMP_CMD_PENDING)
         {
+            Camera_RTOS_RecordUartPending();
             /*
              * 已经收到过有效字节，但命令尚未完整。
              * 这里不能 osDelay，否则 HELP\r\n 这种连续字节会丢失。
@@ -183,6 +236,7 @@ void Camera_RTOS_CameraServiceTask(void *argument)
 
         if (command == CAMERA_PC_DUMP_CMD_NONE)
         {
+            Camera_RTOS_RecordUartNone();
             /*
              * 本轮没有收到任何字节，才允许让出 CPU。
              */
@@ -190,25 +244,39 @@ void Camera_RTOS_CameraServiceTask(void *argument)
             continue;
         }
 
-        // 每处理一个有效命令，循环计数加 1
-        s_camera_rtos_stats.camera_service_loop_count++;
+        if (command == CAMERA_PC_DUMP_CMD_UART_ERROR)
+        {
+            // UART 接收错误已经由轮询函数清理，这里只记录错误
+            Camera_RTOS_RecordUartError();
+            continue;
+        }
 
-        // 如果命令不是 DUMP（例如 AEC 或 CLI 内部命令），则忽略并继续
-        if (command != CAMERA_PC_DUMP_CMD_DUMP)
+        // CLI 命令已在轮询函数内部处理并完成统计
+        if (command == CAMERA_PC_DUMP_CMD_CLI)
         {
             continue;
         }
 
-        // 执行 DUMP 流程（捕获、处理、发送）
-        error_code = Camera_RTOS_CaptureProcessAndSend();
-        if (error_code == CAMERA_RTOS_ERROR_NONE)
+        if (command != CAMERA_PC_DUMP_CMD_DUMP)
         {
-            s_camera_rtos_stats.dump_success_count++;
+            // 未定义的命令状态只记录错误，不输出文本
+            s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_BAD_STATE;
+            continue;
+        }
+
+        // 执行 DUMP 流程（捕获、处理、发送）
+        Camera_RTOS_RecordDumpRequest();
+        dump_start_tick = HAL_GetTick();
+        error_code = Camera_RTOS_CaptureProcessAndSend();
+        dump_elapsed_ms = HAL_GetTick() - dump_start_tick;
+        if (error_code == CAMERA_RTOS_ERR_NONE)
+        {
+            Camera_RTOS_RecordDumpSuccess(dump_elapsed_ms);
         }
         else
         {
-            s_camera_rtos_stats.dump_error_count++;
-            s_camera_rtos_stats.last_error_code = error_code;
+            s_camera_rtos_stats.last_dump_time_ms = dump_elapsed_ms;
+            Camera_RTOS_RecordDumpError(error_code);
         }
     }
 }
@@ -220,8 +288,9 @@ void Camera_RTOS_MonitorTask(void *argument)
 
     for (;;)
     {
-        (void)osDelay(1000U);          // 每秒运行一次
-        s_camera_rtos_stats.monitor_tick_count++;  // 累计运行次数
+        (void)osDelay(1000U);
+        s_camera_rtos_stats.monitor_tick_count++;
+        s_camera_rtos_stats.uptime_ms += 1000U;
     }
 }
 

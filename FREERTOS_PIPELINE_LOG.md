@@ -192,6 +192,8 @@ python tools/pc_dump_rgb565.py --port COM4 --baud 115200 --tag <tag>
 
 ## 后续计划
 
+Stage 8 将在 Stage 7 基础上增加运行统计和 STATUS 输出增强，串口测试统一使用 COM4。
+
 UART DMA + IDLE 可作为后续阶段计划，当前阶段未实现。
 
 ## 阶段结论

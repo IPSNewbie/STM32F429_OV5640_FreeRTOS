@@ -47,6 +47,9 @@
 // 已消耗一个命令字节，但行尚未完整接收
 #define CAMERA_PC_DUMP_CMD_PENDING 4U
 
+// UART 接收发生错误
+#define CAMERA_PC_DUMP_CMD_UART_ERROR 5U
+
 //============================================================================
 // 公开函数声明
 //============================================================================
@@ -72,6 +75,7 @@ uint32_t Camera_PC_Dump_GetWordCount(void);
  * @retval CAMERA_PC_DUMP_CMD_DUMP     接收到完整的 "DUMP" 命令
  * @retval CAMERA_PC_DUMP_CMD_CLI      接收到完整的文本 CLI 命令并已处理
  * @retval CAMERA_PC_DUMP_CMD_PENDING  正在缓存部分命令（尚未完整）
+ * @retval CAMERA_PC_DUMP_CMD_UART_ERROR UART 接收发生错误
  * @note   该函数调用后立即返回，不会阻塞。每次调用尝试接收一个字节，
  *         若超时则返回 NONE，RTOS 任务可安全地让出 CPU 而不丢失已缓存的行。
  *         内部使用静态变量维护当前行的接收状态。
