@@ -21,7 +21,6 @@
 static char s_camera_pc_dump_line[PC_DUMP_COMMAND_LINE_LEN];
 static uint8_t s_camera_pc_dump_line_length;
 static uint8_t s_camera_pc_dump_line_overflow;
-static UART_HandleTypeDef *s_camera_pc_dump_command_uart;
 
 // 将小写字母转换为大写（仅处理 a-z）
 static char Camera_PC_Dump_ToUpper(char ch)
@@ -90,42 +89,6 @@ static uint8_t Camera_PC_Dump_LineEquals(const char *line, const char *token)
     return (i == len) ? 1U : 0U;  // 完全匹配
 }
 
-// 清除 UART 可能存在的各种错误标志（PE, FE, NE, ORE）
-static void Camera_PC_Dump_ClearUartErrors(UART_HandleTypeDef *huart)
-{
-    if (huart == NULL)
-    {
-        return;
-    }
-
-#ifdef UART_FLAG_PE
-    if (__HAL_UART_GET_FLAG(huart, UART_FLAG_PE) != RESET)
-    {
-        __HAL_UART_CLEAR_PEFLAG(huart);
-    }
-#endif
-#ifdef UART_FLAG_FE
-    if (__HAL_UART_GET_FLAG(huart, UART_FLAG_FE) != RESET)
-    {
-        __HAL_UART_CLEAR_FEFLAG(huart);
-    }
-#endif
-#ifdef UART_FLAG_NE
-    if (__HAL_UART_GET_FLAG(huart, UART_FLAG_NE) != RESET)
-    {
-        __HAL_UART_CLEAR_NEFLAG(huart);
-    }
-#endif
-#ifdef UART_FLAG_ORE
-    if (__HAL_UART_GET_FLAG(huart, UART_FLAG_ORE) != RESET)
-    {
-        __HAL_UART_CLEAR_OREFLAG(huart);
-    }
-#endif
-
-    huart->ErrorCode = HAL_UART_ERROR_NONE;  // 重置错误码
-}
-
 // 重置命令行缓存（清空缓冲区，重置长度和溢出标志）
 static void Camera_PC_Dump_ResetLine(char *line,
                                      uint32_t line_size,
@@ -174,58 +137,29 @@ uint32_t Camera_PC_Dump_GetWordCount(void)
     return PC_DUMP_WORD_COUNT;
 }
 
-// 轮询方式接收 PC 串口命令（单字节有限超时版本）
-// 参数：huart - UART 句柄
+// 无输出地重置文本命令行状态
+void Camera_PC_Dump_ResetCommandParser(void)
+{
+    Camera_PC_Dump_ResetLine(s_camera_pc_dump_line,
+                             sizeof(s_camera_pc_dump_line),
+                             &s_camera_pc_dump_line_length,
+                             &s_camera_pc_dump_line_overflow);
+}
+
+// 将单个接收字节送入现有文本命令行解析器
+// 参数：huart - UART 句柄，仅用于发送完整 CLI 命令的文本响应
+//       输入字节 - 本次输入的 byte 参数
 // 返回值：
 //   CAMERA_PC_DUMP_CMD_DUMP   - 收到完整 "DUMP" 命令
 //   CAMERA_PC_DUMP_CMD_CLI    - 收到其他完整命令行（已交由 CLI 处理）
 //   CAMERA_PC_DUMP_CMD_PENDING - 正在接收命令（尚未完整）
-//   CAMERA_PC_DUMP_CMD_NONE   - 本轮没有收到数据
-//   CAMERA_PC_DUMP_CMD_UART_ERROR - UART 接收发生错误
-// 说明：使用静态变量缓存当前行状态，支持逐字节组装，行结束符为 '\n' 或 '\r'。
-uint8_t Camera_PC_Dump_PollCommand(UART_HandleTypeDef *huart)
+//   CAMERA_PC_DUMP_CMD_NONE   - UART 句柄无效
+// 说明：函数不访问 UART RX，行结束符为 '\n' 或 '\r'。
+uint8_t Camera_PC_Dump_FeedCommandByte(UART_HandleTypeDef *huart, uint8_t byte)
 {
-    uint8_t byte;
-    HAL_StatusTypeDef status;
-
     // 无效句柄直接返回无命令
     if (huart == NULL)
     {
-        return CAMERA_PC_DUMP_CMD_NONE;
-    }
-
-    // 若 UART 句柄发生变化，重置状态（用于切换串口）
-    if (s_camera_pc_dump_command_uart != huart)
-    {
-        s_camera_pc_dump_command_uart = huart;
-        Camera_PC_Dump_ResetLine(s_camera_pc_dump_line,
-                                 sizeof(s_camera_pc_dump_line),
-                                 &s_camera_pc_dump_line_length,
-                                 &s_camera_pc_dump_line_overflow);
-    }
-
-    // 尝试接收 1 字节。不要在接收前清 UART 错误，避免误丢正常字节。
-    status = HAL_UART_Receive(huart, &byte, 1U, 1U);
-    if (status == HAL_TIMEOUT)
-    {
-        // 超时表示当前无新数据，返回“等待中”
-        return CAMERA_PC_DUMP_CMD_NONE;
-    }
-
-    if (status == HAL_ERROR)
-    {
-        // 接收出错，清除错误并重置行缓存，返回独立错误状态
-        Camera_PC_Dump_ClearUartErrors(huart);
-        Camera_PC_Dump_ResetLine(s_camera_pc_dump_line,
-                                 sizeof(s_camera_pc_dump_line),
-                                 &s_camera_pc_dump_line_length,
-                                 &s_camera_pc_dump_line_overflow);
-        return CAMERA_PC_DUMP_CMD_UART_ERROR;
-    }
-
-    if (status != HAL_OK)
-    {
-        // HAL_BUSY 等非错误状态不清 UART 错误，也不丢弃已接收的行缓存
         return CAMERA_PC_DUMP_CMD_NONE;
     }
 

@@ -1,6 +1,7 @@
 #include "camera_cli.h"
 #include "camera_frame_buffer.h"
 #include "camera_rtos.h"
+#include "uart_rx_dma.h"
 
 #include <stddef.h>
 
@@ -242,9 +243,11 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart)
 static void Camera_CLI_PrintStatus(UART_HandleTypeDef *huart)
 {
     const CameraRtosStats_t *stats;
+    const UartRxDmaStats_t *uart_dma_stats;
 
     Camera_RTOS_RecordStatus(HAL_GetTick());
     stats = Camera_RTOS_GetStats();
+    uart_dma_stats = UART_RxDma_GetStats();
 
     Camera_CLI_WriteText(huart, "process mode: ");
     Camera_CLI_WriteLine(huart, Camera_CLI_ModeName(s_camera_cli_config.process_mode));
@@ -282,6 +285,32 @@ static void Camera_CLI_PrintStatus(UART_HandleTypeDef *huart)
     Camera_CLI_WriteStatLine(huart, "last_error_code", stats->last_error_code);
     Camera_CLI_WriteStatLine(huart, "last_dump_time_ms", stats->last_dump_time_ms);
     Camera_CLI_WriteStatLine(huart, "last_status_time_ms", stats->last_status_time_ms);
+
+    if (uart_dma_stats != NULL)
+    {
+        Camera_CLI_WriteLine(huart, "UART RX DMA:");
+        Camera_CLI_WriteStatLine(huart,
+                                 "uart_dma_event_count",
+                                 uart_dma_stats->rx_event_count);
+        Camera_CLI_WriteStatLine(huart,
+                                 "uart_dma_rx_bytes",
+                                 uart_dma_stats->rx_bytes);
+        Camera_CLI_WriteStatLine(huart,
+                                 "stream_buffer_write_bytes",
+                                 uart_dma_stats->stream_write_bytes);
+        Camera_CLI_WriteStatLine(huart,
+                                 "stream_buffer_overflow_bytes",
+                                 uart_dma_stats->stream_overflow_bytes);
+        Camera_CLI_WriteStatLine(huart,
+                                 "uart_dma_error_count",
+                                 uart_dma_stats->uart_error_count);
+        Camera_CLI_WriteStatLine(huart,
+                                 "uart_dma_recovery_count",
+                                 uart_dma_stats->recovery_count);
+        Camera_CLI_WriteStatLine(huart,
+                                 "stream_buffer_resync_count",
+                                 uart_dma_stats->stream_resync_count);
+    }
 }
 
 // 处理 "PROC" 命令（显示/设置处理模式）

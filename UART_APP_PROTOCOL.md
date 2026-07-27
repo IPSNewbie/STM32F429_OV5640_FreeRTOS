@@ -11,6 +11,7 @@
 5. Round 1 将现有 CRC32 算法提取为公共模块，但不改变线上 CRC 结果。
 6. 现有 Python 工具 `tools/pc_dump_rgb565.py` 保持兼容且不修改。
 7. Round 2 新增纯 C 二进制图像请求解析器，但尚未接入实际 UART 或 DUMP。
+8. Round 3 已将现有文本 CLI 和文本 `DUMP` 的接收链路迁移到 UART DMA + IDLE + 静态 StreamBuffer，二进制请求解析器仍未接入。
 
 ## 2. 当前通信架构
 
@@ -19,6 +20,12 @@ PC（MobaXterm / Python）
     ↓
 USART1
     ↓
+Circular RX DMA（DMA2 Stream2 Channel 4）
+    ↓ IDLE / HT / TC 位置差分
+HAL_UARTEx_RxEventCallback
+    ↓ xStreamBufferSendFromISR
+静态 StreamBuffer
+    ↓ xStreamBufferReceive
 CameraServiceTask
     ↓
 文本 CLI 或 DUMP
@@ -29,16 +36,16 @@ OV56RGB5 图像响应
 当前实现边界如下：
 
 1. CameraServiceTask 独占 UART、CLI 和 DUMP。
-2. UART RX 仍使用 `HAL_UART_Receive()` 单字节轮询。
-3. `PENDING` 表示已收到部分命令，CameraServiceTask 必须立即继续轮询。
-4. `NONE` 表示本轮没有收到字节，CameraServiceTask 才执行 `osDelay(1U)`。
-5. `HAL_TIMEOUT` 不清空已接收的行缓存。
-6. `HAL_ERROR` 才清理 UART 错误并重置行缓存。
-7. Round 1 未启用 UART RX DMA。
-8. Round 1 未启用 USART1 IDLE 中断。
-9. Round 1 未使用 StreamBuffer。
-10. Round 1 未实现文本/二进制协议分发器。
-11. Round 2 解析器是独立模块，CameraServiceTask 和现有 UART RX 链路仍未调用该模块。
+2. UART RX 使用 `HAL_UARTEx_ReceiveToIdle_DMA()` 启动 Circular DMA，正常运行期间只启动一次。
+3. IDLE、DMA HT 和 DMA TC 事件通过当前 DMA 写入位置与旧位置的差分提取新增字节。
+4. ISR 只搬运新增字节到静态 StreamBuffer、维护最小统计并按需唤醒任务。
+5. CameraServiceTask 使用 `xStreamBufferReceive()` 阻塞等待数据，并逐字节送入现有文本行解析器。
+6. 一个读取块包含多条文本命令时，CameraServiceTask 会按顺序处理全部命令。
+7. UART 错误只在 ISR 中记录并置位，DMA 的中止、清错和重新启动在 CameraServiceTask 上下文完成。
+8. StreamBuffer 溢出后，CameraServiceTask 放弃本地剩余字节、清除残缺文本行并排空缓冲区，再等待下一条完整命令。
+9. 文本 `DUMP` 仍由 CameraServiceTask 串行执行，响应前不发送文本，图像响应仍为 OV56RGB5。
+10. Round 2 的二进制请求解析器仍是独立模块，尚未接入 UART、CameraServiceTask 或 DUMP。
+11. 当前仍未实现文本/二进制协议分发器。
 
 ## 3. 文本 CLI 协议
 
@@ -205,8 +212,8 @@ CRC 不覆盖 magic、version、format/reserved、width、height、payload_len �
 | 轮次 | 计划内容 | 当前状态 |
 |---|---|---|
 | Round 1 | 协议冻结与 CRC32 公共模块 | 已完成 |
-| Round 2 | 纯 C 二进制请求状态机 | 本轮完成，尚未接入 UART |
-| Round 3 | UART DMA + IDLE + StreamBuffer，先迁移文本 CLI | 未实现 |
+| Round 2 | 纯 C 二进制请求状态机 | 已完成，尚未接入 UART |
+| Round 3 | UART DMA + IDLE + StreamBuffer，先迁移文本 CLI | 代码完成，COM4 板上测试待进行 |
 | Round 4 | 文本/二进制协议分发和图像请求接入 | 未实现 |
 | Round 5 | Python 自动化工具和连续请求压力测试 | 未实现 |
 
@@ -299,7 +306,7 @@ Round 2 新增 `image_request_protocol` 纯 C 模块：
 7. 支持随机前缀过滤、错误重同步、连续帧和 100 ms 半帧超时。
 8. 超时差值使用无符号减法，支持 `uint32_t` tick 回绕。
 9. Round 2 尚未接入实际 UART、CameraServiceTask 或 DUMP，也未做 COM4 协议实测。
-10. Round 3 才计划迁移 UART DMA + IDLE + StreamBuffer；Round 4 才计划接入协议分发和图像请求。
+10. Round 3 已迁移文本 UART RX 到 DMA + IDLE + StreamBuffer；Round 4 才计划接入协议分发和图像请求。
 
 ### 11.2 状态机
 
@@ -384,5 +391,73 @@ OK / ERROR / RESYNC
 | RAM | 115592 B / 192 KB，58.79% | Debug 链接结果 |
 | FLASH | 54376 B / 1 MB，5.19% | 模块尚未被业务代码引用，未引用函数段被链接器移除 |
 | HAL / FreeRTOS 依赖扫描 | 通过 | 解析器和主机测试均无相关依赖 |
-| UART 接收链路 | 未修改 | 仍保留原 `HAL_UART_Receive()` 单字节轮询 |
+| UART 接收链路 | Round 2 时未修改 | Round 3 已迁移到 DMA + IDLE + StreamBuffer |
 | COM4 板上协议测试 | 未执行 | Round 2 尚未接入真实 UART |
+
+## 12. UART DMA 接收与文本 CLI 迁移
+
+### 12.1 Round 3 范围
+
+1. USART1 RX 已迁移为 Circular DMA + Receive-to-IDLE。
+2. DMA 使用 CubeMX 生成的 DMA2 Stream2 Channel 4。
+3. 当前只迁移既有文本 CLI 和文本 `DUMP`。
+4. `image_request_protocol` 尚未接入 UART。
+5. 未新增文本/二进制协议分发器。
+6. 未修改 UART TX；CLI 文本和 OV56RGB5 图像仍使用阻塞发送。
+
+### 12.2 DMA 与 StreamBuffer
+
+1. DMA 接收缓冲区为 128 B。
+2. StreamBuffer 有效容量为 512 B，使用 `xStreamBufferCreateStatic()` 创建。
+3. 静态存储区额外保留一个 FreeRTOS 环形缓冲空槽，不使用动态内存。
+4. IDLE、HT 和 TC 事件均保留。
+5. `size > old_position` 时搬运单段新增区域。
+6. `size < old_position` 时按缓冲区末尾和开头两段搬运。
+7. `size == old_position` 时不重复搬运。
+8. `size == 128` 时保留边界位置，用于过滤 TC 后紧接的同位置 IDLE 重复事件；下一次回绕事件再按两段处理。
+
+### 12.3 ISR 职责边界
+
+ISR 只执行以下工作：
+
+1. 确认回调属于已保存的 USART1 句柄。
+2. 根据 DMA 位置差分确定新增字节。
+3. 使用 `xStreamBufferSendFromISR()` 搬运字节。
+4. 维护事件数、接收字节数、写入字节数和溢出字节数。
+5. UART 错误回调只增加错误计数并设置恢复标志。
+6. 使用 `portYIELD_FROM_ISR()` 按需唤醒 CameraServiceTask。
+
+ISR 不执行 UART TX、CLI、DUMP、图像采集、协议重同步或日志打印。
+
+### 12.4 CameraServiceTask 流程
+
+1. 任务启动时静态创建 StreamBuffer，并启动一次 Receive-to-IDLE DMA。
+2. 每次最多从 StreamBuffer 读取 32 B，最长阻塞等待 100 ms。
+3. 每个字节继续使用 `camera_pc_dump` 中的现有文本行状态机。
+4. 完整 CLI 命令仍交给 `Camera_CLI_HandleLine()`。
+5. 完整 `DUMP` 仍由 CameraServiceTask 执行采集、处理和 OV56RGB5 发送。
+6. DUMP 期间 RX DMA 继续接收，但 CameraServiceTask 暂停解析新命令。
+7. DUMP 完成后继续处理本地读取块和 StreamBuffer 中的后续字节；若发生溢出则放弃残缺数据并重新同步。
+
+### 12.5 错误与溢出恢复
+
+1. UART 错误 ISR 不执行复杂恢复。
+2. CameraServiceTask 调用 `HAL_UART_AbortReceive()`，清除 UART 错误并重新启动一次 Receive-to-IDLE DMA。
+3. 恢复失败时保留恢复请求，后续继续重试，不解析旧数据。
+4. StreamBuffer 写入不足时记录丢失字节并设置溢出标志。
+5. CameraServiceTask 检测到溢出后清除文本行状态、丢弃当前读取块剩余字节并非阻塞排空 StreamBuffer。
+6. 只有确认 StreamBuffer 已排空后才清除溢出标志并记录重同步次数。
+7. 溢出或恢复过程不输出文本，避免污染 OV56RGB5 二进制响应。
+
+### 12.6 CMSIS-RTOS2 与原生 FreeRTOS API 边界
+
+1. 任务创建和任务延时继续使用 CMSIS-RTOS2。
+2. 字节流缓冲使用 FreeRTOS StreamBuffer API。
+3. ISR 使用 FreeRTOS `FromISR` API；USART1 和 DMA2 Stream2 IRQ 优先级均为 5，符合当前 FreeRTOS 系统调用优先级边界。
+4. MonitorTask 不访问 UART 或 StreamBuffer。
+
+### 12.7 当前验证边界
+
+1. 固件构建和静态检查由 Round 3 代码验证覆盖。
+2. COM4 板上 HELP、STATUS、快速连续命令、分段命令和文本 DUMP 尚待用户测试。
+3. 不得将当前状态描述为二进制请求已经可以通过 COM4 触发图像。

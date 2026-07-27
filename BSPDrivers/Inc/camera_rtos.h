@@ -28,6 +28,9 @@ typedef enum
     CAMERA_RTOS_ERR_DUMP_FAILED = 0x00000002U,         /**< DUMP 失败 */
     CAMERA_RTOS_ERR_BAD_STATE = 0x00000003U,           /**< 运行状态异常 */
     CAMERA_RTOS_ERR_UNKNOWN_CMD = 0x00000004U,         /**< 未知 CLI 命令 */
+    CAMERA_RTOS_ERR_UART_DMA_INIT = 0x00000005U,       /**< UART DMA 初始化失败 */
+    CAMERA_RTOS_ERR_UART_DMA_RECOVERY = 0x00000006U,   /**< UART DMA 需要恢复 */
+    CAMERA_RTOS_ERR_STREAM_OVERFLOW = 0x00000007U,     /**< StreamBuffer 溢出 */
     CAMERA_RTOS_ERR_SNAPSHOT_START_BASE = 0x00000100U, /**< 快照启动失败基础码 */
     CAMERA_RTOS_ERR_SNAPSHOT_TIMEOUT = 0x00000200U,    /**< 快照等待超时 */
     CAMERA_RTOS_ERR_CAPTURE_COMMIT_BASE = 0x00000300U, /**< 帧缓冲提交失败基础码 */
@@ -52,9 +55,9 @@ typedef struct
     volatile uint32_t dump_request_count;        /**< DUMP 请求次数 */
     volatile uint32_t dump_success_count;        /**< DUMP 成功次数 */
     volatile uint32_t dump_error_count;          /**< DUMP 失败次数 */
-    volatile uint32_t uart_none_count;           /**< UART 本轮无数据次数 */
-    volatile uint32_t uart_pending_count;        /**< UART 命令接收中次数 */
-    volatile uint32_t uart_error_count;          /**< UART 接收错误次数 */
+    volatile uint32_t uart_none_count;           /**< StreamBuffer 读取超时次数 */
+    volatile uint32_t uart_pending_count;        /**< 文本行尚未完整的字节次数 */
+    volatile uint32_t uart_error_count;          /**< UART DMA 错误兼容计数 */
     volatile uint32_t last_error_code;           /**< 最后一次错误码 */
     volatile uint32_t last_dump_time_ms;         /**< 最近一次 DUMP 耗时 */
     volatile uint32_t last_status_time_ms;       /**< 最近一次 STATUS 时间 */
@@ -124,10 +127,11 @@ void Camera_RTOS_RecordStatus(uint32_t time_ms);
  * @brief  摄像头服务任务（FreeRTOS 任务函数）
  * @param  argument 任务参数（未使用）
  * @note   主循环中执行：
- *         1. 等待 PC 通过 UART 发送命令（DUMP 或 CLI 命令）
- *         2. 若收到 DUMP，则触发 DCMI 拍照并发送帧数据
- *         3. 若收到 CLI 命令，则通过 Camera_CLI_HandleLine 处理
- *         4. 维护 UART、CLI 和 DUMP 运行统计
+ *         1. 从静态 StreamBuffer 分块读取 USART1 RX DMA 数据
+ *         2. 将字节送入现有文本行解析器
+ *         3. 若收到 DUMP，则触发 DCMI 拍照并发送帧数据
+ *         4. 若收到 CLI 命令，则通过 Camera_CLI_HandleLine 处理
+ *         5. 维护 UART、CLI 和 DUMP 运行统计
  */
 void Camera_RTOS_CameraServiceTask(void *argument);
 

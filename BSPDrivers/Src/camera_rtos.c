@@ -6,6 +6,7 @@
 #include "camera_image_process.h"
 #include "camera_pc_dump.h"
 #include "cmsis_os.h"
+#include "uart_rx_dma.h"
 
 #include <stddef.h>
 
@@ -18,6 +19,12 @@
 
 // 等待 DCMI 快照完成的最大超时时间（毫秒）
 #define CAMERA_RTOS_SNAPSHOT_TIMEOUT_MS          3000U
+
+// CameraServiceTask 每次从 StreamBuffer 读取的最大字节数
+#define CAMERA_RTOS_UART_RX_CHUNK_SIZE             32U
+
+// CameraServiceTask 等待接收字节的最长时间
+#define CAMERA_RTOS_UART_READ_TIMEOUT_MS           100U
 
 // 静态变量：保存 UART 句柄（用于日志和 PC 通信）
 static UART_HandleTypeDef *s_camera_rtos_uart;
@@ -104,6 +111,61 @@ void Camera_RTOS_RecordUartError(void)
 void Camera_RTOS_RecordStatus(uint32_t time_ms)
 {
     s_camera_rtos_stats.last_status_time_ms = time_ms;
+}
+
+// 将 UART DMA 错误统计同步到 Stage 8 兼容字段
+static void Camera_RTOS_SyncUartErrorCount(void)
+{
+    const UartRxDmaStats_t *uart_stats = UART_RxDma_GetStats();
+
+    if (uart_stats != NULL)
+    {
+        s_camera_rtos_stats.uart_error_count = uart_stats->uart_error_count;
+    }
+}
+
+// 在任务上下文处理 UART DMA 错误恢复，并丢弃恢复前的残缺输入
+static uint8_t Camera_RTOS_RecoverUartInputIfNeeded(void)
+{
+    UartRxDmaRecoveryResult_t recovery_result;
+
+    recovery_result = UART_RxDma_RecoverIfNeeded();
+    Camera_RTOS_SyncUartErrorCount();
+
+    if (recovery_result == UART_RX_DMA_RECOVERY_NONE)
+    {
+        return 0U;
+    }
+
+    s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_UART_DMA_RECOVERY;
+    if (recovery_result == UART_RX_DMA_RECOVERY_RETRY)
+    {
+        (void)osDelay(1U);
+        return 1U;
+    }
+
+    Camera_PC_Dump_ResetCommandParser();
+    (void)UART_RxDma_Drain();
+    if (UART_RxDma_HasOverflow() != 0U)
+    {
+        UART_RxDma_ClearOverflow();
+    }
+    return 1U;
+}
+
+// 检测 StreamBuffer 溢出，清除残缺文本状态并排空现有字节
+static uint8_t Camera_RTOS_DiscardOverflowedInput(void)
+{
+    if (UART_RxDma_HasOverflow() == 0U)
+    {
+        return 0U;
+    }
+
+    Camera_PC_Dump_ResetCommandParser();
+    (void)UART_RxDma_Drain();
+    UART_RxDma_ClearOverflow();
+    s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_STREAM_OVERFLOW;
+    return 1U;
 }
 
 // 执行完整的“捕获 → 图像处理 → 发送”流程，返回错误码（0 表示成功）
@@ -201,82 +263,105 @@ void Camera_RTOS_Init(UART_HandleTypeDef *huart)
 // 摄像头服务任务（FreeRTOS 任务主循环）
 void Camera_RTOS_CameraServiceTask(void *argument)
 {
+    uint8_t rx_chunk[CAMERA_RTOS_UART_RX_CHUNK_SIZE];
     uint8_t command;
+    size_t received;
+    size_t i;
     uint32_t error_code;
     uint32_t dump_start_tick;
     uint32_t dump_elapsed_ms;
 
     (void)argument;  // 未使用的参数
 
+    Camera_PC_Dump_ResetCommandParser();
+
+    // 仅在任务启动阶段初始化，正常运行时不重复启动 DMA
+    while (s_camera_rtos_uart == NULL)
+    {
+        s_camera_rtos_stats.camera_service_loop_count++;
+        s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_UART_NULL;
+        (void)osDelay(1000U);
+    }
+
+    while (UART_RxDma_Init(s_camera_rtos_uart) != HAL_OK)
+    {
+        s_camera_rtos_stats.camera_service_loop_count++;
+        s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_UART_DMA_INIT;
+        (void)osDelay(1000U);
+    }
+
     for (;;)
     {
-        // 每轮服务循环都更新计数
         s_camera_rtos_stats.camera_service_loop_count++;
 
-        // 如果 UART 句柄无效，记录错误并延时
-        if (s_camera_rtos_uart == NULL)
+        if (Camera_RTOS_RecoverUartInputIfNeeded() != 0U)
         {
-            s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_UART_NULL;
-            (void)osDelay(1U);
             continue;
         }
 
-        // 轮询 PC 命令（非阻塞）
-        command = Camera_PC_Dump_PollCommand(s_camera_rtos_uart);
-        if (command == CAMERA_PC_DUMP_CMD_PENDING)
+        if (Camera_RTOS_DiscardOverflowedInput() != 0U)
         {
-            Camera_RTOS_RecordUartPending();
-            /*
-             * 已经收到过有效字节，但命令尚未完整。
-             * 这里不能 osDelay，否则 HELP\r\n 这种连续字节会丢失。
-             */
             continue;
         }
 
-
-        if (command == CAMERA_PC_DUMP_CMD_NONE)
+        received = UART_RxDma_Read(rx_chunk,
+                                   sizeof(rx_chunk),
+                                   CAMERA_RTOS_UART_READ_TIMEOUT_MS);
+        if (received == 0U)
         {
+            // 先排除等待期间出现的错误或溢出，再记录纯读取超时
+            if ((Camera_RTOS_RecoverUartInputIfNeeded() != 0U) ||
+                (Camera_RTOS_DiscardOverflowedInput() != 0U))
+            {
+                continue;
+            }
             Camera_RTOS_RecordUartNone();
-            /*
-             * 本轮没有收到任何字节，才允许让出 CPU。
-             */
-            (void)osDelay(1U);
             continue;
         }
 
-        if (command == CAMERA_PC_DUMP_CMD_UART_ERROR)
+        for (i = 0U; i < received; ++i)
         {
-            // UART 接收错误已经由轮询函数清理，这里只记录错误
-            Camera_RTOS_RecordUartError();
-            continue;
-        }
+            // 错误或溢出发生后放弃当前读取块的剩余字节
+            if ((Camera_RTOS_RecoverUartInputIfNeeded() != 0U) ||
+                (Camera_RTOS_DiscardOverflowedInput() != 0U))
+            {
+                break;
+            }
 
-        // CLI 命令已在轮询函数内部处理并完成统计
-        if (command == CAMERA_PC_DUMP_CMD_CLI)
-        {
-            continue;
-        }
+            command = Camera_PC_Dump_FeedCommandByte(s_camera_rtos_uart,
+                                                     rx_chunk[i]);
+            if (command == CAMERA_PC_DUMP_CMD_PENDING)
+            {
+                Camera_RTOS_RecordUartPending();
+                continue;
+            }
 
-        if (command != CAMERA_PC_DUMP_CMD_DUMP)
-        {
-            // 未定义的命令状态只记录错误，不输出文本
-            s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_BAD_STATE;
-            continue;
-        }
+            // CLI 命令已在文本行解析器内部处理
+            if (command == CAMERA_PC_DUMP_CMD_CLI)
+            {
+                continue;
+            }
 
-        // 执行 DUMP 流程（捕获、处理、发送）
-        Camera_RTOS_RecordDumpRequest();
-        dump_start_tick = HAL_GetTick();
-        error_code = Camera_RTOS_CaptureProcessAndSend();
-        dump_elapsed_ms = HAL_GetTick() - dump_start_tick;
-        if (error_code == CAMERA_RTOS_ERR_NONE)
-        {
-            Camera_RTOS_RecordDumpSuccess(dump_elapsed_ms);
-        }
-        else
-        {
-            s_camera_rtos_stats.last_dump_time_ms = dump_elapsed_ms;
-            Camera_RTOS_RecordDumpError(error_code);
+            if (command != CAMERA_PC_DUMP_CMD_DUMP)
+            {
+                s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_BAD_STATE;
+                continue;
+            }
+
+            // DUMP 仍在 CameraServiceTask 中串行执行，且发送前不输出文本
+            Camera_RTOS_RecordDumpRequest();
+            dump_start_tick = HAL_GetTick();
+            error_code = Camera_RTOS_CaptureProcessAndSend();
+            dump_elapsed_ms = HAL_GetTick() - dump_start_tick;
+            if (error_code == CAMERA_RTOS_ERR_NONE)
+            {
+                Camera_RTOS_RecordDumpSuccess(dump_elapsed_ms);
+            }
+            else
+            {
+                s_camera_rtos_stats.last_dump_time_ms = dump_elapsed_ms;
+                Camera_RTOS_RecordDumpError(error_code);
+            }
         }
     }
 }

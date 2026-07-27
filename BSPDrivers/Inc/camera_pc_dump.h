@@ -69,18 +69,22 @@ uint32_t Camera_PC_Dump_GetBufferAddress(void);
 uint32_t Camera_PC_Dump_GetWordCount(void);
 
 /**
- * @brief  轮询方式接收 PC 串口命令（非阻塞，适合 RTOS 任务）
- * @param  huart UART 句柄，用于命令接收及 CLI 文本响应
- * @retval CAMERA_PC_DUMP_CMD_NONE     当前无完整命令可用
- * @retval CAMERA_PC_DUMP_CMD_DUMP     接收到完整的 "DUMP" 命令
- * @retval CAMERA_PC_DUMP_CMD_CLI      接收到完整的文本 CLI 命令并已处理
- * @retval CAMERA_PC_DUMP_CMD_PENDING  正在缓存部分命令（尚未完整）
- * @retval CAMERA_PC_DUMP_CMD_UART_ERROR UART 接收发生错误
- * @note   该函数调用后立即返回，不会阻塞。每次调用尝试接收一个字节，
- *         若超时则返回 NONE，RTOS 任务可安全地让出 CPU 而不丢失已缓存的行。
- *         内部使用静态变量维护当前行的接收状态。
+ * @brief  将一个接收字节送入现有文本命令行解析器
+ * @param  huart UART 句柄，仅用于完整 CLI 命令的文本响应
+ * @param  byte  本次输入字节
+ * @retval CAMERA_PC_DUMP_CMD_DUMP    接收到完整的 "DUMP" 命令
+ * @retval CAMERA_PC_DUMP_CMD_CLI     接收到完整的文本 CLI 命令并已处理
+ * @retval CAMERA_PC_DUMP_CMD_PENDING 字节已消费，但命令行尚未完整
+ * @retval CAMERA_PC_DUMP_CMD_NONE    参数无效
+ * @note   本函数不读取 UART，只维护原有静态文本行状态。
  */
-uint8_t Camera_PC_Dump_PollCommand(UART_HandleTypeDef *huart);
+uint8_t Camera_PC_Dump_FeedCommandByte(UART_HandleTypeDef *huart, uint8_t byte);
+
+/**
+ * @brief  无输出地清空当前文本命令行状态
+ * @note   用于 UART 错误恢复或 StreamBuffer 溢出后的重同步。
+ */
+void Camera_PC_Dump_ResetCommandParser(void);
 
 // /**
 //  * @brief  等待 PC 通过 UART 发送任意命令（DUMP 或 AEC）
