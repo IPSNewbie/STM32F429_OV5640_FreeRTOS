@@ -1,6 +1,7 @@
 #include "camera_pc_dump.h"
 #include "camera_cli.h"
 #include "camera_frame_buffer.h"
+#include "protocol_crc32.h"
 
 #include <string.h>
 
@@ -159,22 +160,6 @@ static void Camera_PC_Dump_WriteU32LE(uint8_t *dst, uint32_t value)
     dst[1] = (uint8_t)((value >> 8) & 0xFFU);
     dst[2] = (uint8_t)((value >> 16) & 0xFFU);
     dst[3] = (uint8_t)((value >> 24) & 0xFFU);
-}
-
-// 计算 CRC32（标准多项式 0xEDB88320），用于数据校验
-static uint32_t Camera_PC_Dump_CRC32(const uint8_t *data, uint32_t length)
-{
-    uint32_t crc = 0xFFFFFFFFU;   // 初始值
-    for (uint32_t i = 0U; i < length; ++i)
-    {
-        crc ^= data[i];           // 与当前字节异或
-        for (uint32_t bit = 0U; bit < 8U; ++bit)
-        {
-            // 标准位运算：若最低位为 1，则右移后异或多项式
-            crc = (crc >> 1) ^ ((0U - (crc & 1U)) & 0xEDB88320U);
-        }
-    }
-    return crc ^ 0xFFFFFFFFU;     // 取反输出
 }
 
 // 获取图像帧缓冲区的 32 位起始地址，用于配置 DCMI DMA 的目标地址
@@ -362,7 +347,7 @@ uint8_t Camera_PC_Dump_SendFrame(UART_HandleTypeDef *huart, uint32_t frame_id)
     Camera_PC_Dump_WriteU32LE(&header[18], frame_id);                  // 帧序号
 
     // 计算有效载荷的 CRC32
-    crc = Camera_PC_Dump_CRC32(payload, PC_DUMP_PAYLOAD_LEN);
+    crc = Protocol_CRC32_Calculate(payload, PC_DUMP_PAYLOAD_LEN);
     Camera_PC_Dump_WriteU32LE(crc_bytes, crc);
 
     // 发送帧头（22 字节）
