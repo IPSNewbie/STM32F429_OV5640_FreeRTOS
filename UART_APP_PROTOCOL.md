@@ -2,7 +2,7 @@
 
 ## 1. 文档目的
 
-本文档用于冻结 STM32F429 + OV5640 项目在 Stage 9 Round 1 的 UART 应用层通信边界。
+本文档用于冻结 STM32F429 + OV5640 项目的 UART 应用层通信边界，并记录 Stage 9 各轮次的兼容性约束。
 
 1. 当前串口使用 COM4、115200 bit/s、8 个数据位、1 个停止位、无校验、无流控。
 2. 当前已实现文本 CLI 控制协议和 OV56RGB5 图像二进制响应协议。
@@ -10,6 +10,7 @@
 4. Stage 9 后续计划增加二进制图像请求协议；Round 1 仅冻结协议草案，不实现解析。
 5. Round 1 将现有 CRC32 算法提取为公共模块，但不改变线上 CRC 结果。
 6. 现有 Python 工具 `tools/pc_dump_rgb565.py` 保持兼容且不修改。
+7. Round 2 新增纯 C 二进制图像请求解析器，但尚未接入实际 UART 或 DUMP。
 
 ## 2. 当前通信架构
 
@@ -37,6 +38,7 @@ OV56RGB5 图像响应
 8. Round 1 未启用 USART1 IDLE 中断。
 9. Round 1 未使用 StreamBuffer。
 10. Round 1 未实现文本/二进制协议分发器。
+11. Round 2 解析器是独立模块，CameraServiceTask 和现有 UART RX 链路仍未调用该模块。
 
 ## 3. 文本 CLI 协议
 
@@ -172,7 +174,7 @@ CRC 不覆盖 magic、version、format/reserved、width、height、payload_len �
 
 ## 7. 二进制图像请求协议 v1 草案
 
-本节只冻结后续轮次使用的请求格式。目前固件尚未实现该请求的解析、状态机或协议分发，当前 PC 必须继续发送文本 `DUMP\n`。
+本节冻结二进制请求格式。Round 2 已实现独立纯 C 解析器，但尚未接入 UART、CameraServiceTask、DUMP 或协议分发，当前 PC 必须继续发送文本 `DUMP\n`。
 
 | 偏移 | 字段 | 长度 | 说明 |
 |---:|---|---:|---|
@@ -194,7 +196,7 @@ CRC 不覆盖 magic、version、format/reserved、width、height、payload_len �
 3. CRC32 算法参数沿用第 6 节的 CRC-32/ISO-HDLC，仅校验范围不同。
 4. CRC 不包含 SOF、CRC 字段和 EOF。
 5. v1 的 `payload_len` 必须为 0。
-6. Round 1 不实现该帧的解析，不新增二进制状态机或协议分发器。
+6. Round 2 只实现独立解析状态机，不新增实际 UART 协议分发器。
 7. 后续实现请求协议后，STM32 图像响应仍使用 OV56RGB5。
 8. Round 1 不改变现有 `frame_id`；`seq` 与 `frame_id` 是否映射尚未决定。
 
@@ -202,8 +204,8 @@ CRC 不覆盖 magic、version、format/reserved、width、height、payload_len �
 
 | 轮次 | 计划内容 | 当前状态 |
 |---|---|---|
-| Round 1 | 协议冻结与 CRC32 公共模块 | 本轮实现 |
-| Round 2 | 纯 C 二进制请求状态机 | 未实现 |
+| Round 1 | 协议冻结与 CRC32 公共模块 | 已完成 |
+| Round 2 | 纯 C 二进制请求状态机 | 本轮完成，尚未接入 UART |
 | Round 3 | UART DMA + IDLE + StreamBuffer，先迁移文本 CLI | 未实现 |
 | Round 4 | 文本/二进制协议分发和图像请求接入 | 未实现 |
 | Round 5 | Python 自动化工具和连续请求压力测试 | 未实现 |
@@ -281,3 +283,106 @@ python tools/pc_dump_rgb565.py --port COM4 --baud 115200 --tag stage9_r1_reset
 ```
 
 检查每次接收的 magic、尺寸、payload 长度和 CRC，并确认 BYPASS、GRAY、BINARY 和 RESET 后图像符合对应模式。Round 1 不在本文档中编造板上测试结果，也不补录 Stage 8 日志。
+
+## 11. 二进制图像请求解析器
+
+### 11.1 模块边界
+
+Round 2 新增 `image_request_protocol` 纯 C 模块：
+
+1. 解析器由调用方静态分配，不使用动态内存。
+2. 解析器不依赖 HAL、FreeRTOS、CMSIS、CameraServiceTask 或系统时钟。
+3. 输入方式为逐字节调用 `ImageRequestProtocol_FeedByte()`。
+4. 当前时间由调用方通过 `now_ms` 参数传入。
+5. v1 请求帧固定为 14 B，`payload_len` 只允许为 0。
+6. CRC 使用 Round 1 的公共模块，只覆盖偏移 2 至 7 的 6 B。
+7. 支持随机前缀过滤、错误重同步、连续帧和 100 ms 半帧超时。
+8. 超时差值使用无符号减法，支持 `uint32_t` tick 回绕。
+9. Round 2 尚未接入实际 UART、CameraServiceTask 或 DUMP，也未做 COM4 协议实测。
+10. Round 3 才计划迁移 UART DMA + IDLE + StreamBuffer；Round 4 才计划接入协议分发和图像请求。
+
+### 11.2 状态机
+
+```text
+SYNC0
+  ↓ A5
+SYNC1
+  ↓ 5A
+VERSION
+  ↓
+MSG_TYPE
+  ↓
+SEQ_LOW
+  ↓
+SEQ_HIGH
+  ↓
+LEN_LOW
+  ↓
+LEN_HIGH
+  ↓
+CRC0
+  ↓
+CRC1
+  ↓
+CRC2
+  ↓
+CRC3
+  ↓
+EOF0
+  ↓
+EOF1
+  ↓
+OK / ERROR / RESYNC
+```
+
+解析规则：
+
+1. `SYNC0` 忽略非 `0xA5` 字节；收到 `0xA5` 后进入候选帧。
+2. `SYNC1` 收到 `0x5A` 后初始化 CRC；再次收到 `0xA5` 时把后一个字节视为新的 SOF0。
+3. version 必须为 `0x01`，msg_type 必须为 `0x20`。
+4. seq、payload_len 和 received CRC 均按小端序拼接。
+5. 只有收到 LEN_HIGH 后才校验 `payload_len == 0`。
+6. 两个 EOF 字节均正确后才最终化并比较 CRC，因此 EOF 错误优先于 CRC 错误。
+7. 只有返回 `OK` 时才写入独立的 `out_frame` 对象，随后解析器自动复位。
+
+### 11.3 解析结果
+
+| 结果 | 含义 |
+|---|---|
+| `NONE` | 尚未进入有效候选帧 |
+| `PENDING` | 候选帧尚未接收完整 |
+| `OK` | 合法请求帧 |
+| `CRC_ERROR` | CRC 错误 |
+| `VERSION_ERROR` | 版本错误 |
+| `TYPE_ERROR` | 消息类型错误 |
+| `LENGTH_ERROR` | 长度错误 |
+| `EOF_ERROR` | 帧尾错误 |
+| `TIMEOUT` | 半帧超时 |
+| `BAD_ARGUMENT` | 参数错误 |
+
+### 11.4 重同步与超时
+
+1. 字段、长度或帧尾错误后，解析器清除旧候选帧并继续搜索下一帧。
+2. 当前错误字节为 `0xA5` 时，该字节被保留为下一候选帧的新 SOF0，状态进入 `SYNC1`。
+3. 当前错误字节不是 `0xA5` 时，解析器回到 `SYNC0`。
+4. `A5 A5 5A` 会从第二个 `A5` 正确同步。
+5. 随机垃圾字节不产生字段错误，后续合法帧仍可成功。
+6. 每收到一个候选帧字节都会更新 `last_byte_time_ms`。
+7. 活动候选帧满足 `(uint32_t)(now_ms - last_byte_time_ms) >= 100U` 时返回 `TIMEOUT`。
+8. `FeedByte()` 检测到旧帧超时时，使用当前新字节执行重同步；当前字节为 `0xA5` 时仍保留为新 SOF0。
+9. 快速重同步保留 `0xA5` 时 `IsActive()` 返回 1；普通成功、错误或 `CheckTimeout()` 超时复位后返回 0。
+
+### 11.5 Round 2 验证
+
+| 验证项 | 结果 | 说明 |
+|---|---|---|
+| 固定请求帧 CRC | 通过 | CRC 输入 `01 20 34 12 00 00`，结果 `0xDBB445EA` |
+| 固定 14 B 请求帧 | 通过 | `A5 5A 01 20 34 12 00 00 EA 45 B4 DB 0D 0A` |
+| 主机测试 | 通过 | 总数 47，通过 47，失败 0，退出码 0 |
+| 主机编译器 | 通过 | Visual Studio C11，使用 `/std:c11 /W4 /WX /utf-8` |
+| STM32 固件构建 | 通过 | `image_request_protocol.c` 已进入固件编译 |
+| RAM | 115592 B / 192 KB，58.79% | Debug 链接结果 |
+| FLASH | 54376 B / 1 MB，5.19% | 模块尚未被业务代码引用，未引用函数段被链接器移除 |
+| HAL / FreeRTOS 依赖扫描 | 通过 | 解析器和主机测试均无相关依赖 |
+| UART 接收链路 | 未修改 | 仍保留原 `HAL_UART_Receive()` 单字节轮询 |
+| COM4 板上协议测试 | 未执行 | Round 2 尚未接入真实 UART |
