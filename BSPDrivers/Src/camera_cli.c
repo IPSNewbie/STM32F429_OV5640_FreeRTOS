@@ -282,6 +282,39 @@ static void Camera_CLI_PrintStatus(UART_HandleTypeDef *huart)
     Camera_CLI_WriteStatLine(huart, "uart_none_count", stats->uart_none_count);
     Camera_CLI_WriteStatLine(huart, "uart_pending_count", stats->uart_pending_count);
     Camera_CLI_WriteStatLine(huart, "uart_error_count", stats->uart_error_count);
+    Camera_CLI_WriteStatLine(huart,
+                             "binary_request_count",
+                             stats->binary_request_count);
+    Camera_CLI_WriteStatLine(huart,
+                             "binary_request_success_count",
+                             stats->binary_request_success_count);
+    Camera_CLI_WriteStatLine(huart,
+                             "binary_request_error_count",
+                             stats->binary_request_error_count);
+    Camera_CLI_WriteStatLine(huart,
+                             "binary_request_crc_error_count",
+                             stats->binary_request_crc_error_count);
+    Camera_CLI_WriteStatLine(huart,
+                             "binary_request_version_error_count",
+                             stats->binary_request_version_error_count);
+    Camera_CLI_WriteStatLine(huart,
+                             "binary_request_type_error_count",
+                             stats->binary_request_type_error_count);
+    Camera_CLI_WriteStatLine(huart,
+                             "binary_request_length_error_count",
+                             stats->binary_request_length_error_count);
+    Camera_CLI_WriteStatLine(huart,
+                             "binary_request_eof_error_count",
+                             stats->binary_request_eof_error_count);
+    Camera_CLI_WriteStatLine(huart,
+                             "binary_request_timeout_count",
+                             stats->binary_request_timeout_count);
+    Camera_CLI_WriteStatLine(huart,
+                             "last_binary_request_seq",
+                             stats->last_binary_request_seq);
+    Camera_CLI_WriteStatLine(huart,
+                             "last_binary_error_code",
+                             stats->last_binary_error_code);
     Camera_CLI_WriteStatLine(huart, "last_error_code", stats->last_error_code);
     Camera_CLI_WriteStatLine(huart, "last_dump_time_ms", stats->last_dump_time_ms);
     Camera_CLI_WriteStatLine(huart, "last_status_time_ms", stats->last_status_time_ms);

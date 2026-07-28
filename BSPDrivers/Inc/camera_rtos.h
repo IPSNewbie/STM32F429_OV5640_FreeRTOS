@@ -58,6 +58,17 @@ typedef struct
     volatile uint32_t uart_none_count;           /**< StreamBuffer 读取超时次数 */
     volatile uint32_t uart_pending_count;        /**< 文本行尚未完整的字节次数 */
     volatile uint32_t uart_error_count;          /**< UART DMA 错误兼容计数 */
+    volatile uint32_t binary_request_count;      /**< 合法二进制图像请求次数 */
+    volatile uint32_t binary_request_success_count; /**< 二进制请求成功发送图像次数 */
+    volatile uint32_t binary_request_error_count;   /**< 二进制请求解析错误总数 */
+    volatile uint32_t binary_request_crc_error_count; /**< 二进制请求 CRC 错误次数 */
+    volatile uint32_t binary_request_version_error_count; /**< 二进制请求版本错误次数 */
+    volatile uint32_t binary_request_type_error_count; /**< 二进制请求类型错误次数 */
+    volatile uint32_t binary_request_length_error_count; /**< 二进制请求长度错误次数 */
+    volatile uint32_t binary_request_eof_error_count; /**< 二进制请求帧尾错误次数 */
+    volatile uint32_t binary_request_timeout_count; /**< 二进制半帧超时次数 */
+    volatile uint16_t last_binary_request_seq;  /**< 最近一次合法二进制请求序号 */
+    volatile uint32_t last_binary_error_code;   /**< 最近一次二进制解析错误枚举值 */
     volatile uint32_t last_error_code;           /**< 最后一次错误码 */
     volatile uint32_t last_dump_time_ms;         /**< 最近一次 DUMP 耗时 */
     volatile uint32_t last_status_time_ms;       /**< 最近一次 STATUS 时间 */
@@ -128,10 +139,10 @@ void Camera_RTOS_RecordStatus(uint32_t time_ms);
  * @param  argument 任务参数（未使用）
  * @note   主循环中执行：
  *         1. 从静态 StreamBuffer 分块读取 USART1 RX DMA 数据
- *         2. 将字节送入现有文本行解析器
- *         3. 若收到 DUMP，则触发 DCMI 拍照并发送帧数据
- *         4. 若收到 CLI 命令，则通过 Camera_CLI_HandleLine 处理
- *         5. 维护 UART、CLI 和 DUMP 运行统计
+ *         2. 将字节送入文本与二进制协议分发器
+ *         3. 文本字节继续交给现有 CLI 和 DUMP 解析路径
+ *         4. 合法二进制图像请求复用现有 DUMP 发送路径
+ *         5. 维护 UART、CLI、DUMP 和二进制请求运行统计
  */
 void Camera_RTOS_CameraServiceTask(void *argument);
 

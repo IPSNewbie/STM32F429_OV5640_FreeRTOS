@@ -6,12 +6,12 @@
 
 1. 当前串口使用 COM4、115200 bit/s、8 个数据位、1 个停止位、无校验、无流控。
 2. 当前已实现文本 CLI 控制协议和 OV56RGB5 图像二进制响应协议。
-3. 当前图像请求仍由文本命令 `DUMP` 触发。
-4. Stage 9 后续计划增加二进制图像请求协议；Round 1 仅冻结协议草案，不实现解析。
+3. 图像请求可由文本命令 `DUMP` 或 v1 二进制 `REQUEST_IMAGE` 触发。
+4. Round 4 已接入文本/二进制协议分发，二进制响应仍使用既有 OV56RGB5。
 5. Round 1 将现有 CRC32 算法提取为公共模块，但不改变线上 CRC 结果。
 6. 现有 Python 工具 `tools/pc_dump_rgb565.py` 保持兼容且不修改。
-7. Round 2 新增纯 C 二进制图像请求解析器，但尚未接入实际 UART 或 DUMP。
-8. Round 3 已将现有文本 CLI 和文本 `DUMP` 的接收链路迁移到 UART DMA + IDLE + 静态 StreamBuffer，二进制请求解析器仍未接入。
+7. Round 2 新增纯 C 二进制图像请求解析器。
+8. Round 3 已将接收链路迁移到 UART DMA + IDLE + 静态 StreamBuffer；Round 4 在任务上下文接入协议分发和图像请求。
 
 ## 2. 当前通信架构
 
@@ -28,9 +28,9 @@ HAL_UARTEx_RxEventCallback
     ↓ xStreamBufferReceive
 CameraServiceTask
     ↓
-文本 CLI 或 DUMP
-    ↓
-OV56RGB5 图像响应
+camera_uart_dispatcher
+    ├── TEXT_BYTE → 文本 CLI / DUMP
+    └── IMAGE_REQUEST → 既有 DUMP 路径 → OV56RGB5
 ```
 
 当前实现边界如下：
@@ -39,13 +39,13 @@ OV56RGB5 图像响应
 2. UART RX 使用 `HAL_UARTEx_ReceiveToIdle_DMA()` 启动 Circular DMA，正常运行期间只启动一次。
 3. IDLE、DMA HT 和 DMA TC 事件通过当前 DMA 写入位置与旧位置的差分提取新增字节。
 4. ISR 只搬运新增字节到静态 StreamBuffer、维护最小统计并按需唤醒任务。
-5. CameraServiceTask 使用 `xStreamBufferReceive()` 阻塞等待数据，并逐字节送入现有文本行解析器。
-6. 一个读取块包含多条文本命令时，CameraServiceTask 会按顺序处理全部命令。
+5. CameraServiceTask 使用 `xStreamBufferReceive()` 阻塞等待数据，并逐字节送入 `camera_uart_dispatcher`。
+6. 分发器把文本字节送入现有文本行解析器，把二进制候选帧送入 `image_request_protocol`。
 7. UART 错误只在 ISR 中记录并置位，DMA 的中止、清错和重新启动在 CameraServiceTask 上下文完成。
-8. StreamBuffer 溢出后，CameraServiceTask 放弃本地剩余字节、清除残缺文本行并排空缓冲区，再等待下一条完整命令。
+8. StreamBuffer 溢出后，CameraServiceTask 放弃本地剩余字节、同时复位文本和二进制解析状态并排空缓冲区。
 9. 文本 `DUMP` 仍由 CameraServiceTask 串行执行，响应前不发送文本，图像响应仍为 OV56RGB5。
-10. Round 2 的二进制请求解析器仍是独立模块，尚未接入 UART、CameraServiceTask 或 DUMP。
-11. 当前仍未实现文本/二进制协议分发器。
+10. 合法二进制 `REQUEST_IMAGE` 复用文本 `DUMP` 的采集、处理、发送和统计路径。
+11. 二进制解析错误和超时只记录统计，不输出文本，不触发 DUMP。
 
 ## 3. 文本 CLI 协议
 
@@ -144,7 +144,7 @@ Serial engine = PuTTY
 10. Python 会读取、显示并记录 `frame_id` 到报告和 `summary.csv`。
 11. Python 不校验起始值、连续性、重复、倒退或回绕，也不基于该字段丢弃重复帧。
 12. Round 1 不改变 `frame_id` 的任何语义。
-13. 后续是否把二进制请求的 `seq` 映射到 `frame_id`，需在兼容性验证后另行决定。
+13. 二进制请求的 `seq` 与 OV56RGB5 的 `frame_id` 相互独立，不进行映射。
 
 ## 6. CRC32 参数
 
@@ -179,9 +179,9 @@ CRC 不覆盖 magic、version、format/reserved、width、height、payload_len �
 7. `data == NULL` 时更新函数不解引用指针并保持当前 CRC 状态；一次性计算会得到空数据结果。
 8. 该容错行为无法区分空输入和错误的空指针调用，因此 `length > 0` 时调用方仍必须先校验数据指针。
 
-## 7. 二进制图像请求协议 v1 草案
+## 7. 二进制图像请求协议 v1
 
-本节冻结二进制请求格式。Round 2 已实现独立纯 C 解析器，但尚未接入 UART、CameraServiceTask、DUMP 或协议分发，当前 PC 必须继续发送文本 `DUMP\n`。
+本节冻结二进制请求格式。Round 2 已实现独立纯 C 解析器，Round 4 已通过协议分发器接入 CameraServiceTask 和既有 DUMP 路径；文本 `DUMP\n` 继续兼容。
 
 | 偏移 | 字段 | 长度 | 说明 |
 |---:|---|---:|---|
@@ -196,25 +196,25 @@ CRC 不覆盖 magic、version、format/reserved、width、height、payload_len �
 | 12 | `EOF0` | 1 B | 固定为 `0x0D` |
 | 13 | `EOF1` | 1 B | 固定为 `0x0A` |
 
-草案约束：
+协议约束：
 
 1. v1 请求帧总长度为 14 B。
 2. CRC 只覆盖 `version`、`msg_type`、`seq` 和 `payload_len`，即偏移 2 至 7 的 6 B。
 3. CRC32 算法参数沿用第 6 节的 CRC-32/ISO-HDLC，仅校验范围不同。
 4. CRC 不包含 SOF、CRC 字段和 EOF。
 5. v1 的 `payload_len` 必须为 0。
-6. Round 2 只实现独立解析状态机，不新增实际 UART 协议分发器。
-7. 后续实现请求协议后，STM32 图像响应仍使用 OV56RGB5。
-8. Round 1 不改变现有 `frame_id`；`seq` 与 `frame_id` 是否映射尚未决定。
+6. Round 2 只实现独立解析状态机，实际 UART 协议分发由 Round 4 接入。
+7. STM32 图像响应仍使用 OV56RGB5，不新增二进制响应格式。
+8. 请求 `seq` 只标识 PC 发出的请求，响应 `frame_id` 仍按固件成功发送帧的既有规则递增。
 
 ## 8. Stage 9 实施轮次
 
 | 轮次 | 计划内容 | 当前状态 |
 |---|---|---|
 | Round 1 | 协议冻结与 CRC32 公共模块 | 已完成 |
-| Round 2 | 纯 C 二进制请求状态机 | 已完成，尚未接入 UART |
-| Round 3 | UART DMA + IDLE + StreamBuffer，先迁移文本 CLI | 代码完成，COM4 板上测试待进行 |
-| Round 4 | 文本/二进制协议分发和图像请求接入 | 未实现 |
+| Round 2 | 纯 C 二进制请求状态机 | 已完成 |
+| Round 3 | UART DMA + IDLE + StreamBuffer，先迁移文本 CLI | 已完成并通过 COM4 板上测试 |
+| Round 4 | 文本/二进制协议分发和图像请求接入 | 编码与主机验证完成，COM4 板上测试待进行 |
 | Round 5 | Python 自动化工具和连续请求压力测试 | 未实现 |
 
 后续轮次是计划，不代表当前固件已经具备对应能力。
@@ -305,8 +305,8 @@ Round 2 新增 `image_request_protocol` 纯 C 模块：
 6. CRC 使用 Round 1 的公共模块，只覆盖偏移 2 至 7 的 6 B。
 7. 支持随机前缀过滤、错误重同步、连续帧和 100 ms 半帧超时。
 8. 超时差值使用无符号减法，支持 `uint32_t` tick 回绕。
-9. Round 2 尚未接入实际 UART、CameraServiceTask 或 DUMP，也未做 COM4 协议实测。
-10. Round 3 已迁移文本 UART RX 到 DMA + IDLE + StreamBuffer；Round 4 才计划接入协议分发和图像请求。
+9. Round 2 本轮结束时尚未接入实际 UART、CameraServiceTask 或 DUMP，也未做 COM4 协议实测。
+10. Round 3 完成 UART RX 迁移，Round 4 已接入协议分发和图像请求。
 
 ### 11.2 状态机
 
@@ -400,9 +400,9 @@ OK / ERROR / RESYNC
 
 1. USART1 RX 已迁移为 Circular DMA + Receive-to-IDLE。
 2. DMA 使用 CubeMX 生成的 DMA2 Stream2 Channel 4。
-3. 当前只迁移既有文本 CLI 和文本 `DUMP`。
-4. `image_request_protocol` 尚未接入 UART。
-5. 未新增文本/二进制协议分发器。
+3. Round 3 只迁移既有文本 CLI 和文本 `DUMP`。
+4. Round 3 尚未把 `image_request_protocol` 接入 UART。
+5. 文本/二进制协议分发器由 Round 4 新增。
 6. 未修改 UART TX；CLI 文本和 OV56RGB5 图像仍使用阻塞发送。
 
 ### 12.2 DMA 与 StreamBuffer
@@ -433,7 +433,7 @@ ISR 不执行 UART TX、CLI、DUMP、图像采集、协议重同步或日志打�
 
 1. 任务启动时静态创建 StreamBuffer，并启动一次 Receive-to-IDLE DMA。
 2. 每次最多从 StreamBuffer 读取 32 B，最长阻塞等待 100 ms。
-3. 每个字节继续使用 `camera_pc_dump` 中的现有文本行状态机。
+3. Round 3 的每个字节继续使用 `camera_pc_dump` 中的现有文本行状态机。
 4. 完整 CLI 命令仍交给 `Camera_CLI_HandleLine()`。
 5. 完整 `DUMP` 仍由 CameraServiceTask 执行采集、处理和 OV56RGB5 发送。
 6. DUMP 期间 RX DMA 继续接收，但 CameraServiceTask 暂停解析新命令。
@@ -445,7 +445,7 @@ ISR 不执行 UART TX、CLI、DUMP、图像采集、协议重同步或日志打�
 2. CameraServiceTask 调用 `HAL_UART_AbortReceive()`，清除 UART 错误并重新启动一次 Receive-to-IDLE DMA。
 3. 恢复失败时保留恢复请求，后续继续重试，不解析旧数据。
 4. StreamBuffer 写入不足时记录丢失字节并设置溢出标志。
-5. CameraServiceTask 检测到溢出后清除文本行状态、丢弃当前读取块剩余字节并非阻塞排空 StreamBuffer。
+5. Round 3 的 CameraServiceTask 检测到溢出后清除文本行状态、丢弃当前读取块剩余字节并非阻塞排空 StreamBuffer。
 6. 只有确认 StreamBuffer 已排空后才清除溢出标志并记录重同步次数。
 7. 溢出或恢复过程不输出文本，避免污染 OV56RGB5 二进制响应。
 
@@ -459,5 +459,108 @@ ISR 不执行 UART TX、CLI、DUMP、图像采集、协议重同步或日志打�
 ### 12.7 当前验证边界
 
 1. 固件构建和静态检查由 Round 3 代码验证覆盖。
-2. COM4 板上 HELP、STATUS、快速连续命令、分段命令和文本 DUMP 尚待用户测试。
-3. 不得将当前状态描述为二进制请求已经可以通过 COM4 触发图像。
+2. Round 3 的文本 CLI、文本 DUMP、错误恢复和溢出重同步已通过 COM4 板上测试。
+3. Round 3 未接入二进制请求；Round 4 的二进制请求仍需单独完成 COM4 板上验证。
+
+## 13. 文本与二进制协议分发
+
+### 13.1 模块边界
+
+Round 4 新增纯 C 模块 `camera_uart_dispatcher`。该模块不依赖 HAL、CMSIS-RTOS、FreeRTOS、StreamBuffer、CLI 或 UART 句柄，不执行 UART 发送、图像采集和 DUMP，也不使用动态内存。时间戳由 CameraServiceTask 通过 `now_ms` 传入。
+
+当前数据流为：
+
+```text
+DMA + IDLE
+    ↓
+StreamBuffer
+    ↓
+CameraServiceTask
+    ↓
+camera_uart_dispatcher
+    ├── TEXT_BYTE → 现有 CLI / 文本 DUMP
+    └── IMAGE_REQUEST → 现有 DUMP → OV56RGB5
+```
+
+### 13.2 分发模式
+
+| 模式 | 含义 | 退出条件 |
+|---|---|---|
+| `IDLE` | 当前没有文本行或二进制候选帧 | 非 `0xA5` 字节进入文本；`0xA5` 进入二进制候选 |
+| `TEXT` | 当前正在接收文本行 | 仅收到 LF（`0x0A`）后回到 `IDLE` |
+| `BINARY` | 当前正在接收二进制候选帧，或隔离错误帧的剩余尾部 | 解析完成或尾部隔离结束后回到 `IDLE` |
+
+规则如下：
+
+1. `IDLE` 收到 `0xA5` 时，该字节只进入二进制解析器，不进入文本解析器。
+2. `IDLE` 收到其他字节时产生 `TEXT_BYTE`；LF 后保持 `IDLE`，其他字节进入 `TEXT`。
+3. 文本行开始后，直到 LF 前都不切换协议；文本中的 `0xA5` 仍是文本字节。
+4. CR 不是分发层的结束条件；正常 `\r\n` 在 LF 后回到 `IDLE`。
+5. 正常 `BINARY` 字节只进入 `image_request_protocol`；尾部隔离期间的字节只被丢弃，二者均不进入现有文本行解析器。
+6. `A5 00` 作为普通帧头搜索失败静默回到 `IDLE`，不产生二进制错误事件。
+7. `A5 A5 5A` 从第二个 `A5` 重新同步并继续接收候选帧。
+8. 解析错误字节本身为 `0xA5` 时，解析器把它保留为新 SOF0，分发器继续保持 `BINARY`。
+9. 尾部隔离不是新的公开模式，而是 `BINARY` 的内部子状态。
+
+### 13.3 分发结果与业务动作
+
+| 分发结果 | CameraServiceTask 动作 |
+|---|---|
+| `NONE` | 不执行协议业务动作 |
+| `TEXT_BYTE` | 把当前字节送入 `Camera_PC_Dump_FeedCommandByte()` |
+| `IMAGE_REQUEST` | 记录合法请求和 seq，调用文本 DUMP 共用的发送路径 |
+| `BINARY_ERROR` | 按 CRC、version、type、length 或 EOF 分类计数，不输出文本 |
+| `BINARY_TIMEOUT` | 增加半帧超时计数，不输出文本，不触发 DUMP |
+| `BAD_ARGUMENT` | 记录内部状态错误，不修改分发器有效状态 |
+
+合法固定请求帧为：
+
+```text
+A5 5A 01 20 34 12 00 00 EA 45 B4 DB 0D 0A
+```
+
+其中请求 `seq = 0x1234`。解析成功后只触发一次既有 DUMP 路径，直接返回 OV56RGB5；响应前不发送 `OK`、ACK、STATUS 或日志。
+
+### 13.4 错误、超时与输入恢复
+
+1. CRC、version、type、length 和 EOF 错误均不触发 DUMP，也没有文本错误响应。
+2. Round 4 不定义 ACK、NACK、重传或新的二进制错误响应帧。
+3. 二进制候选帧超时阈值保持为 100 ms；CameraServiceTask 的 StreamBuffer 读取无数据时调用分发器超时检查。
+4. `FeedByte()` 发现旧候选帧超时时，当前字节按底层解析器既有规则参与重同步，不进行二次回灌。
+5. UART DMA 错误恢复成功或 StreamBuffer 溢出重同步时，同时复位分发器和现有文本命令解析器。
+6. version、type、length 或 EOF0 提前报错时，分发器先且只产生一次 `BINARY_ERROR`。
+7. 若错误字节 `0xA5` 已被底层保留为新 SOF0，则继续正常 `BINARY`，不进入尾部隔离。
+8. 底层解析器 inactive 时，按错误前状态隔离固定剩余字节：VERSION 为 11 B、MSG_TYPE 为 10 B、LEN_HIGH 为 6 B、EOF0 为 1 B，EOF1 和 CRC 错误为 0 B。
+9. 隔离期间所有输入字节，包括 LF 和 `0xA5`，只被丢弃并递减剩余计数，不产生 `TEXT_BYTE`、新错误或图像请求，也不重放最后一个字节。
+10. 隔离时间戳在建立隔离和每次丢弃字节时更新；剩余计数清零后回到 `IDLE`。
+11. 错误帧被截断时，尾部隔离在 100 ms 后静默解除并返回 `NONE`，不重复产生 `BINARY_ERROR`，也不产生 `BINARY_TIMEOUT`。
+12. `CameraUartDispatcher_Reset()` 会同时清除底层解析器和全部尾部隔离字段。
+
+### 13.5 seq 与 frame_id
+
+1. 请求 `seq` 只标识 PC 发出的二进制请求，当前仅用于运行统计。
+2. OV56RGB5 `frame_id` 只标识 STM32 成功发送的图像帧，继续由 `s_camera_rtos_frame_id` 管理。
+3. 请求 `seq = 0x1234` 时，响应 `frame_id` 不要求等于 `0x1234`。
+4. 现有 Python 工具读取 `frame_id`，不知道请求 `seq`，且本轮保持不变。
+5. 后续若需要请求与响应关联，应扩展协议版本，不能改变既有 `frame_id` 字段语义。
+
+### 13.6 当前验证边界
+
+1. Round 4 分发器使用 Visual Studio C11 编译器和 `/std:c11 /W4 /WX /utf-8` 进行独立主机测试。
+2. 原 CRC32 主机测试和 47 项图像请求解析器测试继续作为回归项目。
+3. 固件构建继续验证分发器、CameraServiceTask 和 STATUS 集成。
+4. Round 4 尚未新增正式 Python 二进制请求工具，也未执行连续请求压力测试。
+5. Round 4 编码完成后仍需使用 COM4 进行板上测试；Round 5 才新增正式 Python 工具和压力测试。
+
+当前验证结果：
+
+| 验证项 | 结果 |
+|---|---|
+| CRC32 主机回归 | 通过，`123456789` 为 `0xCBF43926` |
+| image_request_protocol 主机回归 | 47/47 通过 |
+| camera_uart_dispatcher 主机测试 | 85/85 通过，保留原 62 项并新增 23 项尾部隔离测试 |
+| STM32 Debug 固件构建 | 通过 |
+| RAM | 116488 B / 192 KB，59.25% |
+| CCMRAM | 0 B / 64 KB，0.00% |
+| FLASH | 66128 B / 1 MB，6.31% |
+| COM4 二进制请求板上测试 | 待测试 |
