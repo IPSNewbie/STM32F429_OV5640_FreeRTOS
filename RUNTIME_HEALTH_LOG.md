@@ -1,0 +1,143 @@
+# FreeRTOS运行健康监控日志
+
+## 阶段
+
+Stage 10 Round 1修正：统一栈余量字段语义
+
+## 本阶段目的
+
+- 通信成功不代表系统长时间运行一定安全。
+- 任务栈不足可能造成随机崩溃。
+- Heap不足可能导致后续内核对象创建失败。
+- 本轮统一栈watermark统计语义，不修改采样位置、任务、Heap或保护配置。
+
+## 当前任务
+
+| 任务 | 优先级 | 配置栈大小 |
+| --- | --- | ---: |
+| CameraServiceTask（线程名CameraServiceTa） | osPriorityAboveNormal | 8192 B（2048 * 4） |
+| MonitorTask | osPriorityLow | 2048 B（512 * 4） |
+
+以上配置来自`Core/Src/freertos.c`中的当前任务属性，未在本轮修改。
+
+## 栈余量是什么
+
+- 栈总大小是创建任务时为该任务配置的栈容量。
+- 当前CMSIS-FreeRTOS实现的`osThreadGetStackSpace()`基于FreeRTOS stack high-water mark。
+- 该watermark表示任务启动以来，栈最深使用时仍未被触及的最小剩余空间，不是调用时刻的瞬时剩余栈。
+- 返回的最小剩余栈数值只能保持不变或下降；数值越小，说明任务曾经越接近栈溢出。
+- 当前工程没有使用可移植接口获得真正的瞬时栈余量，因此不提供“当前剩余栈”字段。
+
+## Heap余量是什么
+
+- `free_heap_bytes`是采样时FreeRTOS Heap的当前剩余字节数。
+- `min_ever_free_heap_bytes`是FreeRTOS启动以来曾出现过的最小Heap剩余字节数。
+- 当前free heap可以随内核对象申请和释放而变化；min ever free heap只会保持或下降。
+- 当前工程`configTOTAL_HEAP_SIZE`为32768 B，本轮未修改。
+
+## 复位原因诊断
+
+- Stage 10 Round 1.1B在`main()`进入后、`HAL_Init()`之前保存`RCC->CSR`，随后立即清除硬件复位标志；后续两次日志都只解析这份启动快照，不重新读取已清除的寄存器。
+- UART1和现有`bsp_log`初始化完成后输出`RESET_CAUSE`；摄像头、DCMI和Camera RTOS应用初始化完成、FreeRTOS内核初始化前输出`RESET_CAUSE_READY`。第二条日志用于提高PC端捕获启动诊断的机会。
+- 输出保留原始CSR十六进制值，并分别给出`PIN`、`POR`、`BOR`、`SOFTWARE`、`IWDG`、`WWDG`和`LOW_POWER`的0或1状态；多个标志可能同时存在，不能假设只有一个复位原因。
+- `PIN=1`通常表示NRST引脚或外部复位路径，`SOFTWARE=1`表示软件系统复位，`IWDG=1`或`WWDG=1`表示对应看门狗复位，`POR=1`或`BOR=1`表示上电或电压相关复位。
+- 标志只能证明MCU记录到的复位来源，最终结论必须依据真实板测值，并结合两条日志是否出现判断是否发生完整芯片复位。
+- 本轮尚未启用IWDG，也未主动调用系统复位，因此不能预设实际标志结果；板上结果待测试。
+
+## 实现方式
+
+- 栈余量使用当前CMSIS-RTOS2实现的`osThreadGetStackSpace(osThreadGetId())`读取。
+- 当前工程的`osThreadGetStackSpace()`内部调用`uxTaskGetStackHighWaterMark()`，再乘以`sizeof(StackType_t)`；本端口`StackType_t`为`uint32_t`。
+- CMSIS-RTOS2接口已经完成字节转换，本模块直接将返回值写入对应的`*_stack_min_free_bytes`字段，不再进行第二层min比较。
+- CameraServiceTask在自身上下文中，于UART DMA初始化完成后立即读取watermark；随后在正常读取/分发循环处理结束时采用简单时间差判断，约每1000 ms读取一次；DUMP完成后立即读取，以取得DUMP过程中可能产生的新历史最低值。该限频未新增软件定时器，也不会按每个32 B StreamBuffer块采样。
+- MonitorTask在自身上下文中，每次1000 ms循环读取自身stack watermark、当前Heap和历史最小Heap。
+- Heap使用`xPortGetFreeHeapSize()`和`xPortGetMinimumEverFreeHeapSize()`，返回值保存为`uint32_t`字节数。
+
+## 健康统计字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `health_sample_count` | MonitorTask完成健康资源采样的次数 |
+| `camera_service_stack_min_free_bytes` | CameraServiceTask启动以来的最小剩余栈空间，单位B |
+| `monitor_stack_min_free_bytes` | MonitorTask启动以来的最小剩余栈空间，单位B |
+| `free_heap_bytes` | 当前FreeRTOS Heap余量，单位B |
+| `min_ever_free_heap_bytes` | FreeRTOS启动以来最小Heap余量，单位B |
+
+两个任务的最小栈余量初始化为`0U`，第一次实际采样后由CMSIS-RTOS2返回的真实watermark覆盖，避免首次采样前STATUS显示`UINT32_MAX`。
+
+## STATUS输出
+
+现有STATUS字段、UART RX DMA区域和二进制请求统计全部保留，RTOS统计后新增：
+
+```text
+HEALTH:
+  health_sample_count=
+  camera_service_stack_min_free_bytes=
+  monitor_stack_min_free_bytes=
+  free_heap_bytes=
+  min_ever_free_heap_bytes=
+```
+
+所有带`_bytes`的字段单位均为B；不输出安全阈值或PASS/FAIL结论。
+
+## 并发说明
+
+- CameraServiceTask只更新自己的历史最小栈余量字段。
+- MonitorTask更新自身历史最小栈余量、两个Heap字段和健康采样次数。
+- 每个字段使用单次32位读写，未新增Mutex、临界区或其他同步对象。
+- STATUS允许读到来自不同采样时刻的字段组合，因此它是运行观测，不是严格原子、事务型快照。
+
+## 构建结果
+
+`cmake --build build/Debug`构建通过。
+
+| 区域 | Stage 10 Round 1 | Stage 9结束时 | 变化 |
+| --- | ---: | ---: | ---: |
+| RAM | 116512 B / 192 KB | 116488 B / 192 KB | +24 B |
+| CCMRAM | 0 B / 64 KB | 0 B / 64 KB | 0 B |
+| FLASH | 66820 B / 1 MB | 66128 B / 1 MB | +692 B |
+
+## 板上测试结果
+
+四个正式工具均已完成真实板上回归：
+
+- `tools/uart_image_request_basic.py`：PASS。
+- `tools/uart_image_request_fault_test.py`：PASS。
+- `tools/pc_dump_rgb565.py`：PASS。
+- `tools/uart_image_request_repeat.py`：20/20 PASS。
+
+板上`STATUS`记录的HEALTH字段如下：
+
+```text
+health_sample_count=79
+camera_service_stack_min_free_bytes=7792
+monitor_stack_min_free_bytes=1872
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+同次检查的UART RX DMA统计如下：
+
+```text
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+本次板测中UART DMA无错误、无溢出、无恢复和重同步事件；Heap当前值与历史最小值一致。
+
+## 风险与限制
+
+- 本轮只监控，不自动保护或复位。
+- 尚未启用栈溢出Hook。
+- 尚未启用malloc failed Hook。
+- 尚未启用IWDG。
+- `osThreadGetStackSpace()`所依据的high-water mark只能反映任务启动以来的历史最深栈使用，不能提供瞬时剩余栈。
+- STATUS不是原子快照。
+- 32位统计值长期运行会回绕。
+- 代码构建及本轮真实板上回归已验证；这些数值仅代表本次运行样本，后续长期运行仍需继续观察。
+
+## 阶段结论
+
+Stage 10 Round 1代码、文档和板上回归已完成，固件构建通过。四个正式工具全部PASS，repeat连续请求20/20 PASS，UART DMA无错误或溢出。运行健康统计不会改变任务栈大小、优先级、Heap大小或通信协议。

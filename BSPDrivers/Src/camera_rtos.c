@@ -27,6 +27,9 @@
 // CameraServiceTask 等待接收字节的最长时间
 #define CAMERA_RTOS_UART_READ_TIMEOUT_MS           100U
 
+// CameraServiceTask 栈余量的周期采样间隔（毫秒）
+#define CAMERA_RTOS_STACK_SAMPLE_PERIOD_MS         1000U
+
 // 静态变量：保存 UART 句柄（用于日志和 PC 通信）
 static UART_HandleTypeDef *s_camera_rtos_uart;
 
@@ -67,6 +70,35 @@ static void Camera_RTOS_ClearStats(void)
     s_camera_rtos_stats.last_dump_time_ms = 0U;
     s_camera_rtos_stats.last_status_time_ms = 0U;
     s_camera_rtos_stats.uptime_ms = 0U;
+    s_camera_rtos_stats.health_sample_count = 0U;
+    s_camera_rtos_stats.camera_service_stack_min_free_bytes = 0U;
+    s_camera_rtos_stats.monitor_stack_min_free_bytes = 0U;
+    s_camera_rtos_stats.free_heap_bytes = 0U;
+    s_camera_rtos_stats.min_ever_free_heap_bytes = 0U;
+}
+
+// CMSIS-RTOS2 返回当前任务启动以来的历史最小栈余量，单位为字节
+static uint32_t Camera_RTOS_GetCurrentTaskStackMinFreeBytes(void)
+{
+    return osThreadGetStackSpace(osThreadGetId());
+}
+
+// 在 CameraServiceTask 自身上下文读取最新的历史最小栈余量
+static void Camera_RTOS_UpdateCameraServiceStackStats(void)
+{
+    s_camera_rtos_stats.camera_service_stack_min_free_bytes =
+        Camera_RTOS_GetCurrentTaskStackMinFreeBytes();
+}
+
+// 在 MonitorTask 自身上下文更新历史最小栈余量、Heap 和健康采样计数
+static void Camera_RTOS_UpdateMonitorHealthStats(void)
+{
+    s_camera_rtos_stats.monitor_stack_min_free_bytes =
+        Camera_RTOS_GetCurrentTaskStackMinFreeBytes();
+    s_camera_rtos_stats.free_heap_bytes = (uint32_t)xPortGetFreeHeapSize();
+    s_camera_rtos_stats.min_ever_free_heap_bytes =
+        (uint32_t)xPortGetMinimumEverFreeHeapSize();
+    s_camera_rtos_stats.health_sample_count++;
 }
 
 // 记录一条完整 CLI 命令
@@ -272,6 +304,7 @@ static uint8_t Camera_RTOS_ProcessDumpRequest(void)
     dump_start_tick = HAL_GetTick();
     error_code = Camera_RTOS_CaptureProcessAndSend();
     dump_elapsed_ms = HAL_GetTick() - dump_start_tick;
+    Camera_RTOS_UpdateCameraServiceStackStats();
     if (error_code == CAMERA_RTOS_ERR_NONE)
     {
         Camera_RTOS_RecordDumpSuccess(dump_elapsed_ms);
@@ -418,6 +451,8 @@ void Camera_RTOS_CameraServiceTask(void *argument)
     uint8_t rx_chunk[CAMERA_RTOS_UART_RX_CHUNK_SIZE];
     size_t received;
     size_t i;
+    uint32_t stack_sample_tick;
+    uint32_t current_tick;
     CameraUartDispatchEvent_t dispatch_event;
     CameraUartDispatchResult_t dispatch_result;
 
@@ -440,6 +475,9 @@ void Camera_RTOS_CameraServiceTask(void *argument)
         s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_UART_DMA_INIT;
         (void)osDelay(1000U);
     }
+
+    Camera_RTOS_UpdateCameraServiceStackStats();
+    stack_sample_tick = HAL_GetTick();
 
     for (;;)
     {
@@ -472,6 +510,13 @@ void Camera_RTOS_CameraServiceTask(void *argument)
                 &dispatch_event);
             Camera_RTOS_ProcessDispatchEvent(dispatch_result, &dispatch_event);
             Camera_RTOS_RecordUartNone();
+            current_tick = HAL_GetTick();
+            if ((current_tick - stack_sample_tick) >=
+                CAMERA_RTOS_STACK_SAMPLE_PERIOD_MS)
+            {
+                Camera_RTOS_UpdateCameraServiceStackStats();
+                stack_sample_tick = current_tick;
+            }
             continue;
         }
 
@@ -491,6 +536,14 @@ void Camera_RTOS_CameraServiceTask(void *argument)
                 &dispatch_event);
             Camera_RTOS_ProcessDispatchEvent(dispatch_result, &dispatch_event);
         }
+
+        current_tick = HAL_GetTick();
+        if ((current_tick - stack_sample_tick) >=
+            CAMERA_RTOS_STACK_SAMPLE_PERIOD_MS)
+        {
+            Camera_RTOS_UpdateCameraServiceStackStats();
+            stack_sample_tick = current_tick;
+        }
     }
 }
 
@@ -504,6 +557,7 @@ void Camera_RTOS_MonitorTask(void *argument)
         (void)osDelay(1000U);
         s_camera_rtos_stats.monitor_tick_count++;
         s_camera_rtos_stats.uptime_ms += 1000U;
+        Camera_RTOS_UpdateMonitorHealthStats();
     }
 }
 

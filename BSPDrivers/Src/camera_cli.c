@@ -319,6 +319,19 @@ static void Camera_CLI_PrintStatus(UART_HandleTypeDef *huart)
     Camera_CLI_WriteStatLine(huart, "last_dump_time_ms", stats->last_dump_time_ms);
     Camera_CLI_WriteStatLine(huart, "last_status_time_ms", stats->last_status_time_ms);
 
+    Camera_CLI_WriteLine(huart, "HEALTH:");
+    Camera_CLI_WriteStatLine(huart, "health_sample_count", stats->health_sample_count);
+    Camera_CLI_WriteStatLine(huart,
+                             "camera_service_stack_min_free_bytes",
+                             stats->camera_service_stack_min_free_bytes);
+    Camera_CLI_WriteStatLine(huart,
+                             "monitor_stack_min_free_bytes",
+                             stats->monitor_stack_min_free_bytes);
+    Camera_CLI_WriteStatLine(huart, "free_heap_bytes", stats->free_heap_bytes);
+    Camera_CLI_WriteStatLine(huart,
+                             "min_ever_free_heap_bytes",
+                             stats->min_ever_free_heap_bytes);
+
     if (uart_dma_stats != NULL)
     {
         Camera_CLI_WriteLine(huart, "UART RX DMA:");

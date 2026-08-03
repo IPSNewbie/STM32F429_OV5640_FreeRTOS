@@ -73,6 +73,11 @@ typedef struct
     volatile uint32_t last_dump_time_ms;         /**< 最近一次 DUMP 耗时 */
     volatile uint32_t last_status_time_ms;       /**< 最近一次 STATUS 时间 */
     volatile uint32_t uptime_ms;                 /**< MonitorTask 累计运行时间 */
+    volatile uint32_t health_sample_count;       /**< MonitorTask 健康资源采样次数 */
+    volatile uint32_t camera_service_stack_min_free_bytes; /**< CameraServiceTask 历史最小栈余量，单位 B */
+    volatile uint32_t monitor_stack_min_free_bytes; /**< MonitorTask 历史最小栈余量，单位 B */
+    volatile uint32_t free_heap_bytes;            /**< 当前 FreeRTOS Heap 余量，单位 B */
+    volatile uint32_t min_ever_free_heap_bytes;   /**< FreeRTOS 历史最小 Heap 余量，单位 B */
 } CameraRtosStats_t;
 
 //============================================================================
