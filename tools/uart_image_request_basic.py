@@ -52,10 +52,20 @@ def main():
         print(f"请求十六进制：{request.hex(' ')}")
         print(f"请求 CRC32：0x{request_crc:08X}")
 
-        with serial.Serial(port=PORT, baudrate=BAUD, timeout=0.2) as ser:
-            # 保持硬件流控关闭，并让控制线进入本开发板已验证的安全状态。
-            ser.setRTS(False)
-            ser.setDTR(False)
+        ser = serial.Serial()
+        try:
+            ser.port = PORT
+            ser.baudrate = BAUD
+            ser.timeout = 0.2
+            ser.write_timeout = 2.0
+            ser.rtscts = False
+            ser.dsrdtr = False
+            ser.dtr = False
+            ser.rts = False
+            ser.open()
+
+            print(f"DTR状态：{ser.dtr}")
+            print(f"RTS状态：{ser.rts}")
             time.sleep(0.2)
             ser.reset_input_buffer()
             ser.reset_output_buffer()
@@ -63,6 +73,9 @@ def main():
             ser.flush()
             print("\n开始接收 OV56RGB5 图像帧……")
             response = read_exact(ser, IMAGE_FRAME_SIZE, TIMEOUT_SECONDS)
+        finally:
+            if ser.is_open:
+                ser.close()
 
         print(f"响应长度：{len(response)} B")
         if len(response) != IMAGE_FRAME_SIZE:

@@ -114,10 +114,20 @@ def main():
     print(f"截断帧超时等待：{DISCARD_TIMEOUT_WAIT_SECONDS}秒")
 
     try:
-        with serial.Serial(port=PORT, baudrate=BAUD, timeout=0.2) as ser:
-            # 设置本开发板已验证的安全控制线状态，并清除旧输出数据。
-            ser.setRTS(False)
-            ser.setDTR(False)
+        ser = serial.Serial()
+        try:
+            ser.port = PORT
+            ser.baudrate = BAUD
+            ser.timeout = 0.2
+            ser.write_timeout = 2.0
+            ser.rtscts = False
+            ser.dsrdtr = False
+            ser.dtr = False
+            ser.rts = False
+            ser.open()
+
+            print(f"DTR状态：{ser.dtr}")
+            print(f"RTS状态：{ser.rts}")
             time.sleep(0.2)
             ser.reset_output_buffer()
 
@@ -180,6 +190,9 @@ def main():
                 print(f"  合法请求恢复：PASS，frame_id={frame_id}，耗时={elapsed_ms:.1f} ms")
             else:
                 print(f"  合法请求恢复：FAIL：{error_message}")
+        finally:
+            if ser.is_open:
+                ser.close()
 
     except serial.SerialException as error:
         print(f"串口错误：{error}")

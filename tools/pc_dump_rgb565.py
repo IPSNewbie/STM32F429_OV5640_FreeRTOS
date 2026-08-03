@@ -52,7 +52,9 @@ def open_camera_serial_port(port_name: str, baudrate: int, timeout_s: float) -> 
     port.port = port_name
     port.baudrate = baudrate
     port.timeout = timeout_s
-    port.write_timeout = 3.0
+    port.write_timeout = 2.0
+    port.rtscts = False
+    port.dsrdtr = False
 
     # Set safe control-line state before opening the port.
     # For this board, tested result:
@@ -61,19 +63,20 @@ def open_camera_serial_port(port_name: str, baudrate: int, timeout_s: float) -> 
     port.rts = False
     port.dtr = False
 
-    port.open()
+    try:
+        port.open()
+        print(f"Serial control: DTR={port.dtr} RTS={port.rts}")
 
-    # Confirm safe state again after opening, because some drivers may
-    # briefly initialize control lines during open().
-    port.setRTS(False)
-    port.setDTR(False)
+        # Give MCU and USB-UART control lines time to settle.
+        time.sleep(0.1)
 
-    # Give MCU and USB-UART control lines time to settle.
-    time.sleep(0.1)
-
-    # Clear old boot logs or stale bytes before sending DUMP.
-    port.reset_input_buffer()
-    port.reset_output_buffer()
+        # Clear old boot logs or stale bytes before sending DUMP.
+        port.reset_input_buffer()
+        port.reset_output_buffer()
+    except Exception:
+        if port.is_open:
+            port.close()
+        raise
 
     return port
 
@@ -341,9 +344,7 @@ def main() -> None:
         for attempt in range(1, 4):
             print(f"Sending DUMP command, attempt {attempt}/3...")
 
-            # Keep control lines in safe state before each DUMP attempt.
-            port.setRTS(False)
-            port.setDTR(False)
+            # 保留原有每次DUMP尝试前的短间隔，不再切换已配置的控制线。
             time.sleep(0.02)
 
             # Clear stale bytes before a new request.
@@ -385,7 +386,8 @@ def main() -> None:
             )
 
     finally:
-        port.close()
+        if port.is_open:
+            port.close()
 
     image = rgb565_to_bgr(payload, width, height)
     gray, metrics = analyze_image(image)

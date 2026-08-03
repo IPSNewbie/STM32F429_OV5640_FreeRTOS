@@ -15,6 +15,29 @@ IMAGE_HEADER_SIZE = 22
 IMAGE_PAYLOAD_SIZE = 38400
 IMAGE_CRC_SIZE = 4
 IMAGE_FRAME_SIZE = 38426
+FAILED_RESPONSE_PATH = "captures/uart_repeat_first_failed_response.bin"
+
+
+def save_failed_response(response):
+    """保存并显示第一次校验失败响应的有限诊断信息。"""
+    with open(FAILED_RESPONSE_PATH, "wb") as output_file:
+        saved_bytes = output_file.write(response)
+
+    magic_offset = response.find(b"OV56RGB5")
+    crlf_count = response.count(b"\r\n")
+    print(f"失败响应已保存：{FAILED_RESPONSE_PATH}")
+    print(f"保存字节数：{saved_bytes}")
+    print(f"是否以OV56RGB5开头：{'是' if response.startswith(b'OV56RGB5') else '否'}")
+    if magic_offset < 0:
+        print("OV56RGB5位置：未找到")
+    else:
+        print(f"OV56RGB5位置：{magic_offset}")
+    print(f"CRLF数量：{crlf_count}")
+    print("前256 B文本：")
+    print(repr(response[:256].decode("utf-8", errors="replace")))
+    print("前128 B十六进制：")
+    print(response[:128].hex(" "))
+
 
 def build_request(seq):
     """按协议动态构造一帧 14 B 图像请求。"""
@@ -75,6 +98,7 @@ def check_response(response):
 def main():
     success_count = 0
     failure_count = 0
+    failure_dump_saved = False
     elapsed_times = []
     received_frame_ids = []
     print(f"串口：{PORT}")
@@ -84,10 +108,20 @@ def main():
     print(f"预期响应长度：{IMAGE_FRAME_SIZE} B")
 
     try:
-        with serial.Serial(port=PORT, baudrate=BAUD, timeout=0.2) as ser:
-            # 保持硬件流控关闭，并让控制线进入本开发板已验证的安全状态。
-            ser.setRTS(False)
-            ser.setDTR(False)
+        ser = serial.Serial()
+        try:
+            ser.port = PORT
+            ser.baudrate = BAUD
+            ser.timeout = 0.2
+            ser.write_timeout = 2.0
+            ser.rtscts = False
+            ser.dsrdtr = False
+            ser.dtr = False
+            ser.rts = False
+            ser.open()
+
+            print(f"DTR状态：{ser.dtr}")
+            print(f"RTS状态：{ser.rts}")
             time.sleep(0.2)
             ser.reset_output_buffer()
 
@@ -114,8 +148,17 @@ def main():
                     print(f"[{index + 1:02d}/{REQUEST_COUNT:02d}] seq=0x{seq:04X} "
                           f"接收={len(response)} B 耗时={elapsed_ms:.1f} ms "
                           f"FAIL：{error_message}")
+                    if not failure_dump_saved:
+                        failure_dump_saved = True
+                        try:
+                            save_failed_response(response)
+                        except Exception as error:
+                            print(f"保存失败响应时发生错误：{error}")
                 # 单次失败也继续下一次请求，用于观察接收链路能否恢复。
                 time.sleep(REQUEST_INTERVAL_SECONDS)
+        finally:
+            if ser.is_open:
+                ser.close()
     except serial.SerialException as error:
         print(f"串口错误：{error}")
         print(f"无法打开或使用 {PORT}，请确认 MobaXterm 已经关闭。")
