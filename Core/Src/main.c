@@ -262,12 +262,18 @@ static void Camera_Application_Init(void)
 #else
   ret = OV5640_Min_InitRGB565_160x120_TestBar();
 #endif
-  LOG_INFO("OV5640 PC dump 160x120 init ret = %d", ret);
+  if (ret != 0U)
+  {
+    LOG_ERROR("OV5640 PC dump 160x120 init failed, ret = %u", ret);
+  }
 #if OV5640_AEC_TUNING_ENABLE
   if (ret == 0U)
   {
     uint8_t aec_target_ret = OV5640_Tuning_SetAecTarget(OV5640_AEC_TUNING_LEVEL);
-    LOG_INFO("OV5640 AEC target set ret = %u", aec_target_ret);
+    if (aec_target_ret != 0U)
+    {
+      LOG_ERROR("OV5640 AEC target set failed, ret = %u", aec_target_ret);
+    }
     HAL_Delay(1000U);
   }
 #endif
@@ -275,7 +281,10 @@ static void Camera_Application_Init(void)
   if (ret == 0U)
   {
     uint8_t awb_mode_ret = OV5640_Tuning_SetAWBMode(OV5640_AWB_TUNING_MODE);
-    LOG_INFO("OV5640 AWB mode set ret = %u", awb_mode_ret);
+    if (awb_mode_ret != 0U)
+    {
+      LOG_ERROR("OV5640 AWB mode set failed, ret = %u", awb_mode_ret);
+    }
   }
 #endif
 #if OV5640_IMAGE_TUNING_ENABLE
@@ -285,22 +294,35 @@ static void Camera_Application_Init(void)
     uint8_t contrast_ret = OV5640_Tuning_SetContrast(OV5640_CONTRAST_LEVEL);
     uint8_t saturation_ret = OV5640_Tuning_SetSaturation(OV5640_SATURATION_LEVEL);
     uint8_t sharpness_ret = OV5640_Tuning_SetSharpness(OV5640_SHARPNESS_LEVEL);
-    LOG_INFO("OV5640 image tuning ret B=%u C=%u S=%u H=%u",
-             brightness_ret,
-             contrast_ret,
-             saturation_ret,
-             sharpness_ret);
+    if ((brightness_ret != 0U) || (contrast_ret != 0U) ||
+        (saturation_ret != 0U) || (sharpness_ret != 0U))
+    {
+      LOG_ERROR("OV5640 image tuning failed B=%u C=%u S=%u H=%u",
+                brightness_ret,
+                contrast_ret,
+                saturation_ret,
+                sharpness_ret);
+    }
   }
 #endif
 #elif CAMERA_MODE == CAMERA_MODE_480X320_REAL
   ret = OV5640_Min_InitRGB565_480x320_RealImage();
-  LOG_INFO("OV5640 480x320 real image init ret = %d", ret);
+  if (ret != 0U)
+  {
+    LOG_ERROR("OV5640 480x320 real image init failed, ret = %u", ret);
+  }
 #elif CAMERA_MODE == CAMERA_MODE_480X320_TESTBAR
   ret = OV5640_Min_InitRGB565_480x320_TestBar();
-  LOG_INFO("OV5640 480x320 testbar init ret = %d", ret);
+  if (ret != 0U)
+  {
+    LOG_ERROR("OV5640 480x320 testbar init failed, ret = %u", ret);
+  }
 #elif CAMERA_MODE == CAMERA_MODE_320X240_REAL
   ret = OV5640_Min_InitRGB565_QVGA_RealImage();
-  LOG_INFO("OV5640 320x240 real image init ret = %d", ret);
+  if (ret != 0U)
+  {
+    LOG_ERROR("OV5640 320x240 real image init failed, ret = %u", ret);
+  }
 #else
 #error "Unsupported CAMERA_MODE"
 #endif
@@ -334,6 +356,11 @@ static void Camera_Application_Init(void)
   LOG_INFO("DMA2_Stream1 CR   = 0x%08lX", DMA2_Stream1->CR);
   LOG_INFO("DMA2_Stream1 NDTR = %lu", DMA2_Stream1->NDTR);
 #endif
+
+  if (ret == 0U)
+  {
+    LOG_INFO("Camera init OK");
+  }
 }
 
 /* USER CODE END 4 */

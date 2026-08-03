@@ -6,6 +6,11 @@
 #include "bsp_log.h"
 #include "ov5640cfg.h"
 
+/* OV5640初始化详细打印开关：仅控制成功日志，不改变任何硬件访问。 */
+#ifndef OV5640_VERBOSE_INIT_LOG
+#define OV5640_VERBOSE_INIT_LOG 0U
+#endif
+
 /*
  * 本文件只做“最小可视化调试配置”。
  * 当前目标：RGB565 + QVGA/480x320/320x240/160x120 + 彩条/RealImage
@@ -206,7 +211,9 @@ uint8_t OV5640_Min_InitRGB565_QVGA_TestBar(void)
     // 5.最后开启内部测试彩条
     if (OV5640_Min_EnableTestBar(1)) return 9;
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 full table RGB565 QVGA testbar init done");
+#endif
     (void)OV5640_Min_ReadBackTimingDebug("QVGA_TESTBAR");
 
     return 0;
@@ -286,7 +293,9 @@ uint8_t OV5640_Min_ReadBackTimingDebug(const char *tag)
     };
     uint8_t val = 0;
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 timing readback begin: %s", tag);
+#endif
 
     // 遍历整个寄存器列表，逐一回读并输出
     for (uint32_t i = 0; i < (sizeof(regs) / sizeof(regs[0])); i++)
@@ -297,10 +306,14 @@ uint8_t OV5640_Min_ReadBackTimingDebug(const char *tag)
             return 1;
         }
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
         LOG_INFO("OV5640 %s reg 0x%04X = 0x%02X", tag, regs[i], val);
+#endif
     }
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 timing readback end: %s", tag);
+#endif
 
     return 0;
 }
@@ -354,7 +367,9 @@ uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void)
     // 等待自动曝光稳定几帧
     HAL_Delay(200);
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 RGB565 320x240 real image init done");
+#endif
 
     return 0;
 }
@@ -378,7 +393,9 @@ uint8_t OV5640_Min_InitRGB565_160x120_TestBar(void)
         return 10U;
     }
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 RGB565 160x120 testbar init done");
+#endif
     return 0U;
 }
 
@@ -411,7 +428,9 @@ uint8_t OV5640_Min_InitRGB565_160x120_RealImage(void)
 
     // 等待曝光稳定
     HAL_Delay(200U);
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 RGB565 160x120 real image init done");
+#endif
     return 0U;
 }
 
@@ -453,7 +472,9 @@ uint8_t OV5640_Min_InitRGB565_480x320_TestBar(void)
     // 6. 开启内部测试彩条，便于检查数据通路和显示
     if (OV5640_Min_EnableTestBar(1)) return 9;
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 full table RGB565 480x320 testbar init done");
+#endif
     // 回读关键时序寄存器，确认配置写入
     (void)OV5640_Min_ReadBackTimingDebug("480X320_TESTBAR");
 
@@ -515,7 +536,9 @@ uint8_t OV5640_Min_InitRGB565_480x320_RealImage(void)
     // 等待自动曝光稳定（几帧时间）
     HAL_Delay(200);
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 RGB565 480x320 real image init done");
+#endif
 
     return 0;
 }

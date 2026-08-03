@@ -141,3 +141,36 @@ stream_buffer_resync_count=0
 ## 阶段结论
 
 Stage 10 Round 1代码、文档和板上回归已完成，固件构建通过。四个正式工具全部PASS，repeat连续请求20/20 PASS，UART DMA无错误或溢出。运行健康统计不会改变任务栈大小、优先级、Heap大小或通信协议。
+
+## Stage 10 Round 1.3A 安全版初始化日志精简
+
+- 上一版日志精简板测失败：basic收到0 B，pc_dump收不到`OV56RGB5`，repeat 20/20 FAIL；`STATUS`仍能正常响应，`last_error_code=512`，对应DCMI快照超时。
+- 回滚上一版六个C/头文件后，basic PASS、pc_dump PASS、repeat 20/20 PASS，确认功能基线恢复。
+- 本轮原则：只关闭成功打印，不关闭任何SCCB读写，不关闭时序回读函数调用，不改变delay、返回值、错误码或DCMI/DMA流程。
+- 默认关闭：OV5640 timing readback begin/end成功提示、QVGA_TESTBAR逐项寄存器值打印、full table RGB565成功提示，以及OV5640 IDH/IDL细节INFO输出。
+- 默认保留：全部寄存器读写与读取循环、读取/写入失败日志、`STATUS`输出、DUMP协议、二进制请求协议和DCMI/DMA流程。
+- 待板测项目：确认启动日志减少、`STATUS`完整、basic PASS、pc_dump PASS、repeat 20/20 PASS。
+
+## Stage 10 Round 1.3B AEC与成功日志精简
+
+- 本轮目的：关闭默认启动时的AEC/AGC寄存器Dump和重复成功日志，只保留少量关键初始化结果。
+- 默认关闭：OV5640 IDH/IDL细节日志、testbar/real image成功细节、PC dump初始化成功ret、AEC/AGC寄存器Dump，以及AEC、AWB和image tuning成功ret日志。
+- 默认保留：PCF8574初始化成功、OV5640 ID识别成功、`Camera init OK`、全部错误日志和完整`STATUS`输出。
+- 安全原则：只关闭打印，不删除SCCB读写、寄存器读取、delay、返回值判断，不改变初始化顺序。
+- 待板测项目：确认启动日志只剩少量关键行，basic PASS、pc_dump PASS、repeat 20/20 PASS，并确认`STATUS`完整。
+
+### 板测结果
+
+- basic测试：串口打开后`DTR=False`、`RTS=False`，收到38426 B响应，`frame_id=1`，Header与payload CRC校验一致，结果PASS。
+- pc_dump测试：使用`tag=log_trim_b`，收到`Frame ID=2`的160x120图像，payload为38400 B，`CRC32=0x120470BD`，图像和报告均正常生成，结果PASS。
+- repeat测试：连续请求20次，成功20次、失败0次，成功率100%；`frame_id=3`到`22`且保持连续，结果PASS。
+- 默认启动日志已经精简为以下三条关键结果：
+
+```text
+[INFO][0] PCF8574 initialized successfully
+[INFO][98] OV5640 OK, ID = 0x5640
+[INFO][1982] Camera init OK
+```
+
+- 默认不再输出：OV5640 IDH/IDL细节日志、OV5640 timing readback begin/end、QVGA_TESTBAR逐项寄存器回读、testbar init done、real image init done、PC dump init ret=0、AEC/AGC大段Dump，以及AEC/AWB/image tuning成功ret日志。
+- 结论：本轮只关闭打印，不改变SCCB读写、寄存器读取、delay、返回值判断、DUMP协议和UART DMA；板测确认功能正常。

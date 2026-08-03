@@ -2,6 +2,11 @@
 #include "bsp_log.h"
 #include "bsp_sccb.h"
 
+/* OV5640调参成功明细日志开关：默认关闭，不影响寄存器读取与错误处理。 */
+#ifndef OV5640_TUNING_VERBOSE_LOG
+#define OV5640_TUNING_VERBOSE_LOG 0U
+#endif
+
 typedef struct
 {
     uint16_t reg;
@@ -155,10 +160,15 @@ static uint16_t OV5640_Tuning_ComposeGainRaw(uint8_t high, uint8_t low)
 
 static void OV5640_Tuning_PrintReg(uint32_t index, const uint8_t *values)
 {
+#if (OV5640_TUNING_VERBOSE_LOG != 0U)
     LOG_RAW("%s 0x%04X = 0x%02X\r\n",
             s_aec_regs[index].name,
             (unsigned int)s_aec_regs[index].reg,
             (unsigned int)values[index]);
+#else
+    (void)index;
+    (void)values;
+#endif
 }
 
 uint8_t OV5640_Tuning_GetExposureRaw(uint32_t *exposure_raw)
@@ -221,22 +231,35 @@ uint8_t OV5640_Tuning_DumpAECRegs(void)
     gain_raw = OV5640_Tuning_ComposeGainRaw(values[AEC_REG_GAIN_H],
                                             values[AEC_REG_GAIN_L]);
 
+#if (OV5640_TUNING_VERBOSE_LOG == 0U)
+    (void)exposure_raw;
+    (void)gain_raw;
+#endif
+
+#if (OV5640_TUNING_VERBOSE_LOG != 0U)
     LOG_RAW("========== OV5640 AEC/AGC DUMP ==========\r\n");
+#endif
     OV5640_Tuning_PrintReg(AEC_REG_EXPOSURE_H, values);
     OV5640_Tuning_PrintReg(AEC_REG_EXPOSURE_M, values);
     OV5640_Tuning_PrintReg(AEC_REG_EXPOSURE_L, values);
+#if (OV5640_TUNING_VERBOSE_LOG != 0U)
     LOG_RAW("Exposure raw = 0x%05lX\r\n", (unsigned long)exposure_raw);
+#endif
     OV5640_Tuning_PrintReg(AEC_REG_AEC_AGC_CTRL, values);
     OV5640_Tuning_PrintReg(AEC_REG_GAIN_H, values);
     OV5640_Tuning_PrintReg(AEC_REG_GAIN_L, values);
+#if (OV5640_TUNING_VERBOSE_LOG != 0U)
     LOG_RAW("Gain raw     = 0x%03X\r\n", (unsigned int)gain_raw);
+#endif
 
     for (uint32_t i = AEC_REG_AEC_CTRL_00; i < AEC_REG_COUNT; ++i)
     {
         OV5640_Tuning_PrintReg(i, values);
     }
 
+#if (OV5640_TUNING_VERBOSE_LOG != 0U)
     LOG_RAW("=========================================\r\n");
+#endif
     return 0U;
 }
 

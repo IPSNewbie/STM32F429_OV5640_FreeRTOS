@@ -4,6 +4,12 @@
 #include "bsp_sccb.h"
 #include "bsp_softiic.h"
 #include "bsp_log.h"
+
+/* OV5640 ID字节细节日志开关：默认关闭，仅控制成功打印。 */
+#ifndef SCCB_VERBOSE_ID_LOG
+#define SCCB_VERBOSE_ID_LOG 0U
+#endif
+
 /**
  * @brief  SCCB写OV5640寄存器
  * @param  reg:  OV5640 16位寄存器地址
@@ -146,7 +152,9 @@ uint16_t OV5640_ReadID(void)
         return 0xFFFF;
     }
 
-    LOG_INFO("OV5640 IDH = 0x%02X, IDL = 0x%02X", id_high, id_low);
+#if (SCCB_VERBOSE_ID_LOG != 0U)
+    LOG_DEBUG("OV5640 IDH = 0x%02X, IDL = 0x%02X", id_high, id_low);
+#endif
 
     return ((uint16_t)id_high << 8) | id_low;
 }
