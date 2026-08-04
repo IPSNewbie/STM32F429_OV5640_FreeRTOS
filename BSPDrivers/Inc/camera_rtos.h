@@ -78,6 +78,9 @@ typedef struct
     volatile uint32_t monitor_stack_min_free_bytes; /**< MonitorTask 历史最小栈余量，单位 B */
     volatile uint32_t free_heap_bytes;            /**< 当前 FreeRTOS Heap 余量，单位 B */
     volatile uint32_t min_ever_free_heap_bytes;   /**< FreeRTOS 历史最小 Heap 余量，单位 B */
+    volatile uint32_t hook_fault_code;             /**< 最近一次FreeRTOS保护Hook故障类型 */
+    volatile uint32_t hook_fault_count;            /**< FreeRTOS保护Hook触发次数 */
+    volatile uint32_t assert_line;                 /**< 最近一次configASSERT失败行号 */
 } CameraRtosStats_t;
 
 //============================================================================
@@ -138,6 +141,14 @@ void Camera_RTOS_RecordUartError(void);
  * @param  time_ms 当前系统时间，单位为毫秒
  */
 void Camera_RTOS_RecordStatus(uint32_t time_ms);
+
+/**
+ * @brief  记录FreeRTOS严重错误Hook状态
+ * @param  fault_code 故障类型：1栈溢出，2内存分配失败，3断言失败
+ * @param  assert_line configASSERT失败行号，其他Hook传0
+ * @note   仅写入静态统计字段，不分配动态内存
+ */
+void Camera_RTOS_RecordHookFault(uint32_t fault_code, uint32_t assert_line);
 
 /**
  * @brief  摄像头服务任务（FreeRTOS 任务函数）

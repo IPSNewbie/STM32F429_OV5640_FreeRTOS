@@ -40,6 +40,8 @@
 #include "camera_rtos.h"
 #include "OV5640.h"
 #include "ov5640_tuning.h"
+#include "FreeRTOS.h"
+#include "task.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -76,6 +78,11 @@
 #define CAMERA_BINARY_THRESHOLD        128U
 #define CAMERA_CLI_ENABLE              1U
 
+/* FreeRTOS严重错误Hook类型。 */
+#define HOOK_FAULT_STACK_OVERFLOW      1U
+#define HOOK_FAULT_MALLOC_FAILED       2U
+#define HOOK_FAULT_ASSERT_FAILED       3U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -94,6 +101,8 @@ void SystemClock_Config(void);
 void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 static void Camera_Application_Init(void);
+static void Hook_WriteU32(uint32_t value);
+static void Hook_Stop(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -361,6 +370,65 @@ static void Camera_Application_Init(void)
   {
     LOG_INFO("Camera init OK");
   }
+}
+
+// 不使用格式化缓冲区输出无符号整数，避免严重错误路径额外占用大量栈
+static void Hook_WriteU32(uint32_t value)
+{
+  char buffer[11];
+  uint32_t position = sizeof(buffer);
+
+  buffer[--position] = '\0';
+  do
+  {
+    buffer[--position] = (char)('0' + (value % 10U));
+    value /= 10U;
+  } while ((value != 0U) && (position > 0U));
+
+  log_output(&buffer[position]);
+}
+
+// 致命错误输出完成后关闭中断并停机，不主动复位
+static void Hook_Stop(void)
+{
+  __disable_irq();
+  for (;;)
+  {
+    __NOP();
+  }
+}
+
+// FreeRTOS任务栈溢出Hook
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+  (void)xTask;
+  Camera_RTOS_RecordHookFault(HOOK_FAULT_STACK_OVERFLOW, 0U);
+  log_output("FATAL: FreeRTOS stack overflow, task=");
+  log_output((pcTaskName != NULL) ? pcTaskName : "unknown");
+  log_output("\r\n");
+  Hook_Stop();
+}
+
+// FreeRTOS动态内存分配失败Hook
+void vApplicationMallocFailedHook(void)
+{
+  Camera_RTOS_RecordHookFault(HOOK_FAULT_MALLOC_FAILED, 0U);
+  log_output("FATAL: FreeRTOS malloc failed\r\n");
+  Hook_Stop();
+}
+
+// configASSERT失败处理函数
+void vAssertCalled(const char *file, int line)
+{
+  uint32_t assert_line = (line > 0) ? (uint32_t)line : 0U;
+
+  Camera_RTOS_RecordHookFault(HOOK_FAULT_ASSERT_FAILED, assert_line);
+  log_output("FATAL: configASSERT failed, file=");
+  log_output((file != NULL) ? file : "unknown");
+  log_output(", line=");
+  Hook_WriteU32(assert_line);
+  log_output("\r\n");
+  Hook_Stop();
 }
 
 /* USER CODE END 4 */

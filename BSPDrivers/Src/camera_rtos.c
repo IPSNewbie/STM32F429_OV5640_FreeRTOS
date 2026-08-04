@@ -75,6 +75,9 @@ static void Camera_RTOS_ClearStats(void)
     s_camera_rtos_stats.monitor_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.free_heap_bytes = 0U;
     s_camera_rtos_stats.min_ever_free_heap_bytes = 0U;
+    s_camera_rtos_stats.hook_fault_code = 0U;
+    s_camera_rtos_stats.hook_fault_count = 0U;
+    s_camera_rtos_stats.assert_line = 0U;
 }
 
 // CMSIS-RTOS2 返回当前任务启动以来的历史最小栈余量，单位为字节
@@ -160,6 +163,14 @@ void Camera_RTOS_RecordStatus(uint32_t time_ms)
     s_camera_rtos_stats.last_status_time_ms = time_ms;
 }
 
+// 记录FreeRTOS严重错误Hook；该函数不分配内存，也不执行复杂业务
+void Camera_RTOS_RecordHookFault(uint32_t fault_code, uint32_t assert_line)
+{
+    s_camera_rtos_stats.hook_fault_code = fault_code;
+    s_camera_rtos_stats.hook_fault_count++;
+    s_camera_rtos_stats.assert_line = assert_line;
+}
+
 // 将 UART DMA 错误统计同步到 Stage 8 兼容字段
 static void Camera_RTOS_SyncUartErrorCount(void)
 {
@@ -220,25 +231,26 @@ static uint8_t Camera_RTOS_DiscardOverflowedInput(void)
 // 执行完整的“捕获 → 图像处理 → 发送”流程，返回错误码（0 表示成功）
 static uint32_t Camera_RTOS_CaptureProcessAndSend(void)
 {
-    uint8_t snapshot_ret;
-    uint8_t dump_ret;
-    uint32_t snapshot_start_tick;
-    CameraFrameBufferStatus_t commit_ret;
-    CameraImageProcessStatus_t process_ret;
-    CameraProcessMode_t process_mode;
-    uint8_t binary_threshold;
+    uint8_t snapshot_ret;                      // DCMI 快照启动返回值（0 成功）
+    uint8_t dump_ret;                          // PC Dump 发送返回值（0 成功）
+    uint32_t snapshot_start_tick;              // 快照启动时的时间戳（毫秒）
+    CameraFrameBufferStatus_t commit_ret;      // 帧缓冲区提交结果
+    CameraImageProcessStatus_t process_ret;    // 图像处理结果
+    CameraProcessMode_t process_mode;          // 当前 CLI 配置的处理模式
+    uint8_t binary_threshold;                  // 当前 CLI 配置的二值化阈值
 
-    // 清除快照完成标志
+    // 清除之前可能残留的快照完成标志，确保本次快照状态干净
     Camera_DCMI_ClearSnapshotDone();
 
     // 启动 DCMI 快照，将图像数据写入 PC Dump 缓冲区（即后台缓冲区）
+    // 该缓冲区地址和传输字数是固定的，由 PC Dump 模块提供
     snapshot_ret = Camera_DCMI_StartSnapshotToBuffer(
         Camera_PC_Dump_GetBufferAddress(),
         Camera_PC_Dump_GetWordCount());
     if (snapshot_ret != 0U)
     {
-        Camera_DCMI_Stop();
-        // 返回错误码：基础码 + 子错误码
+        Camera_DCMI_Stop();   // 启动失败则立即停止 DCMI，避免异常状态
+        // 返回组合错误码：基础错误码 + DCMI 返回的子错误码
         return CAMERA_RTOS_ERR_SNAPSHOT_START_BASE | (uint32_t)snapshot_ret;
     }
 
@@ -246,51 +258,59 @@ static uint32_t Camera_RTOS_CaptureProcessAndSend(void)
     snapshot_start_tick = HAL_GetTick();
     while (Camera_DCMI_IsSnapshotDone() == 0U)
     {
+        // 检查是否超过设定的超时时间（通常 3000ms）
         if ((HAL_GetTick() - snapshot_start_tick) > CAMERA_RTOS_SNAPSHOT_TIMEOUT_MS)
         {
-            Camera_DCMI_Stop();
+            Camera_DCMI_Stop();   // 超时强制停止 DCMI
             return CAMERA_RTOS_ERR_SNAPSHOT_TIMEOUT;
         }
-        (void)osDelay(1U);  // 让出 CPU，避免忙等
+        (void)osDelay(1U);  // 让出 CPU，避免忙等，同时保证响应及时
     }
 
-    Camera_DCMI_Stop();
+    Camera_DCMI_Stop();   // 快照完成，正常停止 DCMI（释放资源）
 
-    // 提交后台缓冲区，使新捕获的帧成为前台帧
+    // 提交后台缓冲区，使新捕获的帧成为前台帧（双缓冲切换）
     commit_ret = Camera_FrameBuffer_CommitBackBuffer();
     if (commit_ret != CAMERA_FB_OK)
     {
+        // 提交失败，返回包含帧缓冲区错误码的组合错误
         return CAMERA_RTOS_ERR_CAPTURE_COMMIT_BASE | (uint32_t)commit_ret;
     }
 
-    // 获取当前 CLI 配置的处理模式和二值化阈值
+    // 获取当前 CLI 配置的处理模式和二值化阈值（可能通过串口命令动态修改）
     process_mode = Camera_CLI_GetProcessMode();
     binary_threshold = Camera_CLI_GetBinaryThreshold();
 
-    // 对帧缓冲区应用图像处理（旁路/灰度/二值化）
+    // 对帧缓冲区应用图像处理（旁路/灰度/二值化），处理结果直接写回后台缓冲区，
+    // 然后自动提交成为新的前台帧（ApplyToFrameBuffer 内部会提交）
     process_ret = Camera_ImageProcess_ApplyToFrameBuffer(process_mode, binary_threshold);
     if (process_ret != CAMERA_PROCESS_OK)
     {
-        // 如果处理失败，尝试回退到旁路模式（确保图像可发送）
+        // 如果用户配置的处理模式执行失败（例如内存不足或参数异常），
+        // 则尝试回退到旁路模式（不处理图像），确保至少能发送原始图像数据
         process_ret = Camera_ImageProcess_ApplyToFrameBuffer(
             CAMERA_PROCESS_MODE_BYPASS,
             binary_threshold);
         if (process_ret != CAMERA_PROCESS_OK)
         {
+            // 旁路模式仍然失败，说明系统存在严重错误，返回图像处理错误码
             return CAMERA_RTOS_ERR_IMAGE_PROCESS_BASE | (uint32_t)process_ret;
         }
+        // 注意：若旁路模式成功，则不会返回错误，继续执行发送流程
     }
 
-    // 将当前前台帧通过 UART 发送给 PC
+    // 将当前前台帧（已经过处理或旁路）通过 UART 打包发送给 PC
+    // 帧序号 s_camera_rtos_frame_id 会随每次成功发送递增，便于 PC 端识别
     dump_ret = Camera_PC_Dump_SendFrame(s_camera_rtos_uart, s_camera_rtos_frame_id);
     if (dump_ret != 0U)
     {
+        // 发送失败（可能因为 UART 错误、帧头/CRC 错误等），返回对应的发送错误码
         return CAMERA_RTOS_ERR_DUMP_SEND_BASE | (uint32_t)dump_ret;
     }
 
-    // 成功发送后递增帧序号
+    // 成功发送后递增帧序号，为下一帧准备
     s_camera_rtos_frame_id++;
-    return CAMERA_RTOS_ERR_NONE;
+    return CAMERA_RTOS_ERR_NONE;   // 全部流程顺利完成，返回无错误标志
 }
 
 // 文本和二进制请求共用同一条 DUMP 执行路径
@@ -446,22 +466,26 @@ void Camera_RTOS_Init(UART_HandleTypeDef *huart)
 }
 
 // 摄像头服务任务（FreeRTOS 任务主循环）
+// 功能：管理 UART 命令接收、DMA 数据传输、命令解析及图像采集触发
 void Camera_RTOS_CameraServiceTask(void *argument)
 {
-    uint8_t rx_chunk[CAMERA_RTOS_UART_RX_CHUNK_SIZE];
-    size_t received;
-    size_t i;
-    uint32_t stack_sample_tick;
-    uint32_t current_tick;
-    CameraUartDispatchEvent_t dispatch_event;
-    CameraUartDispatchResult_t dispatch_result;
+    uint8_t rx_chunk[CAMERA_RTOS_UART_RX_CHUNK_SIZE];    // 用于从 DMA 环形缓冲区读取数据的临时块
+    size_t received;                                     // 本次实际读取的字节数
+    size_t i;                                            // 循环索引
+    uint32_t stack_sample_tick;                          // 上次采样栈使用量的时间戳
+    uint32_t current_tick;                               // 当前时间戳
+    CameraUartDispatchEvent_t dispatch_event;            // 解析器产生的事件（如收到完整命令）
+    CameraUartDispatchResult_t dispatch_result;          // 解析器处理单字节的返回结果
 
-    (void)argument;  // 未使用的参数
+    (void)argument;  // 未使用的参数，避免编译警告
 
+    // 初始化 UART 命令分发器（负责解析字节流、识别命令帧）
     CameraUartDispatcher_Init(&s_camera_uart_dispatcher);
+    // 重置 PC Dump 命令解析器的内部状态（清空缓存行）
     Camera_PC_Dump_ResetCommandParser();
 
-    // 仅在任务启动阶段初始化，正常运行时不重复启动 DMA
+    // 等待 UART 句柄被外部初始化（Camera_RTOS_Init 设置）
+    // 若句柄为空，则记录错误并延时重试
     while (s_camera_rtos_uart == NULL)
     {
         s_camera_rtos_stats.camera_service_loop_count++;
@@ -469,6 +493,8 @@ void Camera_RTOS_CameraServiceTask(void *argument)
         (void)osDelay(1000U);
     }
 
+    // 初始化 UART DMA 接收（配置 DMA 环形缓冲区，启动连续接收）
+    // 若初始化失败，则记录错误并反复重试
     while (UART_RxDma_Init(s_camera_rtos_uart) != HAL_OK)
     {
         s_camera_rtos_stats.camera_service_loop_count++;
@@ -476,40 +502,52 @@ void Camera_RTOS_CameraServiceTask(void *argument)
         (void)osDelay(1000U);
     }
 
+    // 首次采样并更新任务栈使用统计（用于监控堆栈溢出）
     Camera_RTOS_UpdateCameraServiceStackStats();
     stack_sample_tick = HAL_GetTick();
 
+    // 主循环：反复从 DMA 环形缓冲区读取数据，送入解析器处理
     for (;;)
     {
+        // 任务运行计数累加（供统计）
         s_camera_rtos_stats.camera_service_loop_count++;
 
+        // 检测并恢复 UART 输入错误（如帧错误、噪声等）
         if (Camera_RTOS_RecoverUartInputIfNeeded() != 0U)
         {
-            continue;
+            continue;  // 若恢复过程中发现问题，重新开始循环
         }
 
+        // 检测并丢弃因缓冲区溢出丢失的输入（避免解析器状态混乱）
         if (Camera_RTOS_DiscardOverflowedInput() != 0U)
         {
             continue;
         }
 
+        // 从 DMA 环形缓冲区读取一块数据（非阻塞，带超时）
         received = UART_RxDma_Read(rx_chunk,
                                    sizeof(rx_chunk),
                                    CAMERA_RTOS_UART_READ_TIMEOUT_MS);
         if (received == 0U)
         {
-            // 先排除等待期间出现的错误或溢出，再记录纯读取超时
+            // 读取超时或暂无数据：
+            // 先再次检查并恢复可能的错误/溢出（因为在等待期间可能发生）
             if ((Camera_RTOS_RecoverUartInputIfNeeded() != 0U) ||
                 (Camera_RTOS_DiscardOverflowedInput() != 0U))
             {
                 continue;
             }
+            // 检查命令解析器是否因超时而产生事件（例如半帧超时）
             dispatch_result = CameraUartDispatcher_CheckTimeout(
                 &s_camera_uart_dispatcher,
                 HAL_GetTick(),
                 &dispatch_event);
+            // 处理解析器产生的事件（若有效）
             Camera_RTOS_ProcessDispatchEvent(dispatch_result, &dispatch_event);
+            // 记录一次“无数据”事件（用于统计空闲次数）
             Camera_RTOS_RecordUartNone();
+
+            // 周期采样任务栈使用量（例如每秒一次）
             current_tick = HAL_GetTick();
             if ((current_tick - stack_sample_tick) >=
                 CAMERA_RTOS_STACK_SAMPLE_PERIOD_MS)
@@ -517,26 +555,30 @@ void Camera_RTOS_CameraServiceTask(void *argument)
                 Camera_RTOS_UpdateCameraServiceStackStats();
                 stack_sample_tick = current_tick;
             }
-            continue;
+            continue;  // 本次循环结束，等待下一轮读取
         }
 
+        // 处理读取到的每一个字节
         for (i = 0U; i < received; ++i)
         {
-            // 错误或溢出发生后放弃当前读取块的剩余字节
+            // 在每字节处理前，检查是否有新的错误/溢出发生，若有则放弃当前块
             if ((Camera_RTOS_RecoverUartInputIfNeeded() != 0U) ||
                 (Camera_RTOS_DiscardOverflowedInput() != 0U))
             {
-                break;
+                break;  // 退出循环，丢弃剩余字节
             }
 
+            // 将当前字节送入命令分发器解析
             dispatch_result = CameraUartDispatcher_FeedByte(
                 &s_camera_uart_dispatcher,
                 rx_chunk[i],
                 HAL_GetTick(),
                 &dispatch_event);
+            // 处理解析器返回的事件（如完整命令、错误等）
             Camera_RTOS_ProcessDispatchEvent(dispatch_result, &dispatch_event);
         }
 
+        // 周期采样任务栈使用量
         current_tick = HAL_GetTick();
         if ((current_tick - stack_sample_tick) >=
             CAMERA_RTOS_STACK_SAMPLE_PERIOD_MS)

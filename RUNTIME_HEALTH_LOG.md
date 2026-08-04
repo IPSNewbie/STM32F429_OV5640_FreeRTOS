@@ -174,3 +174,45 @@ Stage 10 Round 1代码、文档和板上回归已完成，固件构建通过。�
 
 - 默认不再输出：OV5640 IDH/IDL细节日志、OV5640 timing readback begin/end、QVGA_TESTBAR逐项寄存器回读、testbar init done、real image init done、PC dump init ret=0、AEC/AGC大段Dump，以及AEC/AWB/image tuning成功ret日志。
 - 结论：本轮只关闭打印，不改变SCCB读写、寄存器读取、delay、返回值判断、DUMP协议和UART DMA；板测确认功能正常。
+
+## Stage 10 Round 2 FreeRTOS运行保护Hook
+
+- 本轮目的：任务栈溢出时进入`vApplicationStackOverflowHook`，动态内存分配失败时进入`vApplicationMallocFailedHook`，`configASSERT`失败时进入`vAssertCalled`；`STATUS`新增Hook状态字段。
+- FreeRTOS配置：`configCHECK_FOR_STACK_OVERFLOW=2`、`configUSE_MALLOC_FAILED_HOOK=1`，`configASSERT`调用`vAssertCalled`。
+- Hook行为：记录`hook_fault_code`、`hook_fault_count`和`assert_line`，输出一次`FATAL`日志后关闭中断并停在死循环；不主动复位，不配置IWDG或WWDG。
+- 正常运行预期：`hook_fault_code=0`、`hook_fault_count=0`、`assert_line=0`，basic PASS、pc_dump PASS、repeat 20/20 PASS。
+- 后续计划：Stage 10 Round 3再增加IWDG与任务心跳；本轮不加入看门狗。
+
+### 正常路径板测结果
+
+- 启动日志未出现任何`FATAL`信息：未发生stack overflow、malloc failed或configASSERT。
+- basic测试：PASS。
+- pc_dump测试：PASS；图像成功获取，CRC校验通过，报告正常生成。
+- repeat测试：20/20 PASS。
+- Hook状态：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+- HEALTH实测：
+
+```text
+camera_service_stack_min_free_bytes=7792
+monitor_stack_min_free_bytes=1872
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+- UART RX DMA实测：
+
+```text
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+- 结论：Stage 10 Round 2正常路径验证通过。FreeRTOS Hook已接入，正常运行时未误触发；DUMP、二进制请求、PC Dump和UART DMA均保持正常。
