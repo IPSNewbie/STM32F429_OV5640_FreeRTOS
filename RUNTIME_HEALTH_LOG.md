@@ -523,3 +523,5 @@ Stage 10 Round 4A长时间稳定性测试通过。
 连续500次二进制图像请求全部成功，`frame_id`从1到500连续，未出现长度错误、Header错误、CRC错误、`frame_id`跳变、超时或串口通信错误。
 
 测试后`STATUS`显示FreeRTOS栈余量正常；Heap当前值和历史最小值一致，无明显内存泄漏；Hook未触发；IWDG正常喂狗，未出现跳过喂狗；UART DMA无错误、无溢出、无恢复、无重同步。DUMP、二进制协议、UART DMA、FreeRTOS心跳与IWDG在约30分钟连续请求场景下保持稳定。
+
+Stage 10已完成，最终报告见`STAGE10_STABILITY_FINAL_REPORT.md`。
