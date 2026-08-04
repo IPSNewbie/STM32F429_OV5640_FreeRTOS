@@ -1051,3 +1051,224 @@ Stage 11B-3 验证通过。新增 `camera_snapshot_control` 模块和 `SNAPSHOT 
 - 保持 SDIO 接管必须晚于相机暂停、DMA 停止和有效 front 确认。
 
 源码表明当前 `CAMERA_MODE_PC_DUMP_RGB565` 是按请求启动单帧采集，采集完成后已经停止 DCMI/DMA；因此下一步建议进入 Stage 11B-5，先实现相机停止/恢复的软件状态保护、DUMP 禁止重入和捕获/发送边界拆分，仍不切换 PC8、PC9、PC11，也不初始化 SDIO。
+
+## Stage 11B-5 SNAPSHOT软件状态保护
+
+### 1. 本轮目的
+
+Stage 11B-5 在现有 `camera_snapshot_control` 状态机上增加纯软件保护：
+
+- `SNAPSHOT PREPARE` 后激活软件保护。
+- 软件保护期间阻止文本 DUMP 和合法二进制图像请求进入采集及 OV56RGB5 发送流程。
+- `SNAPSHOT RESTORE` 后退出软件保护，使文本和二进制图像请求恢复正常。
+- 为后续真实停止 DCMI、冻结 front buffer 和保存到 SD 卡准备统一门控状态。
+
+### 2. 本轮明确不做
+
+- 不停止 DCMI。
+- 不停止、反初始化或重启 DMA。
+- 不释放或切换 PC8、PC9、PC11。
+- 不初始化 SDIO。
+- 不接入或挂载 FATFS。
+- 不读写 SD 卡或图片文件。
+
+本轮不会修改 DCMI、DMA、GPIO、SDIO、FATFS、UART DMA 或图像协议实现。
+
+### 3. 软件保护状态字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `software_guard_active` | SNAPSHOT 软件保护激活标志；PREPARE 置 1，RESTORE 清 0。 |
+| `dump_block_required` | 当前是否需要阻止图像导出；与 guard 状态同步。 |
+| `dump_block_count` | 软件保护状态下被阻止的文本 DUMP 次数。 |
+| `binary_block_count` | 软件保护状态下被阻止的合法二进制图像请求次数。 |
+
+这些字段追加到 `SNAPSHOT STATUS`，原有状态字段和字段名保持不变。
+
+### 4. 当前保护行为
+
+`SNAPSHOT PREPARE` 仍返回 `CAMERA_SNAPSHOT_ERR_CAMERA_STOP_NOT_IMPLEMENTED` 并保持 `PREPARE_DEFERRED`，但会将 `software_guard_active` 和 `dump_block_required` 置为 1。该状态只表示禁止新的图像导出请求，不表示相机已经进入 `CAMERA_PAUSED`。
+
+`SNAPSHOT RESTORE` 仍返回 `CAMERA_SNAPSHOT_ERR_CAMERA_RESTORE_NOT_IMPLEMENTED` 并保持 `RESTORE_DEFERRED`，同时将 `software_guard_active` 和 `dump_block_required` 清零，使后续 DUMP 恢复正常。
+
+文本 DUMP 和二进制图像请求最终共用 `camera_rtos.c` 内的 `Camera_RTOS_ProcessDumpRequest()`。软件保护判断位于该统一入口的最前面，因此被阻止的请求不会启动 DCMI 快照，也不会发送 OV56RGB5 图像帧：
+
+- 文本 DUMP 输出 `DUMP blocked: snapshot software guard active.`，并增加 `dump_block_count`。
+- 合法二进制请求不输出文本或图像帧，并增加 `binary_block_count`；PC 端等待超时属于预期现象。
+- 两类阻止都会增加 DUMP 错误统计，并将 RTOS 最近错误码设为 SNAPSHOT guard active。
+- 合法二进制请求被阻止不属于协议格式错误，不增加 CRC、版本、类型、长度或帧尾错误计数。
+- 阻止路径不增加 UART 错误计数。
+
+### 5. 板测验证方法
+
+1. 启动后执行 `SNAPSHOT STATUS`，确认 `software_guard_active=0`、两个 block 计数为 0。
+2. 执行 `basic`，确认正常通过。
+3. 执行 `SNAPSHOT PREPARE`，确认 deferred 提示保持不变。
+4. 再次执行 `SNAPSHOT STATUS`，确认 `software_guard_active=1`、`dump_block_required=1`。
+5. 发送文本 `DUMP`，确认只收到 blocked 提示且 `dump_block_count` 增加。
+6. 发送合法二进制图像请求，确认没有 OV56RGB5 帧、PC 端超时且 `binary_block_count` 增加。
+7. 检查协议错误分类计数和 UART DMA 错误计数未因 guard 阻止而增加。
+8. 执行 `SNAPSHOT RESTORE`，确认 `software_guard_active=0`、`dump_block_required=0`。
+9. 重新执行 `basic`、`pc_dump` 和 `repeat 20/20`，确认全部恢复 PASS。
+10. 检查 IWDG 未跳过喂狗、Hook 未触发、UART DMA 无错误或溢出。
+
+### 6. 后续 Stage 11B-6 建议
+
+Stage 11B-6 可在现有软件保护基础上尝试真实 DCMI 停止，但暂时仍不切换 SDIO 引脚：
+
+1. PREPARE 激活 guard 后捕获并固定一帧。
+2. 尝试调用经过确认和封装的 DCMI 停止接口。
+3. 确认 DMA 已停止且 front buffer 为完整 160×120 RGB565 帧。
+4. 验证停止采集后 front buffer 仍可稳定读取或保存。
+5. RESTORE 后验证下一次单帧 DUMP 能重新配置 DMA 并正常采集。
+6. 继续执行 basic、pc_dump、repeat、IWDG、Hook 和 UART DMA 回归。
+
+### 7. Stage 11B-5 板测结果
+
+#### 7.1 启动与初始状态
+
+系统启动正常，启动信息为 `reset: iwdg=0`；测试期间无 FATAL、无反复复位、无 IWDG 复位循环。
+
+初始 `SNAPSHOT STATUS`：
+
+```text
+camera_control_state=0
+camera_control_state_text=IDLE
+software_guard_active=0
+dump_block_required=0
+dump_block_count=0
+binary_block_count=0
+```
+
+激活 guard 前执行 `basic`，结果 PASS，`frame_id=1`，CRC 校验一致。
+
+#### 7.2 SNAPSHOT PREPARE 与软件保护验证
+
+执行 `SNAPSHOT PREPARE` 后：
+
+```text
+camera_control_state=1
+camera_control_state_text=PREPARE_DEFERRED
+prepare_attempt_count=1
+software_guard_active=1
+dump_block_required=1
+dump_block_count=0
+binary_block_count=0
+last_error_code=2
+last_error_text=CAMERA_STOP_NOT_IMPLEMENTED
+```
+
+guard 状态下执行文本 `DUMP`：
+
+- 输出 `DUMP blocked: snapshot software guard active.`。
+- 未发送 OV56RGB5 图像帧。
+- `dump_block_count` 从 0 增加到 1。
+
+guard 状态下执行二进制 `basic`：
+
+- 响应长度为 0 B，PC 端接收超时，只收到 0/38426 B，测试结果为 FAIL。
+- 该 FAIL 是本轮软件保护生效后的预期现象。
+- `binary_block_count` 从 0 增加到 1。
+- 未增加协议解析错误。
+
+#### 7.3 SNAPSHOT RESTORE 与图像功能回归
+
+执行 `SNAPSHOT RESTORE` 后：
+
+```text
+camera_control_state=3
+camera_control_state_text=RESTORE_DEFERRED
+restore_attempt_count=1
+software_guard_active=0
+dump_block_required=0
+dump_block_count=1
+binary_block_count=1
+last_error_code=3
+last_error_text=CAMERA_RESTORE_NOT_IMPLEMENTED
+```
+
+软件保护解除后的图像功能回归结果：
+
+- `basic`：PASS，`frame_id=2`。
+- `pc_dump`：PASS，`frame_id=3`，图像质量无警告。
+- `repeat`：20/20 PASS，`frame_id` 从 4 到 23 连续。
+- `repeat` 平均耗时 3465.61 ms，最短耗时 3447.75 ms，最长耗时 3467.87 ms。
+
+#### 7.4 最终 STATUS 关键字段
+
+`RTOS`：
+
+```text
+dump_request_count=25
+dump_success_count=23
+dump_error_count=2
+binary_request_count=23
+binary_request_success_count=22
+binary_request_error_count=0
+binary_request_crc_error_count=0
+binary_request_version_error_count=0
+binary_request_type_error_count=0
+binary_request_length_error_count=0
+binary_request_eof_error_count=0
+binary_request_timeout_count=0
+last_binary_request_seq=20
+last_binary_error_code=0
+last_error_code=8
+last_dump_time_ms=3518
+```
+
+`dump_error_count=2` 是预期结果，对应 guard 状态下文本 DUMP 和二进制图像请求各被阻止一次。`binary_request_error_count=0` 是正确结果：二进制请求帧格式正确，只是被 snapshot guard 拦截，不属于协议错误。`last_error_code=8` 对应 snapshot guard active 类错误，属于本轮预期行为。
+
+`HEALTH`：
+
+```text
+camera_service_stack_min_free_bytes=7672
+monitor_stack_min_free_bytes=1864
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+`HOOK`：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+`HEARTBEAT`：
+
+```text
+camera_service_heartbeat_age_ms=32
+monitor_heartbeat_age_ms=663
+```
+
+`IWDG`：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=483
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_test_mode=0
+```
+
+`UART RX DMA`：
+
+```text
+uart_dma_event_count=44
+uart_dma_rx_bytes=513
+stream_buffer_write_bytes=513
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+### 8. Stage 11B-5 板测结论
+
+Stage 11B-5 验证通过。`SNAPSHOT PREPARE` 后软件保护状态生效，文本 DUMP 被阻止且未发送 OV56RGB5 图像帧，二进制图像请求被阻止并表现为 PC 端接收超时；`SNAPSHOT RESTORE` 后软件保护解除，basic、pc_dump、repeat 全部恢复正常。
+
+最终 STATUS 显示 IWDG 未跳过喂狗、Hook 未触发，UART RX DMA 无错误、无溢出、无恢复、无重同步，说明本轮软件状态保护没有破坏现有摄像头采集、DUMP、二进制请求和运行保护机制。
+
+后续 Stage 11B-6 建议在软件保护基础上尝试真实 `HAL_DCMI_Stop`，暂时仍不切换 PC8、PC9、PC11，也不初始化 SDIO；先验证停止采集后系统不会死锁，并确认 RESTORE 后图像导出能够恢复。

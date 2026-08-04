@@ -786,6 +786,22 @@ static void Camera_CLI_PrintSnapshotStatus(UART_HandleTypeDef *huart)
         huart,
         "frame_buffer_ready",
         status.frame_buffer_ready);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "software_guard_active",
+        status.software_guard_active);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dump_block_required",
+        status.dump_block_required);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dump_block_count",
+        status.dump_block_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "binary_block_count",
+        status.binary_block_count);
 }
 
 /* 处理 SNAPSHOT 控制边界命令；PREPARE 和 RESTORE 当前只记录 deferred 状态。 */

@@ -5,6 +5,7 @@
 #include "camera_frame_buffer.h"
 #include "camera_image_process.h"
 #include "camera_pc_dump.h"
+#include "camera_snapshot_control.h"
 #include "camera_uart_dispatcher.h"
 #include "bsp_log.h"
 #include "cmsis_os.h"
@@ -31,6 +32,10 @@
 
 // CameraServiceTask 栈余量的周期采样间隔（毫秒）
 #define CAMERA_RTOS_STACK_SAMPLE_PERIOD_MS         1000U
+
+/* 统一图像请求入口的来源，用于分别统计文本 DUMP 和二进制请求阻止次数。 */
+#define CAMERA_RTOS_DUMP_SOURCE_TEXT                   0U
+#define CAMERA_RTOS_DUMP_SOURCE_BINARY                 1U
 
 // IWDG参数：LSI约32 kHz时，(999 + 1) * 256 / 32000约为8秒
 #define CAMERA_RTOS_IWDG_PRESCALER                  IWDG_PRESCALER_256
@@ -481,14 +486,41 @@ static uint32_t Camera_RTOS_CaptureProcessAndSend(void)
     return CAMERA_RTOS_ERR_NONE;   // 全部流程顺利完成，返回无错误标志
 }
 
-// 文本和二进制请求共用同一条 DUMP 执行路径
-static uint8_t Camera_RTOS_ProcessDumpRequest(void)
+// 文本和二进制请求共用同一条 DUMP 执行路径，并在入口执行SNAPSHOT软件保护
+static uint8_t Camera_RTOS_ProcessDumpRequest(uint8_t request_source)
 {
+    static const uint8_t blocked_text[] =
+        "DUMP blocked: snapshot software guard active.\r\n";
     uint32_t error_code;
     uint32_t dump_start_tick;
     uint32_t dump_elapsed_ms;
 
     Camera_RTOS_RecordDumpRequest();
+
+    if (Camera_SnapshotControl_IsDumpAllowed() == 0U)
+    {
+        if (request_source == CAMERA_RTOS_DUMP_SOURCE_BINARY)
+        {
+            Camera_SnapshotControl_RecordBinaryBlocked();
+        }
+        else
+        {
+            Camera_SnapshotControl_RecordDumpBlocked();
+            if (s_camera_rtos_uart != NULL)
+            {
+                (void)HAL_UART_Transmit(
+                    s_camera_rtos_uart,
+                    (uint8_t *)blocked_text,
+                    (uint16_t)(sizeof(blocked_text) - 1U),
+                    HAL_MAX_DELAY);
+            }
+        }
+
+        s_camera_rtos_stats.last_dump_time_ms = 0U;
+        Camera_RTOS_RecordDumpError(CAMERA_RTOS_ERR_SNAPSHOT_GUARD_ACTIVE);
+        return 0U;
+    }
+
     dump_start_tick = HAL_GetTick();
     error_code = Camera_RTOS_CaptureProcessAndSend();
     dump_elapsed_ms = HAL_GetTick() - dump_start_tick;
@@ -573,7 +605,7 @@ static void Camera_RTOS_ProcessTextByte(uint8_t byte)
 
     if (command == CAMERA_PC_DUMP_CMD_DUMP)
     {
-        (void)Camera_RTOS_ProcessDumpRequest();
+        (void)Camera_RTOS_ProcessDumpRequest(CAMERA_RTOS_DUMP_SOURCE_TEXT);
         return;
     }
 
@@ -593,7 +625,8 @@ static void Camera_RTOS_ProcessDispatchEvent(
 
         case CAMERA_UART_DISPATCH_IMAGE_REQUEST:
             Camera_RTOS_RecordBinaryRequest(&event->image_request);
-            if (Camera_RTOS_ProcessDumpRequest() != 0U)
+            if (Camera_RTOS_ProcessDumpRequest(
+                    CAMERA_RTOS_DUMP_SOURCE_BINARY) != 0U)
             {
                 s_camera_rtos_stats.binary_request_success_count++;
             }

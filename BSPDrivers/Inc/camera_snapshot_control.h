@@ -36,6 +36,10 @@ typedef struct
     uint32_t camera_restore_required;       /* 保存结束后是否必须恢复相机，固定为 1。 */
     uint32_t frame_buffer_required;         /* 保存前是否必须具有稳定帧缓冲区，固定为 1。 */
     uint32_t frame_buffer_ready;            /* 帧缓冲区是否已确认可保存，本阶段固定为 0。 */
+    uint32_t software_guard_active;         /* SNAPSHOT 软件保护是否已激活。 */
+    uint32_t dump_block_required;           /* 当前是否需要阻止图像请求导出。 */
+    uint32_t dump_block_count;              /* 软件保护阻止文本 DUMP 的次数。 */
+    uint32_t binary_block_count;            /* 软件保护阻止二进制图像请求的次数。 */
 } CameraSnapshotControlStatus_t;
 
 /* 初始化纯软件状态，不访问 DCMI、DMA、GPIO、SDIO 或 FATFS。 */
@@ -49,6 +53,18 @@ uint32_t Camera_SnapshotControl_RequestPrepare(void);
 
 /* 记录拍照保存后的恢复请求，本阶段不恢复任何硬件。 */
 uint32_t Camera_SnapshotControl_RequestRestore(void);
+
+/* 软件保护未激活时允许 DUMP，激活时禁止 DUMP。 */
+uint32_t Camera_SnapshotControl_IsDumpAllowed(void);
+
+/* 返回当前 SNAPSHOT 软件保护状态。 */
+uint32_t Camera_SnapshotControl_IsSoftwareGuardActive(void);
+
+/* 记录一次被软件保护阻止的文本 DUMP。 */
+void Camera_SnapshotControl_RecordDumpBlocked(void);
+
+/* 记录一次被软件保护阻止的二进制图像请求。 */
+void Camera_SnapshotControl_RecordBinaryBlocked(void);
 
 /* 将相机控制边界返回码转换为 CLI 可读文本。 */
 const char *Camera_SnapshotControl_ErrorToString(uint32_t error_code);
