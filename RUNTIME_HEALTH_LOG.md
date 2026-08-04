@@ -376,3 +376,150 @@ iwdg_test_mode=0
 - 复位后功能回归：basic PASS；pc_dump PASS，图像质量存在过曝和模糊提示，但CRC和功能验证通过；repeat 20/20 PASS且`frame_id`连续。
 - 异常检查：未出现无限复位，也未出现`FATAL`。
 - 结论：Stage 10 Round 3C故障路径验证通过。`IWDGTEST CAMERA_TIMEOUT`可以可控触发停止喂狗，系统最终由IWDG硬件复位；复位后RAM测试标志清零，`iwdg_test_mode`恢复为0，系统未进入无限复位，并且DUMP、PC Dump和二进制请求均恢复正常。
+
+## Stage 10 Round 4A 长时间稳定性测试工具
+
+- 本轮目的：新增PC端长时间二进制图像请求测试脚本，用于验证DUMP、二进制协议、UART DMA、FreeRTOS和IWDG在长时间运行下的稳定性。
+- 新增脚本：`tools/uart_image_request_stability.py`。
+- 默认测试规模：`count=500`、`interval=0.2 s`、单帧响应超时10 s，预计总耗时约30 min。
+- 每帧检查响应长度、OV56RGB5 Header、payload CRC、`frame_id`连续性和单帧耗时，并统计LENGTH_ERROR、MAGIC_ERROR、HEADER_ERROR、CRC_ERROR、FRAME_ID_GAP、TIMEOUT_OR_EMPTY和SERIAL_ERROR。
+- 输出文件：`stability_<tag>_<timestamp>.csv`、`stability_<tag>_<timestamp>_summary.txt`，以及发生失败时保存的`stability_first_failed_response_<tag>_<timestamp>.bin`。
+- 板测计划：测试前记录`STATUS`，运行500次stability测试，测试后再次记录`STATUS`并执行basic、pc_dump、repeat回归；确认IWDG没有跳过刷新、Hook保持为0、UART DMA无错误无溢出。
+
+## Stage 10 Round 4A 长时间稳定性测试结果
+
+### 1. 测试说明
+
+使用新增脚本：`tools/uart_image_request_stability.py`
+
+执行命令：
+
+```bash
+python tools/uart_image_request_stability.py --count 500 --interval 0.2 --tag stage10_round4
+```
+
+测试连续发送500次二进制图像请求，每次接收38426 B的OV56RGB5图像帧，并检查响应长度、Header、payload CRC和`frame_id`连续性，同时统计每帧耗时与错误类型。测试过程不做自动重试。
+
+### 2. smoke 测试说明
+
+正式长测前曾执行20次smoke测试：
+
+```bash
+python tools/uart_image_request_stability.py --count 20 --interval 0.2 --tag stage10_round4_smoke
+```
+
+该次测试因以下PC端串口错误而失败：
+
+```text
+could not open port 'COM4': PermissionError(13, '拒绝访问。')
+```
+
+确认失败原因是COM4被其他串口工具占用，测试脚本未成功打开串口，也没有向STM32发送请求。因此该结果不计入STM32固件、协议、UART DMA或IWDG稳定性失败。
+
+### 3. 500 次长测结果
+
+- 请求总数：500
+- 成功次数：500
+- 失败次数：0
+- 成功率：100.00%
+- 平均耗时：3466.104 ms
+- 最短耗时：3430.170 ms
+- 最长耗时：3486.542 ms
+- 首个`frame_id`：1
+- 最后`frame_id`：500
+- `frame_id`连续：YES
+- 最终结果：PASS
+
+### 4. 失败分类
+
+```text
+LENGTH_ERROR=0
+MAGIC_ERROR=0
+HEADER_ERROR=0
+CRC_ERROR=0
+FRAME_ID_GAP=0
+TIMEOUT_OR_EMPTY=0
+SERIAL_ERROR=0
+```
+
+### 5. 输出文件
+
+- CSV路径：`captures\stability_stage10_round4_20260804_172829.csv`
+- summary路径：`captures\stability_stage10_round4_20260804_172829_summary.txt`
+- 本次500次长测没有发生图像请求失败，因此没有生成有效的失败响应文件。
+
+### 6. 测试后 STATUS 关键结果
+
+RTOS：
+
+```text
+dump_request_count=500
+dump_success_count=500
+dump_error_count=0
+binary_request_count=500
+binary_request_success_count=500
+binary_request_error_count=0
+last_binary_request_seq=500
+last_error_code=0
+last_dump_time_ms=3516
+```
+
+HEALTH：
+
+```text
+health_sample_count=3591
+camera_service_stack_min_free_bytes=7816
+monitor_stack_min_free_bytes=1864
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+HOOK：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+HEARTBEAT：
+
+```text
+camera_service_heartbeat_count=32511
+monitor_heartbeat_count=3591
+camera_service_heartbeat_age_ms=57
+monitor_heartbeat_age_ms=656
+```
+
+IWDG：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=3591
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_timeout_ms=8000
+iwdg_camera_age_limit_ms=6000
+iwdg_monitor_age_limit_ms=3000
+iwdg_test_mode=0
+```
+
+UART RX DMA：
+
+```text
+uart_dma_event_count=610
+uart_dma_rx_bytes=7008
+stream_buffer_write_bytes=7008
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+### 7. 结论
+
+Stage 10 Round 4A长时间稳定性测试通过。
+
+连续500次二进制图像请求全部成功，`frame_id`从1到500连续，未出现长度错误、Header错误、CRC错误、`frame_id`跳变、超时或串口通信错误。
+
+测试后`STATUS`显示FreeRTOS栈余量正常；Heap当前值和历史最小值一致，无明显内存泄漏；Hook未触发；IWDG正常喂狗，未出现跳过喂狗；UART DMA无错误、无溢出、无恢复、无重同步。DUMP、二进制协议、UART DMA、FreeRTOS心跳与IWDG在约30分钟连续请求场景下保持稳定。
