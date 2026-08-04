@@ -224,3 +224,149 @@ BMP 支持应作为后续优化单独验证，因为需要增加文件头，并�
 7. 明确风险列表和保护原则。
 8. 本轮只新增本预研文档，不修改任何代码。
 
+## Stage 11B-1 SD卡模块框架和CLI入口
+
+本阶段已经新增 `camera_sd_storage` 模块，并提供纯软件状态结构、状态查询接口和受控的初始化请求入口。模块不使用动态内存，不访问文件系统，也不访问 SDIO 寄存器。
+
+CLI 新增以下文本命令：
+
+- `SD STATUS`：输出 SD 卡模块的软件状态、初始化请求计数、最近返回码及处理时间。
+- `SD INIT`：记录一次初始化请求，提示必须先执行 SDIO 接管，并输出当前状态。
+
+本阶段的 `SD INIT` 不会真正初始化 SDIO，固定返回 `CAMERA_SD_ERR_NEED_TAKEOVER`。该返回结果用于明确 PC8、PC9、PC11 与 DCMI 的复用冲突必须先通过受控接管流程解决。本阶段不切换 PC8、PC9、PC11，不调用 `HAL_SD_Init`，不挂载 FATFS，也不读写 SD 卡。
+
+后续 Stage 11B-2 再单独实现并验证以下流程：
+
+1. 停止 DCMI。
+2. 停止相关 DMA，并确认传输已经结束。
+3. 释放 PC8、PC9、PC11，进入 SDIO 接管模式。
+4. 以不超过 400 kHz 的初始化时钟初始化 SDIO 和 SD 卡。
+5. 初始化成功后提高 SDIO 时钟并读取 SD 卡信息。
+
+Stage 11B-2 开始前仍需评审 DCMI/DMA 停止、GPIO 复用切换、失败回滚和 DCMI 恢复边界，不能把真实 SDIO 初始化直接加入当前稳定采集路径。
+
+### Stage 11B-1 板测结果
+
+#### 1. 启动情况
+
+- 启动正常。
+- 启动日志显示 `reset: iwdg=0`。
+- 未出现 `FATAL`。
+- 未出现反复复位。
+- 未出现 IWDG 复位循环。
+
+#### 2. HELP 测试
+
+`HELP` 输出中可以看到新增的 `SD STATUS` 和 `SD INIT` 命令，帮助文本如下：
+
+```text
+SD STATUS - show SD storage status
+SD INIT - request SD card init, currently deferred until SDIO takeover
+```
+
+#### 3. 首次 SD STATUS
+
+首次执行 `SD STATUS` 时，模块处于未初始化状态，尚未收到初始化请求，输出如下：
+
+```text
+is_initialized=0
+takeover_required=1
+sdio_ready=0
+fatfs_ready=0
+init_attempt_count=0
+init_success_count=0
+init_error_count=0
+last_error_code=0
+last_error_text=OK
+```
+
+结果符合 Stage 11B-1 设计：SDIO 和 FATFS 均未启用，同时由于 PC8、PC9、PC11 与 DCMI 冲突，`takeover_required` 保持为 1。
+
+#### 4. SD INIT 返回
+
+执行 `SD INIT` 后，CLI 正确提示需要先完成 SDIO 接管：
+
+```text
+SD INIT: deferred, need SDIO takeover because PC8/PC9/PC11 conflict with DCMI.
+```
+
+该结果表明命令只进入受控软件入口，没有执行真实 SDIO 初始化。
+
+#### 5. SD INIT 后的 SD STATUS
+
+执行一次 `SD INIT` 后，状态输出如下：
+
+```text
+is_initialized=0
+takeover_required=1
+sdio_ready=0
+fatfs_ready=0
+init_attempt_count=1
+init_success_count=0
+init_error_count=0
+last_error_code=3
+last_error_text=NEED_TAKEOVER
+```
+
+`init_attempt_count` 从 0 墕加到 1，最近返回码更新为 `CAMERA_SD_ERR_NEED_TAKEOVER`；初始化成功次数和硬件错误次数仍为 0，符合“记录请求但不操作硬件”的预期。
+
+#### 6. 原有功能回归
+
+| 测试项 | 结果 | 说明 |
+| --- | --- | --- |
+| basic | PASS | 基础功能正常。 |
+| pc_dump | PASS | 图像导出正常，图像质量无警告。 |
+| repeat | 20/20 PASS | 20 次请求全部通过，`frame_id` 连续。 |
+
+回归结果说明新增模块框架和 CLI 入口未破坏现有 UART DUMP 与二进制图像请求路径。
+
+#### 7. 最终 STATUS 关键状态
+
+本次板测已单独执行最终 `STATUS`。以下按稳定性验证重点整理 `HOOK`、`IWDG` 和 `UART RX DMA` 三组结果。
+
+`HOOK`：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+未记录 Hook 故障或断言失败。
+
+`IWDG`：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=488
+iwdg_refresh_skip_count=0
+iwdg_last_refresh_ms=550609
+iwdg_last_skip_ms=0
+iwdg_last_skip_reason=0
+iwdg_timeout_ms=8000
+iwdg_camera_age_limit_ms=6000
+iwdg_monitor_age_limit_ms=3000
+iwdg_test_mode=0
+```
+
+IWDG 已启用并正常刷新，没有跳过喂狗，未进入看门狗测试模式。
+
+`UART RX DMA`：
+
+```text
+uart_dma_event_count=32
+uart_dma_rx_bytes=344
+stream_buffer_write_bytes=344
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+UART DMA 接收字节数与 StreamBuffer 写入字节数一致，没有缓冲区溢出、UART DMA 错误、恢复或重同步事件。
+
+#### 8. 板测结论
+
+Stage 11B-1 验证通过。新增 `camera_sd_storage` 模块和 `SD STATUS`、`SD INIT` CLI 入口后，系统启动正常；`SD INIT` 能正确提示 `NEED_TAKEOVER`，说明当前没有真正启用 SDIO、没有切换 PC8、PC9、PC11，也没有接入 FATFS。
+
+`basic`、`pc_dump` 和 `repeat` 回归均通过，最终状态中 Hook、IWDG 和 UART RX DMA 指标正常，说明该框架没有破坏现有 UART DUMP、二进制请求、FreeRTOS 和 IWDG 正常路径。

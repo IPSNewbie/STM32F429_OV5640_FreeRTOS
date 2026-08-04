@@ -47,6 +47,8 @@ add_executable(${CMAKE_PROJECT_NAME}
         BSPDrivers/Src/camera_dcmi_dma.c
         BSPDrivers/Inc/camera_cli.h
         BSPDrivers/Src/camera_cli.c
+        BSPDrivers/Inc/camera_sd_storage.h
+        BSPDrivers/Src/camera_sd_storage.c
         BSPDrivers/Inc/camera_frame_buffer.h
         BSPDrivers/Src/camera_frame_buffer.c
         BSPDrivers/Inc/camera_image_process.h

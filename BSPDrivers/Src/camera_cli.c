@@ -1,4 +1,5 @@
 #include "camera_cli.h"          // 引入 CLI 模块自身的声明，例如 Camera_CLI_Init()、Camera_CLI_HandleLine() 和相关枚举类型
+#include "camera_sd_storage.h"   // 引入 SD 卡软件状态和受控初始化请求接口，本阶段不操作 SDIO 硬件
 #include "camera_frame_buffer.h" // 引入帧缓冲区尺寸宏，例如 CAMERA_FB_WIDTH 和 CAMERA_FB_HEIGHT
 #include "camera_rtos.h"         // 引入 RTOS 运行统计接口，用于记录 CLI 命令次数并读取 CameraRtosStats_t
 #include "uart_rx_dma.h"         // 引入 UART DMA 接收统计接口，用于 STATUS 命令输出 DMA 和 StreamBuffer 状态
@@ -203,6 +204,7 @@ void Camera_CLI_ResetDefault(void) // 将运行时 CLI 配置恢复为项目定�
 void Camera_CLI_Init(void) // 初始化 CLI 模块；当前只需要初始化运行时配置
 {
     Camera_CLI_ResetDefault(); // 复用默认重置函数，避免在多个位置重复写默认参数
+    Camera_SDStorage_InitState(); // 初始化 SD 卡模块的软件状态，不访问 SDIO、GPIO 或 FATFS
 }
 
 CameraProcessMode_t Camera_CLI_GetProcessMode(void) // 获取当前 CLI 选择的图像处理模式
@@ -232,6 +234,8 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart) // 输出当前 CLI 
     Camera_CLI_WriteLine(huart, "THR 0..255");   // THR 数值：将二值化阈值修改为 0～255
     Camera_CLI_WriteLine(huart, "RESET");        // RESET：恢复 BYPASS 模式和默认阈值 128
     Camera_CLI_WriteLine(huart, "DUMP");         // DUMP：触发一次图像采集并发送 OV56RGB5 二进制帧
+    Camera_CLI_WriteLine(huart, "SD STATUS - show SD storage status"); // 查询 SD 卡模块的软件状态
+    Camera_CLI_WriteLine(huart, "SD INIT - request SD card init, currently deferred until SDIO takeover"); // 请求初始化，本阶段延后到 SDIO 接管完成后
     Camera_CLI_WriteLine(huart, "IWDGTEST CAMERA_TIMEOUT - simulate camera heartbeat timeout and wait for IWDG reset"); // IWDG故障路径测试
 }
 
@@ -544,6 +548,66 @@ static CameraCliStatus_t Camera_CLI_HandleThreshold(UART_HandleTypeDef *huart, /
     return CAMERA_CLI_OK;                                              // 返回处理成功
 }
 
+/* 输出 Stage 11B-1 的 SD 卡软件状态，不访问 SDIO 或 FATFS。 */
+static void Camera_CLI_PrintSdStatus(UART_HandleTypeDef *huart)
+{
+    CameraSdStorageStatus_t status;
+
+    Camera_SDStorage_GetStatus(&status);
+
+    Camera_CLI_WriteLine(huart, "SD:");
+    Camera_CLI_WriteStatLine(huart, "is_initialized", status.is_initialized);
+    Camera_CLI_WriteStatLine(huart, "takeover_required", status.takeover_required);
+    Camera_CLI_WriteStatLine(huart, "sdio_ready", status.sdio_ready);
+    Camera_CLI_WriteStatLine(huart, "fatfs_ready", status.fatfs_ready);
+    Camera_CLI_WriteStatLine(huart, "init_attempt_count", status.init_attempt_count);
+    Camera_CLI_WriteStatLine(huart, "init_success_count", status.init_success_count);
+    Camera_CLI_WriteStatLine(huart, "init_error_count", status.init_error_count);
+    Camera_CLI_WriteStatLine(huart, "last_error_code", status.last_error_code);
+    Camera_CLI_WriteText(huart, "  last_error_text=");
+    Camera_CLI_WriteLine(
+        huart,
+        Camera_SDStorage_ErrorToString(status.last_error_code));
+    Camera_CLI_WriteStatLine(huart, "last_operation_ms", status.last_operation_ms);
+}
+
+/* 处理 SD STATUS 和 SD INIT；初始化请求当前只记录状态并返回需要接管。 */
+static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
+                                             const char *arg,
+                                             uint32_t arg_len)
+{
+    uint32_t result;
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "STATUS") != 0U)
+    {
+        Camera_CLI_PrintSdStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "INIT") != 0U)
+    {
+        result = Camera_SDStorage_RequestInit();
+
+        if (result == CAMERA_SD_ERR_NEED_TAKEOVER)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD INIT: deferred, need SDIO takeover because PC8/PC9/PC11 conflict with DCMI.");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SD INIT: ");
+            Camera_CLI_WriteLine(huart, Camera_SDStorage_ErrorToString(result));
+        }
+
+        Camera_CLI_PrintSdStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    Camera_CLI_WriteLine(huart, "ERR bad SD arg");
+    return CAMERA_CLI_ERROR_BAD_ARG;
+}
+
 // 处理IWDG故障路径测试命令；仅设置RAM标志，不主动复位
 static CameraCliStatus_t Camera_CLI_HandleIwdgTest(UART_HandleTypeDef *huart,
                                                    const char *arg,
@@ -619,6 +683,11 @@ CameraCliStatus_t Camera_CLI_HandleLine(UART_HandleTypeDef *huart, // UART句柄
         return Camera_CLI_HandleThreshold(huart, // 将阈值查询或设置交给专用子函数
                                           arg,   // 传递THR后的参数
                                           arg_len); // 传递参数长度，并直接返回处理结果
+    }
+
+    if (Camera_CLI_TokenEquals(trimmed, cmd_len, "SD") != 0U)
+    {
+        return Camera_CLI_HandleSd(huart, arg, arg_len);
     }
 
     if (Camera_CLI_TokenEquals(trimmed, cmd_len, "IWDGTEST") != 0U)
