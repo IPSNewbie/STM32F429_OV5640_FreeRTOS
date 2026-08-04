@@ -338,3 +338,41 @@ stream_buffer_resync_count=0
 ```
 
 - 结论：Stage 10 Round 3B正常路径验证通过。IWDG已启用，由MonitorTask基于CameraServiceTask和MonitorTask心跳统一刷新；正常运行期间没有跳过喂狗、没有误复位，Hook未触发，DUMP、PC Dump、二进制请求和UART DMA均保持正常。
+
+## Stage 10 Round 3C IWDG故障路径验证
+
+- 本轮目的：增加可控测试命令`IWDGTEST CAMERA_TIMEOUT`，模拟CameraServiceTask心跳超时，使MonitorTask停止刷新IWDG，等待IWDG硬件复位，并验证复位后系统恢复正常。
+- 测试状态：`iwdg_test_mode=0`表示正常，`iwdg_test_mode=1`表示强制Camera心跳超时测试。测试标志仅保存在RAM中，不写Flash，也不跨复位保存。
+- 预期复位前：`iwdg_refresh_skip_count`持续增加，`iwdg_last_skip_reason=3`；系统不调用`NVIC_SystemReset`，约8秒后由IWDG硬件复位。
+- 预期复位后：启动日志显示`reset: iwdg=1`，`iwdg_test_mode`恢复为0，刷新计数重新增加，正常情况下跳过计数和最后跳过原因为0；随后验证basic PASS、pc_dump PASS、repeat 20/20 PASS。
+- 安全说明：测试不写死循环，不修改正式心跳字段，不故意触发栈溢出、malloc失败或`configASSERT`；不修改协议、UART DMA、任务优先级、任务栈大小和Heap。
+
+### 故障路径板测结果
+
+- 触发前`STATUS`的IWDG状态：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=0
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_test_mode=0
+```
+
+- 执行命令：`IWDGTEST CAMERA_TIMEOUT`。
+- 命令返回：`IWDG test: CAMERA_TIMEOUT enabled, wait for hardware reset.`
+- 复位前观察：日志中出现`[ERROR][17046]`，随后发生IWDG硬件复位；未调用`NVIC_SystemReset`，也未出现`FATAL`。
+- 复位后启动日志显示：`reset: iwdg=1`。
+- 复位后`STATUS`的IWDG状态：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=13
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_test_mode=0
+```
+
+- 复位后功能回归：basic PASS；pc_dump PASS，图像质量存在过曝和模糊提示，但CRC和功能验证通过；repeat 20/20 PASS且`frame_id`连续。
+- 异常检查：未出现无限复位，也未出现`FATAL`。
+- 结论：Stage 10 Round 3C故障路径验证通过。`IWDGTEST CAMERA_TIMEOUT`可以可控触发停止喂狗，系统最终由IWDG硬件复位；复位后RAM测试标志清零，`iwdg_test_mode`恢复为0，系统未进入无限复位，并且DUMP、PC Dump和二进制请求均恢复正常。

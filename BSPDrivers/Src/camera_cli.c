@@ -232,6 +232,7 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart) // 输出当前 CLI 
     Camera_CLI_WriteLine(huart, "THR 0..255");   // THR 数值：将二值化阈值修改为 0～255
     Camera_CLI_WriteLine(huart, "RESET");        // RESET：恢复 BYPASS 模式和默认阈值 128
     Camera_CLI_WriteLine(huart, "DUMP");         // DUMP：触发一次图像采集并发送 OV56RGB5 二进制帧
+    Camera_CLI_WriteLine(huart, "IWDGTEST CAMERA_TIMEOUT - simulate camera heartbeat timeout and wait for IWDG reset"); // IWDG故障路径测试
 }
 
 static void Camera_CLI_PrintStatus(UART_HandleTypeDef *huart) // 输出当前图像配置、RTOS运行统计、健康状态和UART DMA统计
@@ -445,6 +446,7 @@ static void Camera_CLI_PrintStatus(UART_HandleTypeDef *huart) // 输出当前图
     Camera_CLI_WriteStatLine(huart,
                              "iwdg_monitor_age_limit_ms",
                              stats->iwdg_monitor_age_limit_ms);
+    Camera_CLI_WriteStatLine(huart, "iwdg_test_mode", stats->iwdg_test_mode);
 
     if (uart_dma_stats != NULL) // 只有成功获取 UART DMA 统计指针时才输出下面的 DMA 接收统计
     {
@@ -542,6 +544,24 @@ static CameraCliStatus_t Camera_CLI_HandleThreshold(UART_HandleTypeDef *huart, /
     return CAMERA_CLI_OK;                                              // 返回处理成功
 }
 
+// 处理IWDG故障路径测试命令；仅设置RAM标志，不主动复位
+static CameraCliStatus_t Camera_CLI_HandleIwdgTest(UART_HandleTypeDef *huart,
+                                                   const char *arg,
+                                                   uint32_t arg_len)
+{
+    if (Camera_CLI_TokenEquals(arg, arg_len, "CAMERA_TIMEOUT") == 0U)
+    {
+        Camera_CLI_WriteLine(huart, "ERR bad IWDGTEST arg");
+        return CAMERA_CLI_ERROR_BAD_ARG;
+    }
+
+    Camera_RTOS_EnableIwdgCameraTimeoutTest();
+    Camera_CLI_WriteLine(
+        huart,
+        "IWDG test: CAMERA_TIMEOUT enabled, wait for hardware reset.");
+    return CAMERA_CLI_OK;
+}
+
 CameraCliStatus_t Camera_CLI_HandleLine(UART_HandleTypeDef *huart, // UART句柄，用于执行命令时向PC输出结果
                                        const char *line)          // 已经由上层文本行解析器整理好的完整命令字符串
 {
@@ -599,6 +619,11 @@ CameraCliStatus_t Camera_CLI_HandleLine(UART_HandleTypeDef *huart, // UART句柄
         return Camera_CLI_HandleThreshold(huart, // 将阈值查询或设置交给专用子函数
                                           arg,   // 传递THR后的参数
                                           arg_len); // 传递参数长度，并直接返回处理结果
+    }
+
+    if (Camera_CLI_TokenEquals(trimmed, cmd_len, "IWDGTEST") != 0U)
+    {
+        return Camera_CLI_HandleIwdgTest(huart, arg, arg_len);
     }
 
     if (Camera_CLI_TokenEquals(trimmed, cmd_len, "RESET") != 0U) // 检查第一个单词是否为RESET

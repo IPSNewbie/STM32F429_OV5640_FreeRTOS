@@ -56,6 +56,9 @@ static uint32_t s_camera_rtos_frame_id = 1U;
 // IWDG句柄仅供初始化和MonitorTask刷新使用
 static IWDG_HandleTypeDef s_camera_rtos_iwdg;
 
+// 测试日志只输出一次，避免MonitorTask每秒刷屏
+static uint8_t s_camera_rtos_iwdg_test_log_printed;
+
 // 重置所有统计计数为 0
 static void Camera_RTOS_ClearStats(void)
 {
@@ -109,6 +112,8 @@ static void Camera_RTOS_ClearStats(void)
         CAMERA_RTOS_IWDG_CAMERA_AGE_LIMIT_MS;
     s_camera_rtos_stats.iwdg_monitor_age_limit_ms =
         CAMERA_RTOS_IWDG_MONITOR_AGE_LIMIT_MS;
+    s_camera_rtos_stats.iwdg_test_mode = CAMERA_RTOS_IWDG_TEST_NONE;
+    s_camera_rtos_iwdg_test_log_printed = 0U;
 }
 
 // 当前构建未纳入HAL IWDG源文件，在此提供等价的最小初始化实现
@@ -194,6 +199,12 @@ static CameraRtosIwdgSkipReason_t Camera_RTOS_GetIwdgSkipReason(
 {
     Camera_RTOS_UpdateHeartbeatAges(current_tick);
 
+    if (s_camera_rtos_stats.iwdg_test_mode ==
+        CAMERA_RTOS_IWDG_TEST_FORCE_CAMERA_TIMEOUT)
+    {
+        return CAMERA_RTOS_IWDG_SKIP_CAMERA_TIMEOUT;
+    }
+
     if (s_camera_rtos_stats.hook_fault_code != 0U)
     {
         return CAMERA_RTOS_IWDG_SKIP_HOOK_FAULT;
@@ -245,8 +256,17 @@ static void Camera_RTOS_ServiceIwdg(uint32_t current_tick)
     s_camera_rtos_stats.iwdg_last_skip_ms = current_tick;
     s_camera_rtos_stats.iwdg_last_skip_reason = (uint32_t)skip_reason;
 
-    // 同一种异常只输出一次，后续保持不喂狗并等待硬件复位
-    if (previous_skip_reason != (uint32_t)skip_reason)
+    if (s_camera_rtos_stats.iwdg_test_mode ==
+        CAMERA_RTOS_IWDG_TEST_FORCE_CAMERA_TIMEOUT)
+    {
+        if (s_camera_rtos_iwdg_test_log_printed == 0U)
+        {
+            LOG_ERROR("IWDG test: force camera heartbeat timeout, stop refresh");
+            s_camera_rtos_iwdg_test_log_printed = 1U;
+        }
+    }
+    // 正式异常同一种原因只输出一次，后续保持不喂狗并等待硬件复位
+    else if (previous_skip_reason != (uint32_t)skip_reason)
     {
         LOG_ERROR("IWDG refresh skipped, reason=%u", (unsigned int)skip_reason);
     }
@@ -629,6 +649,17 @@ HAL_StatusTypeDef Camera_RTOS_IwdgInit(void)
     }
 
     return status;
+}
+
+// CLI故障测试只设置RAM标志，复位后由BSS和统计初始化自动恢复为NONE
+void Camera_RTOS_EnableIwdgCameraTimeoutTest(void)
+{
+    if (s_camera_rtos_stats.iwdg_test_mode == CAMERA_RTOS_IWDG_TEST_NONE)
+    {
+        s_camera_rtos_stats.iwdg_test_mode =
+            CAMERA_RTOS_IWDG_TEST_FORCE_CAMERA_TIMEOUT;
+        s_camera_rtos_iwdg_test_log_printed = 0U;
+    }
 }
 
 // 摄像头服务任务（FreeRTOS 任务主循环）

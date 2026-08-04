@@ -51,6 +51,15 @@ typedef enum
     CAMERA_RTOS_IWDG_SKIP_HOOK_FAULT = 5U
 } CameraRtosIwdgSkipReason_t;
 
+/**
+ * @brief IWDG故障路径测试模式，仅保存在RAM中
+ */
+typedef enum
+{
+    CAMERA_RTOS_IWDG_TEST_NONE = 0U,
+    CAMERA_RTOS_IWDG_TEST_FORCE_CAMERA_TIMEOUT = 1U
+} CameraRtosIwdgTestMode_t;
+
 //============================================================================
 // 结构体：RTOS 运行统计信息
 //============================================================================
@@ -109,6 +118,7 @@ typedef struct
     volatile uint32_t iwdg_timeout_ms;             /**< IWDG设计超时时间，单位ms */
     volatile uint32_t iwdg_camera_age_limit_ms;    /**< CameraServiceTask心跳年龄阈值，单位ms */
     volatile uint32_t iwdg_monitor_age_limit_ms;   /**< MonitorTask心跳年龄阈值，单位ms */
+    volatile uint32_t iwdg_test_mode;              /**< IWDG故障路径测试模式，仅保存在RAM中 */
 } CameraRtosStats_t;
 
 //============================================================================
@@ -128,6 +138,12 @@ void Camera_RTOS_Init(UART_HandleTypeDef *huart);
  * @note   应在应用初始化和任务创建完成后、调度器启动前调用
  */
 HAL_StatusTypeDef Camera_RTOS_IwdgInit(void);
+
+/**
+ * @brief  启用CameraServiceTask心跳超时模拟测试
+ * @note   仅设置RAM标志，由MonitorTask停止刷新IWDG，不主动复位
+ */
+void Camera_RTOS_EnableIwdgCameraTimeoutTest(void);
 
 /**
  * @brief  记录一条完整 CLI 命令
