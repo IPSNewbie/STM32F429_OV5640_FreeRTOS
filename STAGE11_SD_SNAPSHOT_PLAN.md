@@ -370,3 +370,302 @@ UART DMA 接收字节数与 StreamBuffer 写入字节数一致，没有缓冲区
 Stage 11B-1 验证通过。新增 `camera_sd_storage` 模块和 `SD STATUS`、`SD INIT` CLI 入口后，系统启动正常；`SD INIT` 能正确提示 `NEED_TAKEOVER`，说明当前没有真正启用 SDIO、没有切换 PC8、PC9、PC11，也没有接入 FATFS。
 
 `basic`、`pc_dump` 和 `repeat` 回归均通过，最终状态中 Hook、IWDG 和 UART RX DMA 指标正常，说明该框架没有破坏现有 UART DUMP、二进制请求、FreeRTOS 和 IWDG 正常路径。
+
+## Stage 11B-2 SDIO接管模式预留接口
+
+### 1. 本轮目的
+
+Stage 11B-2 在现有 `camera_sd_storage` 软件框架上增加 SDIO 接管模式状态和 CLI 预留入口，为后续停止 DCMI、释放冲突引脚并切换到 SDIO 做接口准备。
+
+本轮新增：
+
+- SDIO 接管状态及进入、退出请求的统计字段。
+- `SD TAKEOVER STATUS` 状态查询命令。
+- `SD TAKEOVER ENTER` 进入接管请求命令。
+- `SD TAKEOVER EXIT` 退出接管请求命令。
+- 在原有 `SD STATUS` 末尾输出全部接管状态字段。
+
+### 2. 本轮明确不做
+
+- 不停止 DCMI。
+- 不停止 DCMI DMA。
+- 不释放或切换 PC8、PC9、PC11。
+- 不初始化 SDIO，也不调用任何 SD 卡 HAL 读写接口。
+- 不接入或挂载 FATFS。
+- 不读写 SD 卡。
+
+所有接管操作仍是纯软件请求，不会改变当前稳定的摄像头采集链路。
+
+### 3. 接管状态设计
+
+| 状态 | 数值 | 含义 |
+| --- | ---: | --- |
+| `IDLE` | 0 | 尚未收到接管进入或退出请求。 |
+| `ENTER_DEFERRED` | 1 | 已请求进入接管模式，但停止 DCMI 和切换引脚尚未实现。 |
+| `ACTIVE` | 2 | 已真正进入 SDIO 接管模式；本轮禁止设置为该状态。 |
+| `EXIT_DEFERRED` | 3 | 已请求退出接管模式，但恢复 DCMI 尚未实现。 |
+| `ERROR` | 4 | 真实接管流程发生错误时使用；本轮 deferred 请求不视为硬件错误。 |
+
+初始状态为 `IDLE`。执行 `SD TAKEOVER ENTER` 后状态变为 `ENTER_DEFERRED`；执行 `SD TAKEOVER EXIT` 后状态变为 `EXIT_DEFERRED`。由于本轮没有真实接管 SDIO，任何入口都不会把状态设为 `ACTIVE`，`takeover_enter_success_count` 和 `takeover_exit_success_count` 保持为 0。
+
+### 4. 命令设计
+
+| 命令 | 当前行为 |
+| --- | --- |
+| `SD TAKEOVER STATUS` | 输出接管状态、状态文本、进入和退出计数、错误码及最近操作时间。 |
+| `SD TAKEOVER ENTER` | 记录一次进入请求，返回 `TAKEOVER_NOT_IMPLEMENTED`，状态置为 `ENTER_DEFERRED`。 |
+| `SD TAKEOVER EXIT` | 记录一次退出请求，返回 `TAKEOVER_NOT_IMPLEMENTED`，状态置为 `EXIT_DEFERRED`。 |
+
+`SD TAKEOVER ENTER` 和 `SD TAKEOVER EXIT` 返回 deferred 后都会输出当前接管状态，便于确认请求计数和状态变化。`TAKEOVER_NOT_IMPLEMENTED` 表示硬件接管尚未实现，不计入 SD 卡硬件失败，因此本轮 `takeover_error_count` 保持为 0。
+
+### 5. 当前行为边界
+
+- `SD TAKEOVER ENTER` 当前返回 `CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED`。
+- `SD TAKEOVER EXIT` 当前返回 `CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED`。
+- 接管状态不会被设置为 `ACTIVE`。
+- 原有 `SD INIT` 行为保持不变，仍返回 `CAMERA_SD_ERR_NEED_TAKEOVER`，不会真正初始化 SDIO。
+- 原有 `SD STATUS` 字段全部保留，仅在末尾增加接管状态字段。
+- 原有 `STATUS`、`DUMP`、二进制请求和 `IWDGTEST` 路径不变。
+
+### 6. 后续 Stage 11B-3 计划
+
+Stage 11B-3 先验证相机停止和恢复的接口边界，暂时仍不实现真实 SDIO 初始化：
+
+1. 增加相机停止接口边界。
+2. 增加 DCMI DMA 停止状态确认。
+3. 增加 PC8、PC9、PC11 冲突引脚释放前的条件检查。
+4. 验证停止失败时的状态恢复和错误回滚。
+5. 验证恢复 DCMI/DMA 后现有采集链路仍能正常工作。
+
+### 7. Stage 11B-2 板测计划
+
+本轮不由 Codex 执行硬件测试。固件烧录后按以下顺序验证：
+
+1. 确认系统启动正常，无反复复位或 IWDG 复位循环。
+2. 确认 `HELP` 中出现 `SD TAKEOVER STATUS`、`SD TAKEOVER ENTER` 和 `SD TAKEOVER EXIT`。
+3. 确认 `SD STATUS` 保留原字段并输出新增接管字段。
+4. 执行 `SD TAKEOVER STATUS`，确认初始状态为 `IDLE`。
+5. 执行 `SD TAKEOVER ENTER`，确认提示 deferred、返回 `TAKEOVER_NOT_IMPLEMENTED` 且状态为 `ENTER_DEFERRED`。
+6. 执行 `SD TAKEOVER EXIT`，确认提示 deferred、返回 `TAKEOVER_NOT_IMPLEMENTED` 且状态为 `EXIT_DEFERRED`。
+7. 执行 `SD INIT`，确认仍提示 `NEED_TAKEOVER`。
+8. 回归 `basic`、`pc_dump` 和 `repeat 20/20`。
+
+### 8. Stage 11B-2 板测结果
+
+#### 8.1 启动情况
+
+- 系统启动正常。
+- 启动日志显示 `reset: iwdg=0`。
+- 未出现 `FATAL`。
+- 未出现反复复位。
+- 未出现 IWDG 复位循环。
+
+#### 8.2 HELP 测试
+
+`HELP` 输出中可以看到以下全部 SD 卡相关命令：
+
+```text
+SD STATUS
+SD INIT
+SD TAKEOVER STATUS
+SD TAKEOVER ENTER
+SD TAKEOVER EXIT
+```
+
+HELP 测试通过，Stage 11B-1 原有命令和 Stage 11B-2 新增命令均保留。
+
+#### 8.3 初始 SD STATUS 接管字段
+
+系统启动后首次执行 `SD STATUS`，接管字段如下：
+
+```text
+takeover_state=0
+takeover_state_text=IDLE
+takeover_enter_attempt_count=0
+takeover_exit_attempt_count=0
+takeover_enter_success_count=0
+takeover_exit_success_count=0
+takeover_error_count=0
+last_takeover_error_code=0
+last_takeover_error_text=OK
+last_takeover_operation_ms=0
+```
+
+初始状态为 `IDLE`，所有进入、退出、成功和错误计数均为 0，符合软件状态初始化设计。
+
+#### 8.4 SD TAKEOVER STATUS 初始结果
+
+单独执行 `SD TAKEOVER STATUS`，得到：
+
+```text
+takeover_state=0
+takeover_state_text=IDLE
+takeover_enter_attempt_count=0
+takeover_exit_attempt_count=0
+takeover_enter_success_count=0
+takeover_exit_success_count=0
+takeover_error_count=0
+last_takeover_error_code=0
+last_takeover_error_text=OK
+```
+
+专用状态命令与 `SD STATUS` 中的接管字段一致。
+
+#### 8.5 SD TAKEOVER ENTER
+
+执行 `SD TAKEOVER ENTER`，CLI 返回：
+
+```text
+SD TAKEOVER ENTER: deferred, DCMI stop and PC8/PC9/PC11 switch are not implemented yet.
+```
+
+随后查询 `SD TAKEOVER STATUS`：
+
+```text
+takeover_state=1
+takeover_state_text=ENTER_DEFERRED
+takeover_enter_attempt_count=1
+takeover_exit_attempt_count=0
+takeover_enter_success_count=0
+takeover_exit_success_count=0
+takeover_error_count=0
+last_takeover_error_code=6
+last_takeover_error_text=TAKEOVER_NOT_IMPLEMENTED
+```
+
+进入请求次数正确增加到 1，状态进入 `ENTER_DEFERRED`，但成功计数仍为 0，未误报真实硬件接管成功。`TAKEOVER_NOT_IMPLEMENTED` 是本阶段预期的 deferred 返回，不计入硬件错误。
+
+#### 8.6 SD TAKEOVER EXIT
+
+执行 `SD TAKEOVER EXIT`，CLI 返回：
+
+```text
+SD TAKEOVER EXIT: deferred, DCMI restore is not implemented yet.
+```
+
+随后查询 `SD TAKEOVER STATUS`：
+
+```text
+takeover_state=3
+takeover_state_text=EXIT_DEFERRED
+takeover_enter_attempt_count=1
+takeover_exit_attempt_count=1
+takeover_enter_success_count=0
+takeover_exit_success_count=0
+takeover_error_count=0
+last_takeover_error_code=6
+last_takeover_error_text=TAKEOVER_NOT_IMPLEMENTED
+```
+
+退出请求次数正确增加到 1，状态进入 `EXIT_DEFERRED`，没有进入 `ACTIVE`，也没有误报硬件失败。
+
+#### 8.7 SD INIT 行为保持验证
+
+执行 `SD INIT` 后仍返回 `NEED_TAKEOVER`。该命令没有真正初始化 SDIO、没有切换 PC8、PC9、PC11，也没有接入 FATFS。
+
+`SD INIT` 后的 SD 状态如下：
+
+```text
+is_initialized=0
+takeover_required=1
+sdio_ready=0
+fatfs_ready=0
+init_attempt_count=1
+init_success_count=0
+init_error_count=0
+last_error_code=3
+last_error_text=NEED_TAKEOVER
+takeover_state=3
+takeover_state_text=EXIT_DEFERRED
+```
+
+`SD INIT` 没有改变接管状态，`takeover_state` 仍保持 `EXIT_DEFERRED`，符合两个软件入口相互独立且均不执行硬件操作的设计。
+
+板测中观察到 `last_operation_ms=1245613`，该数值更像系统 tick 时间戳，而不是本次命令的实际处理耗时。这个观察项不影响 Stage 11B-2 接口验证结论，后续阶段应明确字段语义，并在需要时修正为真实命令耗时统计。
+
+#### 8.8 原有功能回归
+
+| 测试项 | 结果 | 说明 |
+| --- | --- | --- |
+| basic | PASS | 基础功能正常。 |
+| pc_dump | PASS | 图像导出正常，图像质量无警告。 |
+| repeat | 20/20 PASS | `frame_id` 从 3 到 22 连续，平均耗时约 3465.83 ms。 |
+
+原有摄像头采集、PC DUMP 和二进制连续请求链路均未受到影响。
+
+#### 8.9 最终 STATUS 关键字段
+
+`RTOS`：
+
+```text
+dump_request_count=22
+dump_success_count=22
+dump_error_count=0
+binary_request_count=21
+binary_request_success_count=21
+binary_request_error_count=0
+last_binary_request_seq=20
+last_error_code=0
+last_dump_time_ms=3515
+```
+
+22 次 DUMP 请求全部成功，21 次二进制请求全部成功，未记录请求错误。
+
+`HEALTH`：
+
+```text
+camera_service_stack_min_free_bytes=7656
+monitor_stack_min_free_bytes=1864
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+任务栈和堆仍有余量，当前记录中没有资源耗尽迹象。
+
+`HOOK`：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+未记录 Hook 故障或断言失败。
+
+`HEARTBEAT`：
+
+```text
+camera_service_heartbeat_age_ms=69
+monitor_heartbeat_age_ms=619
+```
+
+相机服务任务和监控任务心跳均处于有效范围内。
+
+`IWDG`：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=1534
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_test_mode=0
+```
+
+IWDG 已启用并持续正常刷新，没有跳过喂狗，也未进入测试模式。
+
+`UART RX DMA`：
+
+```text
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+未发生 StreamBuffer 溢出、UART DMA 错误、恢复或协议重同步事件。
+
+### 9. Stage 11B-2 板测结论
+
+Stage 11B-2 验证通过。新增 SDIO 接管模式预留接口后，`SD TAKEOVER STATUS`、`SD TAKEOVER ENTER` 和 `SD TAKEOVER EXIT` 命令均可正常工作；ENTER 和 EXIT 均只进入 deferred 状态，没有真正停止 DCMI、没有切换 PC8、PC9、PC11、没有初始化 SDIO，也没有接入 FATFS。
+
+`SD INIT` 仍保持 `NEED_TAKEOVER` 行为。`basic`、`pc_dump` 和 `repeat` 回归通过，IWDG、Hook、心跳和 UART DMA 状态正常，说明本轮接管模式软件接口没有破坏现有摄像头采集、DUMP、二进制请求和运行保护机制。

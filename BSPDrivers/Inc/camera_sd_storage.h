@@ -10,6 +10,16 @@
 #define CAMERA_SD_ERR_NEED_TAKEOVER          3U
 #define CAMERA_SD_ERR_INIT_FAILED            4U
 #define CAMERA_SD_ERR_INVALID_ARGUMENT       5U
+#define CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED 6U
+#define CAMERA_SD_ERR_TAKEOVER_NOT_ACTIVE    7U
+#define CAMERA_SD_ERR_TAKEOVER_ALREADY_ACTIVE 8U
+
+/* SDIO 接管状态。Stage 11B-2 只会进入请求延后状态，不会进入 ACTIVE。 */
+#define CAMERA_SD_TAKEOVER_STATE_IDLE             0U
+#define CAMERA_SD_TAKEOVER_STATE_ENTER_DEFERRED   1U
+#define CAMERA_SD_TAKEOVER_STATE_ACTIVE           2U
+#define CAMERA_SD_TAKEOVER_STATE_EXIT_DEFERRED    3U
+#define CAMERA_SD_TAKEOVER_STATE_ERROR            4U
 
 /* SD 卡模块的软件状态，不包含 SDIO 或 FATFS 对象。 */
 typedef struct
@@ -23,6 +33,14 @@ typedef struct
     uint32_t sdio_ready;         /* SDIO 是否已就绪，本阶段固定为 0。 */
     uint32_t fatfs_ready;        /* FATFS 是否已挂载，本阶段固定为 0。 */
     uint32_t last_operation_ms;  /* 最近一次 SD INIT 请求的系统时间。 */
+    uint32_t takeover_state;     /* 当前 SDIO 接管状态。 */
+    uint32_t takeover_enter_attempt_count; /* 请求进入接管模式的次数。 */
+    uint32_t takeover_exit_attempt_count;  /* 请求退出接管模式的次数。 */
+    uint32_t takeover_enter_success_count; /* 成功进入接管模式的次数，本阶段保持为 0。 */
+    uint32_t takeover_exit_success_count;  /* 成功退出接管模式的次数，本阶段保持为 0。 */
+    uint32_t takeover_error_count;         /* 接管硬件错误次数，延后请求不计为硬件错误。 */
+    uint32_t last_takeover_error_code;     /* 最近一次接管请求的返回码。 */
+    uint32_t last_takeover_operation_ms;   /* 最近一次接管命令的软件处理耗时。 */
 } CameraSdStorageStatus_t;
 
 /* 初始化纯软件状态，不访问 SDIO、GPIO 或文件系统。 */
@@ -34,7 +52,16 @@ void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status);
 /* 记录一次初始化请求；当前返回 NEED_TAKEOVER，不执行真实初始化。 */
 uint32_t Camera_SDStorage_RequestInit(void);
 
+/* 记录进入 SDIO 接管模式的请求，本阶段不停止 DCMI 或切换 GPIO。 */
+uint32_t Camera_SDStorage_RequestTakeoverEnter(void);
+
+/* 记录退出 SDIO 接管模式的请求，本阶段不恢复 DCMI 或切换 GPIO。 */
+uint32_t Camera_SDStorage_RequestTakeoverExit(void);
+
 /* 将 SD 卡模块返回码转换为 CLI 可读文本。 */
 const char *Camera_SDStorage_ErrorToString(uint32_t error_code);
+
+/* 将 SDIO 接管状态转换为 CLI 可读文本。 */
+const char *Camera_SDStorage_TakeoverStateToString(uint32_t state);
 
 #endif /* ISP_OV5640_CAMERA_SD_STORAGE_H */

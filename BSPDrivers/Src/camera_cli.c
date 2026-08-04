@@ -236,6 +236,9 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart) // 输出当前 CLI 
     Camera_CLI_WriteLine(huart, "DUMP");         // DUMP：触发一次图像采集并发送 OV56RGB5 二进制帧
     Camera_CLI_WriteLine(huart, "SD STATUS - show SD storage status"); // 查询 SD 卡模块的软件状态
     Camera_CLI_WriteLine(huart, "SD INIT - request SD card init, currently deferred until SDIO takeover"); // 请求初始化，本阶段延后到 SDIO 接管完成后
+    Camera_CLI_WriteLine(huart, "SD TAKEOVER STATUS - show SDIO takeover status"); // 查询 SDIO 接管软件状态
+    Camera_CLI_WriteLine(huart, "SD TAKEOVER ENTER - request SDIO takeover, currently deferred"); // 请求进入接管模式，本阶段只记录请求
+    Camera_CLI_WriteLine(huart, "SD TAKEOVER EXIT - request leaving SDIO takeover, currently deferred"); // 请求退出接管模式，本阶段只记录请求
     Camera_CLI_WriteLine(huart, "IWDGTEST CAMERA_TIMEOUT - simulate camera heartbeat timeout and wait for IWDG reset"); // IWDG故障路径测试
 }
 
@@ -548,7 +551,51 @@ static CameraCliStatus_t Camera_CLI_HandleThreshold(UART_HandleTypeDef *huart, /
     return CAMERA_CLI_OK;                                              // 返回处理成功
 }
 
-/* 输出 Stage 11B-1 的 SD 卡软件状态，不访问 SDIO 或 FATFS。 */
+/* 输出 SDIO 接管状态字段，供 SD STATUS 和 SD TAKEOVER STATUS 复用。 */
+static void Camera_CLI_PrintSdTakeoverFields(
+    UART_HandleTypeDef *huart,
+    const CameraSdStorageStatus_t *status)
+{
+    Camera_CLI_WriteStatLine(huart, "takeover_state", status->takeover_state);
+    Camera_CLI_WriteText(huart, "  takeover_state_text=");
+    Camera_CLI_WriteLine(
+        huart,
+        Camera_SDStorage_TakeoverStateToString(status->takeover_state));
+    Camera_CLI_WriteStatLine(
+        huart,
+        "takeover_enter_attempt_count",
+        status->takeover_enter_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "takeover_exit_attempt_count",
+        status->takeover_exit_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "takeover_enter_success_count",
+        status->takeover_enter_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "takeover_exit_success_count",
+        status->takeover_exit_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "takeover_error_count",
+        status->takeover_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_takeover_error_code",
+        status->last_takeover_error_code);
+    Camera_CLI_WriteText(huart, "  last_takeover_error_text=");
+    Camera_CLI_WriteLine(
+        huart,
+        Camera_SDStorage_ErrorToString(status->last_takeover_error_code));
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_takeover_operation_ms",
+        status->last_takeover_operation_ms);
+}
+
+/* 输出完整 SD 卡软件状态，不访问 SDIO 或 FATFS。 */
 static void Camera_CLI_PrintSdStatus(UART_HandleTypeDef *huart)
 {
     CameraSdStorageStatus_t status;
@@ -569,9 +616,20 @@ static void Camera_CLI_PrintSdStatus(UART_HandleTypeDef *huart)
         huart,
         Camera_SDStorage_ErrorToString(status.last_error_code));
     Camera_CLI_WriteStatLine(huart, "last_operation_ms", status.last_operation_ms);
+    Camera_CLI_PrintSdTakeoverFields(huart, &status);
 }
 
-/* 处理 SD STATUS 和 SD INIT；初始化请求当前只记录状态并返回需要接管。 */
+/* 单独输出 SDIO 接管状态，不执行任何硬件接管操作。 */
+static void Camera_CLI_PrintSdTakeoverStatus(UART_HandleTypeDef *huart)
+{
+    CameraSdStorageStatus_t status;
+
+    Camera_SDStorage_GetStatus(&status);
+    Camera_CLI_WriteLine(huart, "SD TAKEOVER:");
+    Camera_CLI_PrintSdTakeoverFields(huart, &status);
+}
+
+/* 处理 SD 命令；初始化和接管请求当前都只记录软件状态。 */
 static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
                                              const char *arg,
                                              uint32_t arg_len)
@@ -601,6 +659,52 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
         }
 
         Camera_CLI_PrintSdStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "TAKEOVER STATUS") != 0U)
+    {
+        Camera_CLI_PrintSdTakeoverStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "TAKEOVER ENTER") != 0U)
+    {
+        result = Camera_SDStorage_RequestTakeoverEnter();
+
+        if (result == CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD TAKEOVER ENTER: deferred, DCMI stop and PC8/PC9/PC11 switch are not implemented yet.");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SD TAKEOVER ENTER: ");
+            Camera_CLI_WriteLine(huart, Camera_SDStorage_ErrorToString(result));
+        }
+
+        Camera_CLI_PrintSdTakeoverStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "TAKEOVER EXIT") != 0U)
+    {
+        result = Camera_SDStorage_RequestTakeoverExit();
+
+        if (result == CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD TAKEOVER EXIT: deferred, DCMI restore is not implemented yet.");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SD TAKEOVER EXIT: ");
+            Camera_CLI_WriteLine(huart, Camera_SDStorage_ErrorToString(result));
+        }
+
+        Camera_CLI_PrintSdTakeoverStatus(huart);
         return CAMERA_CLI_OK;
     }
 
