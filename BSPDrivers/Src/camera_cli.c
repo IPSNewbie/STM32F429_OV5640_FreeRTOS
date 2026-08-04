@@ -1,5 +1,6 @@
 #include "camera_cli.h"          // 引入 CLI 模块自身的声明，例如 Camera_CLI_Init()、Camera_CLI_HandleLine() 和相关枚举类型
 #include "camera_sd_storage.h"   // 引入 SD 卡软件状态和受控初始化请求接口，本阶段不操作 SDIO 硬件
+#include "camera_snapshot_control.h" // 引入拍照保存前后的相机控制边界软件接口
 #include "camera_frame_buffer.h" // 引入帧缓冲区尺寸宏，例如 CAMERA_FB_WIDTH 和 CAMERA_FB_HEIGHT
 #include "camera_rtos.h"         // 引入 RTOS 运行统计接口，用于记录 CLI 命令次数并读取 CameraRtosStats_t
 #include "uart_rx_dma.h"         // 引入 UART DMA 接收统计接口，用于 STATUS 命令输出 DMA 和 StreamBuffer 状态
@@ -205,6 +206,7 @@ void Camera_CLI_Init(void) // 初始化 CLI 模块；当前只需要初始化运
 {
     Camera_CLI_ResetDefault(); // 复用默认重置函数，避免在多个位置重复写默认参数
     Camera_SDStorage_InitState(); // 初始化 SD 卡模块的软件状态，不访问 SDIO、GPIO 或 FATFS
+    Camera_SnapshotControl_InitState(); // 初始化相机控制边界软件状态，不操作 DCMI、DMA 或 GPIO
 }
 
 CameraProcessMode_t Camera_CLI_GetProcessMode(void) // 获取当前 CLI 选择的图像处理模式
@@ -239,6 +241,9 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart) // 输出当前 CLI 
     Camera_CLI_WriteLine(huart, "SD TAKEOVER STATUS - show SDIO takeover status"); // 查询 SDIO 接管软件状态
     Camera_CLI_WriteLine(huart, "SD TAKEOVER ENTER - request SDIO takeover, currently deferred"); // 请求进入接管模式，本阶段只记录请求
     Camera_CLI_WriteLine(huart, "SD TAKEOVER EXIT - request leaving SDIO takeover, currently deferred"); // 请求退出接管模式，本阶段只记录请求
+    Camera_CLI_WriteLine(huart, "SNAPSHOT STATUS - show snapshot camera control status"); // 查询相机控制边界软件状态
+    Camera_CLI_WriteLine(huart, "SNAPSHOT PREPARE - request camera stop boundary before SD save, currently deferred"); // 请求准备相机停止边界
+    Camera_CLI_WriteLine(huart, "SNAPSHOT RESTORE - request camera restore boundary after SD save, currently deferred"); // 请求恢复相机采集边界
     Camera_CLI_WriteLine(huart, "IWDGTEST CAMERA_TIMEOUT - simulate camera heartbeat timeout and wait for IWDG reset"); // IWDG故障路径测试
 }
 
@@ -712,6 +717,138 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
     return CAMERA_CLI_ERROR_BAD_ARG;
 }
 
+/* 输出拍照保存前后的相机控制边界状态，不访问任何硬件。 */
+static void Camera_CLI_PrintSnapshotStatus(UART_HandleTypeDef *huart)
+{
+    CameraSnapshotControlStatus_t status;
+
+    Camera_SnapshotControl_GetStatus(&status);
+
+    Camera_CLI_WriteLine(huart, "SNAPSHOT:");
+    Camera_CLI_WriteStatLine(
+        huart,
+        "camera_control_state",
+        status.camera_control_state);
+    Camera_CLI_WriteText(huart, "  camera_control_state_text=");
+    Camera_CLI_WriteLine(
+        huart,
+        Camera_SnapshotControl_StateToString(status.camera_control_state));
+    Camera_CLI_WriteStatLine(
+        huart,
+        "prepare_attempt_count",
+        status.prepare_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "restore_attempt_count",
+        status.restore_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "prepare_success_count",
+        status.prepare_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "restore_success_count",
+        status.restore_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "control_error_count",
+        status.control_error_count);
+    Camera_CLI_WriteStatLine(huart, "last_error_code", status.last_error_code);
+    Camera_CLI_WriteText(huart, "  last_error_text=");
+    Camera_CLI_WriteLine(
+        huart,
+        Camera_SnapshotControl_ErrorToString(status.last_error_code));
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_operation_ms",
+        status.last_operation_ms);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dcmi_stop_required",
+        status.dcmi_stop_required);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dcmi_dma_stop_required",
+        status.dcmi_dma_stop_required);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "conflict_pin_release_required",
+        status.conflict_pin_release_required);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "camera_restore_required",
+        status.camera_restore_required);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "frame_buffer_required",
+        status.frame_buffer_required);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "frame_buffer_ready",
+        status.frame_buffer_ready);
+}
+
+/* 处理 SNAPSHOT 控制边界命令；PREPARE 和 RESTORE 当前只记录 deferred 状态。 */
+static CameraCliStatus_t Camera_CLI_HandleSnapshot(UART_HandleTypeDef *huart,
+                                                   const char *arg,
+                                                   uint32_t arg_len)
+{
+    uint32_t result;
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "STATUS") != 0U)
+    {
+        Camera_CLI_PrintSnapshotStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "PREPARE") != 0U)
+    {
+        result = Camera_SnapshotControl_RequestPrepare();
+
+        if (result == CAMERA_SNAPSHOT_ERR_CAMERA_STOP_NOT_IMPLEMENTED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SNAPSHOT PREPARE: deferred, DCMI stop, DMA stop and PC8/PC9/PC11 release are not implemented yet.");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SNAPSHOT PREPARE: ");
+            Camera_CLI_WriteLine(
+                huart,
+                Camera_SnapshotControl_ErrorToString(result));
+        }
+
+        Camera_CLI_PrintSnapshotStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "RESTORE") != 0U)
+    {
+        result = Camera_SnapshotControl_RequestRestore();
+
+        if (result == CAMERA_SNAPSHOT_ERR_CAMERA_RESTORE_NOT_IMPLEMENTED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SNAPSHOT RESTORE: deferred, camera restore and DCMI restart are not implemented yet.");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SNAPSHOT RESTORE: ");
+            Camera_CLI_WriteLine(
+                huart,
+                Camera_SnapshotControl_ErrorToString(result));
+        }
+
+        Camera_CLI_PrintSnapshotStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    Camera_CLI_WriteLine(huart, "ERR bad SNAPSHOT arg");
+    return CAMERA_CLI_ERROR_BAD_ARG;
+}
+
 // 处理IWDG故障路径测试命令；仅设置RAM标志，不主动复位
 static CameraCliStatus_t Camera_CLI_HandleIwdgTest(UART_HandleTypeDef *huart,
                                                    const char *arg,
@@ -792,6 +929,11 @@ CameraCliStatus_t Camera_CLI_HandleLine(UART_HandleTypeDef *huart, // UART句柄
     if (Camera_CLI_TokenEquals(trimmed, cmd_len, "SD") != 0U)
     {
         return Camera_CLI_HandleSd(huart, arg, arg_len);
+    }
+
+    if (Camera_CLI_TokenEquals(trimmed, cmd_len, "SNAPSHOT") != 0U)
+    {
+        return Camera_CLI_HandleSnapshot(huart, arg, arg_len);
     }
 
     if (Camera_CLI_TokenEquals(trimmed, cmd_len, "IWDGTEST") != 0U)

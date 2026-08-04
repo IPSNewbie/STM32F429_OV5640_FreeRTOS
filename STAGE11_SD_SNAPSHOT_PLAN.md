@@ -669,3 +669,372 @@ stream_buffer_resync_count=0
 Stage 11B-2 验证通过。新增 SDIO 接管模式预留接口后，`SD TAKEOVER STATUS`、`SD TAKEOVER ENTER` 和 `SD TAKEOVER EXIT` 命令均可正常工作；ENTER 和 EXIT 均只进入 deferred 状态，没有真正停止 DCMI、没有切换 PC8、PC9、PC11、没有初始化 SDIO，也没有接入 FATFS。
 
 `SD INIT` 仍保持 `NEED_TAKEOVER` 行为。`basic`、`pc_dump` 和 `repeat` 回归通过，IWDG、Hook、心跳和 UART DMA 状态正常，说明本轮接管模式软件接口没有破坏现有摄像头采集、DUMP、二进制请求和运行保护机制。
+
+## Stage 11B-3 相机停止/恢复接口边界设计
+
+### 1. 本轮目的
+
+Stage 11B-3 新增 `camera_snapshot_control` 模块，用纯软件状态描述拍照保存前后的相机控制边界，并增加以下 CLI 命令：
+
+- `SNAPSHOT STATUS`
+- `SNAPSHOT PREPARE`
+- `SNAPSHOT RESTORE`
+
+该模块为后续实现 SD 卡拍照保存前的相机停止、DCMI DMA 停止、稳定帧确认、冲突引脚释放，以及保存完成后的相机恢复流程提供独立接口边界。
+
+### 2. 本轮明确不做
+
+- 不停止 DCMI。
+- 不停止或反初始化 DMA。
+- 不释放或切换 PC8、PC9、PC11。
+- 不初始化 SDIO。
+- 不接入或挂载 FATFS。
+- 不读写 SD 卡。
+- 不保存 raw、BMP 或其他图片文件。
+
+本轮所有接口只维护软件状态和请求计数，不改变当前 DCMI、DMA、GPIO、SDIO 或图像采集链路。
+
+### 3. 状态设计
+
+| 状态 | 数值 | 含义 |
+| --- | ---: | --- |
+| `IDLE` | 0 | 尚未收到相机准备或恢复请求。 |
+| `PREPARE_DEFERRED` | 1 | 已收到准备请求，但停止相机、DMA 和释放引脚尚未实现。 |
+| `CAMERA_PAUSED` | 2 | 相机和 DCMI DMA 已真正停止；本轮禁止设置为该状态。 |
+| `RESTORE_DEFERRED` | 3 | 已收到恢复请求，但恢复引脚、DCMI 和 DMA 尚未实现。 |
+| `ERROR` | 4 | 真实硬件控制流程发生错误时使用；本轮 deferred 请求不视为硬件错误。 |
+
+初始状态为 `IDLE`。执行 `SNAPSHOT PREPARE` 后状态变为 `PREPARE_DEFERRED`；执行 `SNAPSHOT RESTORE` 后状态变为 `RESTORE_DEFERRED`。由于没有真正停止相机，本轮不会进入 `CAMERA_PAUSED`，准备和恢复成功计数均保持为 0。
+
+### 4. 命令设计
+
+| 命令 | 当前行为 |
+| --- | --- |
+| `SNAPSHOT STATUS` | 输出相机控制状态、请求计数、错误码、实际软件处理耗时和后续硬件操作需求标志。 |
+| `SNAPSHOT PREPARE` | 记录一次准备请求，返回 `CAMERA_STOP_NOT_IMPLEMENTED`，状态置为 `PREPARE_DEFERRED`。 |
+| `SNAPSHOT RESTORE` | 记录一次恢复请求，返回 `CAMERA_RESTORE_NOT_IMPLEMENTED`，状态置为 `RESTORE_DEFERRED`。 |
+
+`SNAPSHOT PREPARE` 和 `SNAPSHOT RESTORE` 都会在返回 deferred 提示后输出当前状态。`last_operation_ms` 按函数出口 tick 减去函数入口 tick 计算，记录本次软件命令的真实处理耗时，不记录系统绝对 tick。
+
+### 5. 当前行为边界
+
+- `SNAPSHOT PREPARE` 当前返回 `CAMERA_SNAPSHOT_ERR_CAMERA_STOP_NOT_IMPLEMENTED`。
+- `SNAPSHOT RESTORE` 当前返回 `CAMERA_SNAPSHOT_ERR_CAMERA_RESTORE_NOT_IMPLEMENTED`。
+- deferred 返回不计为硬件故障，`control_error_count` 保持为 0。
+- `frame_buffer_ready` 固定为 0，本轮不检查真实帧缓冲区。
+- 相机控制状态不会被设置为 `CAMERA_PAUSED`。
+- 当前 DCMI、DMA、GPIO 和图像采集链路不会发生变化。
+- 原有 `SD STATUS`、`SD INIT`、SD TAKEOVER、`STATUS`、`DUMP`、二进制请求和 `IWDGTEST` 行为保持不变。
+
+### 6. 与 SD TAKEOVER 的关系
+
+后续真正的 SD 卡单帧保存流程应按以下顺序组织：
+
+1. `SNAPSHOT PREPARE`：采集并固定一帧，停止 DCMI 和 DMA，释放冲突引脚。
+2. `SD TAKEOVER ENTER`：将 PC8、PC9、PC11 等相关引脚切换给 SDIO，并初始化 SDIO。
+3. `SD INIT / FATFS`：初始化 SD 卡并挂载文件系统。
+4. `SNAPSHOT SD`：将稳定帧缓冲区写入图像文件。
+5. `SD TAKEOVER EXIT`：退出 SDIO 接管并释放 SDIO 对冲突引脚的占用。
+6. `SNAPSHOT RESTORE`：恢复 DCMI 引脚、DMA 和相机采集。
+
+这些步骤必须按状态机串行执行，并为每一步定义失败回滚路径；不能在 DCMI 连续采集期间同时让 SDIO 使用冲突引脚。
+
+### 7. 后续 Stage 11B-4 计划
+
+Stage 11B-4 继续进行相机停止边界预研，暂时仍不初始化 SDIO：
+
+1. 检查现有相机采集启动和停止相关函数。
+2. 找出 DCMI 与 DMA 句柄的定义位置、所有权和调用上下文。
+3. 明确真正停止 DCMI 的最小改动点及帧边界条件。
+4. 明确 DMA 停止确认、帧缓冲区所有权和失败回滚顺序。
+5. 明确恢复 DCMI/DMA 后的回归验证项目。
+
+### 8. Stage 11B-3 板测计划
+
+本轮不由 Codex 执行硬件测试。固件烧录后按以下顺序验证：
+
+1. 确认系统启动正常，无反复复位或 IWDG 复位循环。
+2. 确认 `HELP` 中出现 `SNAPSHOT STATUS`、`SNAPSHOT PREPARE` 和 `SNAPSHOT RESTORE`。
+3. 执行 `SNAPSHOT STATUS`，确认初始状态为 `IDLE`，固定需求标志为 1，`frame_buffer_ready` 为 0。
+4. 执行 `SNAPSHOT PREPARE`，确认提示 deferred、返回 `CAMERA_STOP_NOT_IMPLEMENTED`，状态为 `PREPARE_DEFERRED`。
+5. 执行 `SNAPSHOT RESTORE`，确认提示 deferred、返回 `CAMERA_RESTORE_NOT_IMPLEMENTED`，状态为 `RESTORE_DEFERRED`。
+6. 确认 `last_operation_ms` 是短命令处理耗时，而不是系统绝对 tick。
+7. 确认 `SD STATUS`、SD TAKEOVER 和 `SD INIT` 行为保持正常。
+8. 回归 `basic`、`pc_dump` 和 `repeat 20/20`。
+9. 检查 IWDG 未跳过喂狗、Hook 未触发、UART DMA 无错误或溢出。
+
+### 9. Stage 11B-3 板测结果
+
+#### 9.1 启动情况
+
+- 系统启动正常。
+- 启动日志显示 `reset: iwdg=0`。
+- 未出现 `FATAL`。
+- 未出现反复复位。
+- 未出现 IWDG 复位循环。
+
+#### 9.2 HELP 测试
+
+`HELP` 输出中可以看到 Stage 11B-3 新增命令及其完整说明：
+
+```text
+SNAPSHOT STATUS - show snapshot camera control status
+SNAPSHOT PREPARE - request camera stop boundary before SD save, currently deferred
+SNAPSHOT RESTORE - request camera restore boundary after SD save, currently deferred
+```
+
+同时确认以下原有命令仍然存在：
+
+```text
+SD STATUS
+SD INIT
+SD TAKEOVER STATUS
+SD TAKEOVER ENTER
+SD TAKEOVER EXIT
+DUMP
+IWDGTEST CAMERA_TIMEOUT
+```
+
+HELP 测试通过，新增命令未覆盖或删除原有命令入口。
+
+#### 9.3 首次 SNAPSHOT STATUS
+
+系统启动后首次执行 `SNAPSHOT STATUS`，输出如下：
+
+```text
+camera_control_state=0
+camera_control_state_text=IDLE
+prepare_attempt_count=0
+restore_attempt_count=0
+prepare_success_count=0
+restore_success_count=0
+control_error_count=0
+last_error_code=0
+last_error_text=OK
+last_operation_ms=0
+dcmi_stop_required=1
+dcmi_dma_stop_required=1
+conflict_pin_release_required=1
+camera_restore_required=1
+frame_buffer_required=1
+frame_buffer_ready=0
+```
+
+初始状态为 `IDLE`，所有请求、成功和错误计数均为 0；DCMI 停止、DMA 停止、冲突引脚释放、相机恢复和帧缓冲区需求标志均为 1。由于本轮没有检查真实帧缓冲区，`frame_buffer_ready` 保持为 0。
+
+#### 9.4 SNAPSHOT PREPARE
+
+执行 `SNAPSHOT PREPARE`，CLI 返回：
+
+```text
+SNAPSHOT PREPARE: deferred, DCMI stop, DMA stop and PC8/PC9/PC11 release are not implemented yet.
+```
+
+随后查询 `SNAPSHOT STATUS`：
+
+```text
+camera_control_state=1
+camera_control_state_text=PREPARE_DEFERRED
+prepare_attempt_count=1
+restore_attempt_count=0
+prepare_success_count=0
+restore_success_count=0
+control_error_count=0
+last_error_code=2
+last_error_text=CAMERA_STOP_NOT_IMPLEMENTED
+last_operation_ms=0
+dcmi_stop_required=1
+dcmi_dma_stop_required=1
+conflict_pin_release_required=1
+camera_restore_required=1
+frame_buffer_required=1
+frame_buffer_ready=0
+```
+
+准备请求次数正确增加到 1，状态进入 `PREPARE_DEFERRED`。准备成功次数仍为 0，说明没有误报相机已停止；返回的 `CAMERA_STOP_NOT_IMPLEMENTED` 是本阶段预期的 deferred 结果，不计入硬件错误。
+
+`last_operation_ms=0` 符合短软件路径在 1 ms tick 分辨率内完成的预期，也说明该字段记录的是入口到出口的耗时差值，而不是系统绝对 tick。
+
+#### 9.5 SNAPSHOT RESTORE
+
+执行 `SNAPSHOT RESTORE`，CLI 返回：
+
+```text
+SNAPSHOT RESTORE: deferred, camera restore and DCMI restart are not implemented yet.
+```
+
+随后查询 `SNAPSHOT STATUS`：
+
+```text
+camera_control_state=3
+camera_control_state_text=RESTORE_DEFERRED
+prepare_attempt_count=1
+restore_attempt_count=1
+prepare_success_count=0
+restore_success_count=0
+control_error_count=0
+last_error_code=3
+last_error_text=CAMERA_RESTORE_NOT_IMPLEMENTED
+last_operation_ms=0
+dcmi_stop_required=1
+dcmi_dma_stop_required=1
+conflict_pin_release_required=1
+camera_restore_required=1
+frame_buffer_required=1
+frame_buffer_ready=0
+```
+
+恢复请求次数正确增加到 1，状态进入 `RESTORE_DEFERRED`。恢复成功次数仍为 0，相机控制状态没有进入 `CAMERA_PAUSED`，也没有误报硬件故障。
+
+#### 9.6 SD 命令回归
+
+首次执行 `SD STATUS`，核心状态和接管状态均正常：
+
+```text
+is_initialized=0
+takeover_required=1
+sdio_ready=0
+fatfs_ready=0
+init_attempt_count=0
+init_success_count=0
+init_error_count=0
+last_error_code=0
+last_error_text=OK
+takeover_state=0
+takeover_state_text=IDLE
+```
+
+执行 `SD TAKEOVER STATUS`，输出如下：
+
+```text
+takeover_state=0
+takeover_state_text=IDLE
+takeover_enter_attempt_count=0
+takeover_exit_attempt_count=0
+takeover_enter_success_count=0
+takeover_exit_success_count=0
+takeover_error_count=0
+last_takeover_error_code=0
+last_takeover_error_text=OK
+```
+
+执行 `SD INIT`，仍返回原有提示：
+
+```text
+SD INIT: deferred, need SDIO takeover because PC8/PC9/PC11 conflict with DCMI.
+```
+
+`SD INIT` 后状态如下：
+
+```text
+is_initialized=0
+takeover_required=1
+sdio_ready=0
+fatfs_ready=0
+init_attempt_count=1
+init_success_count=0
+init_error_count=0
+last_error_code=3
+last_error_text=NEED_TAKEOVER
+```
+
+上述结果确认 Stage 11B-3 没有改变 `SD STATUS`、SD TAKEOVER 或 `SD INIT` 的既有行为，也没有真正初始化 SDIO、切换冲突引脚或接入 FATFS。
+
+板测中观察到 `SD INIT` 后 `last_operation_ms=259963`，该数值仍更像系统 tick 时间戳，而不是本次命令的实际处理耗时。这是 `camera_sd_storage` 模块的既有统计语义问题，不影响 Stage 11B-3 相机控制边界验证结论；后续阶段应将其修正为函数出口 tick 减函数入口 tick 的真实命令耗时。
+
+#### 9.7 原有图像功能回归
+
+| 测试项 | 结果 | 说明 |
+| --- | --- | --- |
+| basic | PASS | 基础功能正常。 |
+| pc_dump | PASS | 图像质量无警告，`frame_id=2`。 |
+| repeat | 20/20 PASS | `frame_id` 从 3 到 22 连续。 |
+
+repeat 性能统计：
+
+- 平均耗时：3463.43 ms。
+- 最短耗时：3433.29 ms。
+- 最长耗时：3468.43 ms。
+
+摄像头采集、PC DUMP 和二进制连续请求链路均未受到新增软件边界接口影响。
+
+#### 9.8 最终 STATUS 关键字段
+
+`RTOS`：
+
+```text
+dump_request_count=22
+dump_success_count=22
+dump_error_count=0
+binary_request_count=21
+binary_request_success_count=21
+binary_request_error_count=0
+last_binary_request_seq=20
+last_error_code=0
+last_dump_time_ms=3503
+```
+
+22 次 DUMP 请求全部成功，21 次二进制请求全部成功，没有记录请求错误。
+
+`HEALTH`：
+
+```text
+health_sample_count=715
+camera_service_stack_min_free_bytes=7656
+monitor_stack_min_free_bytes=1864
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+任务栈和堆仍有余量，当前记录中没有资源耗尽迹象。
+
+`HOOK`：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+未记录 Hook 故障或断言失败。
+
+`HEARTBEAT`：
+
+```text
+camera_service_heartbeat_age_ms=72
+monitor_heartbeat_age_ms=171
+```
+
+相机服务任务和监控任务心跳均处于有效范围内。
+
+`IWDG`：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=715
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_test_mode=0
+```
+
+IWDG 已启用并正常刷新，没有跳过喂狗，也未进入测试模式。
+
+`UART RX DMA`：
+
+```text
+uart_dma_event_count=38
+uart_dma_rx_bytes=440
+stream_buffer_write_bytes=440
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+UART DMA 接收字节数与 StreamBuffer 写入字节数一致，没有缓冲区溢出、UART DMA 错误、恢复或协议重同步事件。
+
+### 10. Stage 11B-3 板测结论
+
+Stage 11B-3 验证通过。新增 `camera_snapshot_control` 模块和 `SNAPSHOT STATUS`、`SNAPSHOT PREPARE`、`SNAPSHOT RESTORE` 命令后，系统启动正常；PREPARE 和 RESTORE 均只进入 deferred 状态，没有真正停止 DCMI、没有停止 DMA、没有释放 PC8、PC9、PC11、没有初始化 SDIO，也没有接入 FATFS。
+
+`SD STATUS`、`SD TAKEOVER STATUS` 和 `SD INIT` 行为保持正常。`basic`、`pc_dump` 和 `repeat` 回归通过，IWDG、Hook、心跳和 UART DMA 状态正常，说明本轮相机停止/恢复接口边界没有破坏现有摄像头采集、DUMP、二进制请求和运行保护机制。
