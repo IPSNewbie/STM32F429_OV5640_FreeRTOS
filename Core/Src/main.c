@@ -94,6 +94,9 @@
 
 /* USER CODE BEGIN PV */
 
+// 启动最早期保存的IWDG复位标志，仅用于简洁诊断输出
+static uint32_t g_boot_iwdg_reset = 0U;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -118,6 +121,9 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+
+  g_boot_iwdg_reset = ((RCC->CSR & RCC_CSR_IWDGRSTF) != 0U) ? 1U : 0U;
+  __HAL_RCC_CLEAR_RESET_FLAGS();
 
   /* USER CODE END 1 */
 
@@ -146,9 +152,16 @@ int main(void)
   /* USER CODE BEGIN 2 */
   log_init(&huart1);
   log_set_level(LOG_LEVEL_DEBUG);   // 输出 DEBUG 及以上等级
+  LOG_INFO("reset: iwdg=%lu", (unsigned long)g_boot_iwdg_reset);
   Delay_TIM7_Init();
   Camera_Application_Init();
   Camera_RTOS_Init(&huart1);
+  // 应用初始化完成后、调度器启动前启用IWDG
+  if (Camera_RTOS_IwdgInit() != HAL_OK)
+  {
+    LOG_ERROR("IWDG init failed");
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Init scheduler */

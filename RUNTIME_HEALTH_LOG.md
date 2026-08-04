@@ -260,3 +260,81 @@ stream_buffer_resync_count=0
 ```
 
 - 结论：Stage 10 Round 3A正常路径验证通过。CameraServiceTask和MonitorTask心跳字段已接入`STATUS`，两个任务心跳正常更新；当前未启用IWDG/WWDG，未主动复位，Hook未误触发，DUMP、PC Dump、二进制请求和UART DMA均保持正常。
+
+## Stage 10 Round 3B IWDG看门狗接入
+
+- 本轮目的：启用IWDG，由MonitorTask根据两个核心任务心跳和Hook状态统一刷新，并在`STATUS`中输出IWDG运行状态；正常路径应避免误复位。
+- IWDG参数：Prescaler为256，Reload为999；按LSI约32 kHz计算，设计超时时间约8 s。CameraServiceTask心跳年龄阈值为6000 ms，MonitorTask心跳年龄阈值为3000 ms。
+- 喂狗条件：Hook未触发，CameraServiceTask和MonitorTask心跳均已启动，且两个心跳年龄未超过各自阈值。运行期只由MonitorTask调用`HAL_IWDG_Refresh`。
+- 不满足条件时：不主动复位，不调用`NVIC_SystemReset`；记录跳过计数、时间和原因，同一种原因只输出一次简短错误日志，随后等待IWDG硬件复位。
+- 跳过原因编码：0为NONE，1为CAMERA_HEARTBEAT_NOT_STARTED，2为MONITOR_HEARTBEAT_NOT_STARTED，3为CAMERA_HEARTBEAT_TIMEOUT，4为MONITOR_HEARTBEAT_TIMEOUT，5为HOOK_FAULT。
+- `STATUS`新增字段：`iwdg_enabled`、`iwdg_refresh_count`、`iwdg_refresh_skip_count`、`iwdg_last_refresh_ms`、`iwdg_last_skip_ms`、`iwdg_last_skip_reason`、`iwdg_timeout_ms`、`iwdg_camera_age_limit_ms`、`iwdg_monitor_age_limit_ms`。
+- 启动时只读取并输出简洁的IWDG复位标志，不恢复完整`RESET_CAUSE`诊断日志。
+- 正常运行预期：basic PASS、pc_dump PASS、repeat 20/20 PASS；`iwdg_enabled=1`，刷新计数持续增加，跳过计数和最后跳过原因为0，`hook_fault_code=0`，UART DMA无错误无溢出。
+
+### 正常路径板测结果
+
+- 启动情况：未出现反复复位、`FATAL`或WWDG提示，IWDG正常启用。
+- 首次`STATUS`的IWDG状态：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=4
+iwdg_refresh_skip_count=0
+iwdg_last_refresh_ms=5987
+iwdg_last_skip_ms=0
+iwdg_last_skip_reason=0
+iwdg_timeout_ms=8000
+iwdg_camera_age_limit_ms=6000
+iwdg_monitor_age_limit_ms=3000
+```
+
+- basic测试：PASS。
+- pc_dump测试：PASS；图像成功获取且CRC校验通过。图像质量报告提示存在过曝和模糊，但功能测试通过。
+- repeat测试：20/20 PASS，`frame_id`保持连续。
+- 最终`STATUS`的IWDG状态：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=145
+iwdg_refresh_skip_count=0
+iwdg_last_refresh_ms=207084
+iwdg_last_skip_ms=0
+iwdg_last_skip_reason=0
+iwdg_timeout_ms=8000
+iwdg_camera_age_limit_ms=6000
+iwdg_monitor_age_limit_ms=3000
+```
+
+- 最终HEARTBEAT状态：
+
+```text
+camera_service_heartbeat_count=1307
+monitor_heartbeat_count=145
+camera_service_heartbeat_ms=207683
+monitor_heartbeat_ms=207084
+camera_service_heartbeat_age_ms=93
+monitor_heartbeat_age_ms=692
+```
+
+- HOOK状态：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+- UART RX DMA实测：
+
+```text
+uart_dma_event_count=28
+uart_dma_rx_bytes=315
+stream_buffer_write_bytes=315
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+- 结论：Stage 10 Round 3B正常路径验证通过。IWDG已启用，由MonitorTask基于CameraServiceTask和MonitorTask心跳统一刷新；正常运行期间没有跳过喂狗、没有误复位，Hook未触发，DUMP、PC Dump、二进制请求和UART DMA均保持正常。

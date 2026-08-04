@@ -6,7 +6,9 @@
 #include "camera_image_process.h"
 #include "camera_pc_dump.h"
 #include "camera_uart_dispatcher.h"
+#include "bsp_log.h"
 #include "cmsis_os.h"
+#include "stm32f4xx_hal_iwdg.h"
 #include "uart_rx_dma.h"
 
 #include <stddef.h>
@@ -30,6 +32,15 @@
 // CameraServiceTask 栈余量的周期采样间隔（毫秒）
 #define CAMERA_RTOS_STACK_SAMPLE_PERIOD_MS         1000U
 
+// IWDG参数：LSI约32 kHz时，(999 + 1) * 256 / 32000约为8秒
+#define CAMERA_RTOS_IWDG_PRESCALER                  IWDG_PRESCALER_256
+#define CAMERA_RTOS_IWDG_RELOAD                     999U
+#define CAMERA_RTOS_IWDG_TIMEOUT_MS                 8000U
+#define CAMERA_RTOS_IWDG_CAMERA_AGE_LIMIT_MS        6000U
+#define CAMERA_RTOS_IWDG_MONITOR_AGE_LIMIT_MS       3000U
+#define CAMERA_RTOS_IWDG_UPDATE_TIMEOUT_MS          100U
+#define CAMERA_RTOS_IWDG_UPDATE_FLAGS               (IWDG_SR_RVU | IWDG_SR_PVU)
+
 // 静态变量：保存 UART 句柄（用于日志和 PC 通信）
 static UART_HandleTypeDef *s_camera_rtos_uart;
 
@@ -41,6 +52,9 @@ static CameraUartDispatcher_t s_camera_uart_dispatcher;
 
 // 静态变量：帧序号（每次成功发送后递增）
 static uint32_t s_camera_rtos_frame_id = 1U;
+
+// IWDG句柄仅供初始化和MonitorTask刷新使用
+static IWDG_HandleTypeDef s_camera_rtos_iwdg;
 
 // 重置所有统计计数为 0
 static void Camera_RTOS_ClearStats(void)
@@ -84,6 +98,59 @@ static void Camera_RTOS_ClearStats(void)
     s_camera_rtos_stats.monitor_heartbeat_ms = 0U;
     s_camera_rtos_stats.camera_service_heartbeat_age_ms = 0U;
     s_camera_rtos_stats.monitor_heartbeat_age_ms = 0U;
+    s_camera_rtos_stats.iwdg_enabled = 0U;
+    s_camera_rtos_stats.iwdg_refresh_count = 0U;
+    s_camera_rtos_stats.iwdg_refresh_skip_count = 0U;
+    s_camera_rtos_stats.iwdg_last_refresh_ms = 0U;
+    s_camera_rtos_stats.iwdg_last_skip_ms = 0U;
+    s_camera_rtos_stats.iwdg_last_skip_reason = CAMERA_RTOS_IWDG_SKIP_NONE;
+    s_camera_rtos_stats.iwdg_timeout_ms = CAMERA_RTOS_IWDG_TIMEOUT_MS;
+    s_camera_rtos_stats.iwdg_camera_age_limit_ms =
+        CAMERA_RTOS_IWDG_CAMERA_AGE_LIMIT_MS;
+    s_camera_rtos_stats.iwdg_monitor_age_limit_ms =
+        CAMERA_RTOS_IWDG_MONITOR_AGE_LIMIT_MS;
+}
+
+// 当前构建未纳入HAL IWDG源文件，在此提供等价的最小初始化实现
+HAL_StatusTypeDef HAL_IWDG_Init(IWDG_HandleTypeDef *hiwdg)
+{
+    uint32_t tick_start;
+
+    if ((hiwdg == NULL) || (hiwdg->Instance != IWDG) ||
+        (IS_IWDG_PRESCALER(hiwdg->Init.Prescaler) == 0U) ||
+        (IS_IWDG_RELOAD(hiwdg->Init.Reload) == 0U))
+    {
+        return HAL_ERROR;
+    }
+
+    __HAL_IWDG_START(hiwdg);
+    IWDG_ENABLE_WRITE_ACCESS(hiwdg);
+    hiwdg->Instance->PR = hiwdg->Init.Prescaler;
+    hiwdg->Instance->RLR = hiwdg->Init.Reload;
+
+    tick_start = HAL_GetTick();
+    while ((hiwdg->Instance->SR & CAMERA_RTOS_IWDG_UPDATE_FLAGS) != 0U)
+    {
+        if ((HAL_GetTick() - tick_start) > CAMERA_RTOS_IWDG_UPDATE_TIMEOUT_MS)
+        {
+            return HAL_TIMEOUT;
+        }
+    }
+
+    __HAL_IWDG_RELOAD_COUNTER(hiwdg);
+    return HAL_OK;
+}
+
+// 当前构建未纳入HAL IWDG源文件，在此提供HAL刷新接口
+HAL_StatusTypeDef HAL_IWDG_Refresh(IWDG_HandleTypeDef *hiwdg)
+{
+    if ((hiwdg == NULL) || (hiwdg->Instance != IWDG))
+    {
+        return HAL_ERROR;
+    }
+
+    __HAL_IWDG_RELOAD_COUNTER(hiwdg);
+    return HAL_OK;
 }
 
 // CMSIS-RTOS2 返回当前任务启动以来的历史最小栈余量，单位为字节
@@ -108,6 +175,81 @@ static void Camera_RTOS_UpdateMonitorHealthStats(void)
     s_camera_rtos_stats.min_ever_free_heap_bytes =
         (uint32_t)xPortGetMinimumEverFreeHeapSize();
     s_camera_rtos_stats.health_sample_count++;
+}
+
+// 按同一个tick快照计算两个任务的心跳年龄
+static void Camera_RTOS_UpdateHeartbeatAges(uint32_t current_tick)
+{
+    s_camera_rtos_stats.camera_service_heartbeat_age_ms =
+        (current_tick >= s_camera_rtos_stats.camera_service_heartbeat_ms) ?
+        (current_tick - s_camera_rtos_stats.camera_service_heartbeat_ms) : 0U;
+    s_camera_rtos_stats.monitor_heartbeat_age_ms =
+        (current_tick >= s_camera_rtos_stats.monitor_heartbeat_ms) ?
+        (current_tick - s_camera_rtos_stats.monitor_heartbeat_ms) : 0U;
+}
+
+// 根据Hook和任务心跳状态决定本周期是否允许刷新IWDG
+static CameraRtosIwdgSkipReason_t Camera_RTOS_GetIwdgSkipReason(
+    uint32_t current_tick)
+{
+    Camera_RTOS_UpdateHeartbeatAges(current_tick);
+
+    if (s_camera_rtos_stats.hook_fault_code != 0U)
+    {
+        return CAMERA_RTOS_IWDG_SKIP_HOOK_FAULT;
+    }
+    if (s_camera_rtos_stats.camera_service_heartbeat_count == 0U)
+    {
+        return CAMERA_RTOS_IWDG_SKIP_CAMERA_NOT_STARTED;
+    }
+    if (s_camera_rtos_stats.monitor_heartbeat_count == 0U)
+    {
+        return CAMERA_RTOS_IWDG_SKIP_MONITOR_NOT_STARTED;
+    }
+    if (s_camera_rtos_stats.camera_service_heartbeat_age_ms >
+        CAMERA_RTOS_IWDG_CAMERA_AGE_LIMIT_MS)
+    {
+        return CAMERA_RTOS_IWDG_SKIP_CAMERA_TIMEOUT;
+    }
+    if (s_camera_rtos_stats.monitor_heartbeat_age_ms >
+        CAMERA_RTOS_IWDG_MONITOR_AGE_LIMIT_MS)
+    {
+        return CAMERA_RTOS_IWDG_SKIP_MONITOR_TIMEOUT;
+    }
+
+    return CAMERA_RTOS_IWDG_SKIP_NONE;
+}
+
+// 仅由MonitorTask调用：健康条件满足时刷新，否则记录一次跳过原因
+static void Camera_RTOS_ServiceIwdg(uint32_t current_tick)
+{
+    CameraRtosIwdgSkipReason_t skip_reason;
+    uint32_t previous_skip_reason;
+
+    if (s_camera_rtos_stats.iwdg_enabled == 0U)
+    {
+        return;
+    }
+
+    skip_reason = Camera_RTOS_GetIwdgSkipReason(current_tick);
+    if (skip_reason == CAMERA_RTOS_IWDG_SKIP_NONE)
+    {
+        (void)HAL_IWDG_Refresh(&s_camera_rtos_iwdg);
+        s_camera_rtos_stats.iwdg_refresh_count++;
+        s_camera_rtos_stats.iwdg_last_refresh_ms = current_tick;
+        return;
+    }
+
+    previous_skip_reason = s_camera_rtos_stats.iwdg_last_skip_reason;
+    s_camera_rtos_stats.iwdg_refresh_skip_count++;
+    s_camera_rtos_stats.iwdg_last_skip_ms = current_tick;
+    s_camera_rtos_stats.iwdg_last_skip_reason = (uint32_t)skip_reason;
+
+    // 同一种异常只输出一次，后续保持不喂狗并等待硬件复位
+    if (previous_skip_reason != (uint32_t)skip_reason)
+    {
+        LOG_ERROR("IWDG refresh skipped, reason=%u", (unsigned int)skip_reason);
+    }
 }
 
 // 记录一条完整 CLI 命令
@@ -471,6 +613,24 @@ void Camera_RTOS_Init(UART_HandleTypeDef *huart)
     s_camera_rtos_uart = huart;
 }
 
+// 在调度器启动前配置并启动IWDG，运行期仅由MonitorTask刷新
+HAL_StatusTypeDef Camera_RTOS_IwdgInit(void)
+{
+    HAL_StatusTypeDef status;
+
+    s_camera_rtos_iwdg.Instance = IWDG;
+    s_camera_rtos_iwdg.Init.Prescaler = CAMERA_RTOS_IWDG_PRESCALER;
+    s_camera_rtos_iwdg.Init.Reload = CAMERA_RTOS_IWDG_RELOAD;
+
+    status = HAL_IWDG_Init(&s_camera_rtos_iwdg);
+    if (status == HAL_OK)
+    {
+        s_camera_rtos_stats.iwdg_enabled = 1U;
+    }
+
+    return status;
+}
+
 // 摄像头服务任务（FreeRTOS 任务主循环）
 // 功能：管理 UART 命令接收、DMA 数据传输、命令解析及图像采集触发
 void Camera_RTOS_CameraServiceTask(void *argument)
@@ -601,6 +761,8 @@ void Camera_RTOS_CameraServiceTask(void *argument)
 // MonitorTask：每 1000 ms 更新心跳计数，不使用 UART。
 void Camera_RTOS_MonitorTask(void *argument)
 {
+    uint32_t current_tick;
+
     (void)argument;
 
     for (;;)
@@ -610,8 +772,10 @@ void Camera_RTOS_MonitorTask(void *argument)
         s_camera_rtos_stats.uptime_ms += 1000U;
         // 每个监控周期更新心跳，不改变原有健康采样周期
         s_camera_rtos_stats.monitor_heartbeat_count++;
-        s_camera_rtos_stats.monitor_heartbeat_ms = HAL_GetTick();
+        current_tick = HAL_GetTick();
+        s_camera_rtos_stats.monitor_heartbeat_ms = current_tick;
         Camera_RTOS_UpdateMonitorHealthStats();
+        Camera_RTOS_ServiceIwdg(current_tick);
     }
 }
 
@@ -621,12 +785,7 @@ const CameraRtosStats_t *Camera_RTOS_GetStats(void)
     uint32_t current_tick = HAL_GetTick();
 
     // 获取状态时计算心跳年龄；tick异常回退时按0处理，避免无符号下溢
-    s_camera_rtos_stats.camera_service_heartbeat_age_ms =
-        (current_tick >= s_camera_rtos_stats.camera_service_heartbeat_ms) ?
-        (current_tick - s_camera_rtos_stats.camera_service_heartbeat_ms) : 0U;
-    s_camera_rtos_stats.monitor_heartbeat_age_ms =
-        (current_tick >= s_camera_rtos_stats.monitor_heartbeat_ms) ?
-        (current_tick - s_camera_rtos_stats.monitor_heartbeat_ms) : 0U;
+    Camera_RTOS_UpdateHeartbeatAges(current_tick);
 
     return &s_camera_rtos_stats;
 }

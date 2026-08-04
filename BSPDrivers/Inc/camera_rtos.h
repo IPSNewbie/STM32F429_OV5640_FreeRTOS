@@ -38,6 +38,19 @@ typedef enum
     CAMERA_RTOS_ERR_DUMP_SEND_BASE = 0x00000500U       /**< 图像发送失败基础码 */
 } CameraRtosErrorCode_t;
 
+/**
+ * @brief IWDG跳过刷新原因
+ */
+typedef enum
+{
+    CAMERA_RTOS_IWDG_SKIP_NONE = 0U,
+    CAMERA_RTOS_IWDG_SKIP_CAMERA_NOT_STARTED = 1U,
+    CAMERA_RTOS_IWDG_SKIP_MONITOR_NOT_STARTED = 2U,
+    CAMERA_RTOS_IWDG_SKIP_CAMERA_TIMEOUT = 3U,
+    CAMERA_RTOS_IWDG_SKIP_MONITOR_TIMEOUT = 4U,
+    CAMERA_RTOS_IWDG_SKIP_HOOK_FAULT = 5U
+} CameraRtosIwdgSkipReason_t;
+
 //============================================================================
 // 结构体：RTOS 运行统计信息
 //============================================================================
@@ -87,6 +100,15 @@ typedef struct
     volatile uint32_t monitor_heartbeat_ms;        /**< MonitorTask最近心跳时间，单位ms */
     volatile uint32_t camera_service_heartbeat_age_ms; /**< CameraServiceTask心跳年龄，单位ms */
     volatile uint32_t monitor_heartbeat_age_ms;    /**< MonitorTask心跳年龄，单位ms */
+    volatile uint32_t iwdg_enabled;                /**< IWDG已启用标志 */
+    volatile uint32_t iwdg_refresh_count;          /**< MonitorTask成功刷新IWDG次数 */
+    volatile uint32_t iwdg_refresh_skip_count;     /**< 因健康条件不满足而跳过刷新次数 */
+    volatile uint32_t iwdg_last_refresh_ms;        /**< 最近一次成功刷新时间，单位ms */
+    volatile uint32_t iwdg_last_skip_ms;           /**< 最近一次跳过刷新时间，单位ms */
+    volatile uint32_t iwdg_last_skip_reason;       /**< 最近一次跳过刷新原因 */
+    volatile uint32_t iwdg_timeout_ms;             /**< IWDG设计超时时间，单位ms */
+    volatile uint32_t iwdg_camera_age_limit_ms;    /**< CameraServiceTask心跳年龄阈值，单位ms */
+    volatile uint32_t iwdg_monitor_age_limit_ms;   /**< MonitorTask心跳年龄阈值，单位ms */
 } CameraRtosStats_t;
 
 //============================================================================
@@ -99,6 +121,13 @@ typedef struct
  * @note   在创建任务之前调用，保存 UART 句柄并重置统计信息
  */
 void Camera_RTOS_Init(UART_HandleTypeDef *huart);
+
+/**
+ * @brief  配置并启动IWDG
+ * @return HAL状态
+ * @note   应在应用初始化和任务创建完成后、调度器启动前调用
+ */
+HAL_StatusTypeDef Camera_RTOS_IwdgInit(void);
 
 /**
  * @brief  记录一条完整 CLI 命令
