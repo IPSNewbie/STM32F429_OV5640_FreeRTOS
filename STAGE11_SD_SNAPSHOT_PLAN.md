@@ -1038,3 +1038,16 @@ UART DMA 接收字节数与 StreamBuffer 写入字节数一致，没有缓冲区
 Stage 11B-3 验证通过。新增 `camera_snapshot_control` 模块和 `SNAPSHOT STATUS`、`SNAPSHOT PREPARE`、`SNAPSHOT RESTORE` 命令后，系统启动正常；PREPARE 和 RESTORE 均只进入 deferred 状态，没有真正停止 DCMI、没有停止 DMA、没有释放 PC8、PC9、PC11、没有初始化 SDIO，也没有接入 FATFS。
 
 `SD STATUS`、`SD TAKEOVER STATUS` 和 `SD INIT` 行为保持正常。`basic`、`pc_dump` 和 `repeat` 回归通过，IWDG、Hook、心跳和 UART DMA 状态正常，说明本轮相机停止/恢复接口边界没有破坏现有摄像头采集、DUMP、二进制请求和运行保护机制。
+
+## Stage 11B-4 真实相机停止/恢复最小改动点梳理
+
+本轮新增 `STAGE11_CAMERA_STOP_RESTORE_ANALYSIS.md`，只进行源码搜索、采集链路分析和后续接口设计，不修改任何 C/H 源码或工程配置。
+
+分析已经定位后续真实 `SNAPSHOT PREPARE` / `SNAPSHOT RESTORE` 的最小改动点：
+
+- 在 `camera_rtos` 中统一门控文本 DUMP、二进制请求和 SNAPSHOT 状态，并拆分“捕获/处理”与“UART 发送”。
+- 在 `camera_dcmi_dma` 中补充可返回结果的 DCMI/DMA 停止确认和冲突引脚释放/恢复边界。
+- 在 `camera_frame_buffer` 中补充 front 有效帧状态，避免仅凭非空地址判断帧可保存。
+- 保持 SDIO 接管必须晚于相机暂停、DMA 停止和有效 front 确认。
+
+源码表明当前 `CAMERA_MODE_PC_DUMP_RGB565` 是按请求启动单帧采集，采集完成后已经停止 DCMI/DMA；因此下一步建议进入 Stage 11B-5，先实现相机停止/恢复的软件状态保护、DUMP 禁止重入和捕获/发送边界拆分，仍不切换 PC8、PC9、PC11，也不初始化 SDIO。
