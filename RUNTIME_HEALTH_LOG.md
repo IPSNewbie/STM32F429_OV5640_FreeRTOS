@@ -216,3 +216,47 @@ stream_buffer_resync_count=0
 ```
 
 - 结论：Stage 10 Round 2正常路径验证通过。FreeRTOS Hook已接入，正常运行时未误触发；DUMP、二进制请求、PC Dump和UART DMA均保持正常。
+
+## Stage 10 Round 3A 任务心跳监控框架
+
+- 本轮目的：增加CameraServiceTask和MonitorTask心跳，并在`STATUS`中显示心跳计数、最近心跳时间及心跳年龄，为Round 3B IWDG做准备。
+- 本轮不启用IWDG或WWDG，不主动复位，不做卡死判定，也不改变任务优先级、任务栈大小和Heap大小。
+- 新增`STATUS`字段：`camera_service_heartbeat_count`、`monitor_heartbeat_count`、`camera_service_heartbeat_ms`、`monitor_heartbeat_ms`、`camera_service_heartbeat_age_ms`、`monitor_heartbeat_age_ms`。
+- CameraServiceTask在每轮主循环更新计数和最近心跳时间；MonitorTask在每个1000 ms监控周期更新。获取状态时计算心跳年龄，若当前tick小于最近心跳tick则按0处理。
+- 正常运行预期：两个`heartbeat_count`持续增加，两个`heartbeat_age_ms`保持在合理范围；basic PASS、pc_dump PASS、repeat 20/20 PASS，UART DMA无错误无溢出，`hook_fault_code`保持为0。
+
+### 正常路径板测结果
+
+- 启动日志：无`FATAL`、无IWDG、无WWDG，也未出现reset异常提示。
+- basic测试：PASS。
+- pc_dump测试：PASS；图像成功获取且CRC校验通过。图像质量报告提示存在过曝和模糊，但不影响本轮功能测试通过的结论。
+- repeat测试：20/20 PASS，`frame_id`保持连续。
+- HEARTBEAT实测：
+
+```text
+camera_service_heartbeat_count=648
+monitor_heartbeat_count=78
+camera_service_heartbeat_ms=141740
+monitor_heartbeat_ms=140941
+camera_service_heartbeat_age_ms=97
+monitor_heartbeat_age_ms=896
+```
+
+- HOOK状态：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+- UART RX DMA实测：
+
+```text
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+- 结论：Stage 10 Round 3A正常路径验证通过。CameraServiceTask和MonitorTask心跳字段已接入`STATUS`，两个任务心跳正常更新；当前未启用IWDG/WWDG，未主动复位，Hook未误触发，DUMP、PC Dump、二进制请求和UART DMA均保持正常。

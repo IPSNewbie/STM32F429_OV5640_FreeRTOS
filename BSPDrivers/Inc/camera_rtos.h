@@ -81,6 +81,12 @@ typedef struct
     volatile uint32_t hook_fault_code;             /**< 最近一次FreeRTOS保护Hook故障类型 */
     volatile uint32_t hook_fault_count;            /**< FreeRTOS保护Hook触发次数 */
     volatile uint32_t assert_line;                 /**< 最近一次configASSERT失败行号 */
+    volatile uint32_t camera_service_heartbeat_count; /**< CameraServiceTask心跳计数 */
+    volatile uint32_t monitor_heartbeat_count;     /**< MonitorTask心跳计数 */
+    volatile uint32_t camera_service_heartbeat_ms; /**< CameraServiceTask最近心跳时间，单位ms */
+    volatile uint32_t monitor_heartbeat_ms;        /**< MonitorTask最近心跳时间，单位ms */
+    volatile uint32_t camera_service_heartbeat_age_ms; /**< CameraServiceTask心跳年龄，单位ms */
+    volatile uint32_t monitor_heartbeat_age_ms;    /**< MonitorTask心跳年龄，单位ms */
 } CameraRtosStats_t;
 
 //============================================================================

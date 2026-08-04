@@ -78,6 +78,12 @@ static void Camera_RTOS_ClearStats(void)
     s_camera_rtos_stats.hook_fault_code = 0U;
     s_camera_rtos_stats.hook_fault_count = 0U;
     s_camera_rtos_stats.assert_line = 0U;
+    s_camera_rtos_stats.camera_service_heartbeat_count = 0U;
+    s_camera_rtos_stats.monitor_heartbeat_count = 0U;
+    s_camera_rtos_stats.camera_service_heartbeat_ms = 0U;
+    s_camera_rtos_stats.monitor_heartbeat_ms = 0U;
+    s_camera_rtos_stats.camera_service_heartbeat_age_ms = 0U;
+    s_camera_rtos_stats.monitor_heartbeat_age_ms = 0U;
 }
 
 // CMSIS-RTOS2 返回当前任务启动以来的历史最小栈余量，单位为字节
@@ -511,6 +517,9 @@ void Camera_RTOS_CameraServiceTask(void *argument)
     {
         // 任务运行计数累加（供统计）
         s_camera_rtos_stats.camera_service_loop_count++;
+        // 每轮主循环更新心跳；本轮只记录状态，不做卡死判定或复位
+        s_camera_rtos_stats.camera_service_heartbeat_count++;
+        s_camera_rtos_stats.camera_service_heartbeat_ms = HAL_GetTick();
 
         // 检测并恢复 UART 输入错误（如帧错误、噪声等）
         if (Camera_RTOS_RecoverUartInputIfNeeded() != 0U)
@@ -599,6 +608,9 @@ void Camera_RTOS_MonitorTask(void *argument)
         (void)osDelay(1000U);
         s_camera_rtos_stats.monitor_tick_count++;
         s_camera_rtos_stats.uptime_ms += 1000U;
+        // 每个监控周期更新心跳，不改变原有健康采样周期
+        s_camera_rtos_stats.monitor_heartbeat_count++;
+        s_camera_rtos_stats.monitor_heartbeat_ms = HAL_GetTick();
         Camera_RTOS_UpdateMonitorHealthStats();
     }
 }
@@ -606,5 +618,15 @@ void Camera_RTOS_MonitorTask(void *argument)
 // 获取运行统计信息的只读指针
 const CameraRtosStats_t *Camera_RTOS_GetStats(void)
 {
+    uint32_t current_tick = HAL_GetTick();
+
+    // 获取状态时计算心跳年龄；tick异常回退时按0处理，避免无符号下溢
+    s_camera_rtos_stats.camera_service_heartbeat_age_ms =
+        (current_tick >= s_camera_rtos_stats.camera_service_heartbeat_ms) ?
+        (current_tick - s_camera_rtos_stats.camera_service_heartbeat_ms) : 0U;
+    s_camera_rtos_stats.monitor_heartbeat_age_ms =
+        (current_tick >= s_camera_rtos_stats.monitor_heartbeat_ms) ?
+        (current_tick - s_camera_rtos_stats.monitor_heartbeat_ms) : 0U;
+
     return &s_camera_rtos_stats;
 }
