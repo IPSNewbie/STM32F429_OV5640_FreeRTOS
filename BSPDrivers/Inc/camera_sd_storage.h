@@ -15,6 +15,9 @@
 #define CAMERA_SD_ERR_TAKEOVER_ALREADY_ACTIVE 8U
 #define CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED     9U
 #define CAMERA_SD_ERR_TAKEOVER_PRECHECK_FAILED 10U
+#define CAMERA_SD_ERR_CONFLICT_PIN_RELEASE_FAILED 11U
+#define CAMERA_SD_ERR_CONFLICT_PIN_RESTORE_FAILED 12U
+#define CAMERA_SD_ERR_CONFLICT_PIN_NOT_RELEASED   13U
 
 /* SDIO 接管状态。Stage 11B-2 只会进入请求延后状态，不会进入 ACTIVE。 */
 #define CAMERA_SD_TAKEOVER_STATE_IDLE             0U
@@ -51,6 +54,15 @@ typedef struct
     uint32_t snapshot_pause_confirmed;        /* 最近一次前置检查是否确认相机已暂停。 */
     uint32_t conflict_pin_release_ready;      /* 软件条件是否允许进入冲突引脚释放流程。 */
     uint32_t last_takeover_precheck_error_code; /* 最近一次前置检查错误码。 */
+    uint32_t conflict_pin_release_attempt_count; /* 尝试释放 PC8、PC9、PC11 的次数。 */
+    uint32_t conflict_pin_release_success_count; /* 冲突引脚释放成功次数。 */
+    uint32_t conflict_pin_release_error_count;   /* 冲突引脚释放失败次数。 */
+    uint32_t conflict_pin_restore_attempt_count; /* 尝试恢复 PC8、PC9、PC11 的次数。 */
+    uint32_t conflict_pin_restore_success_count; /* 冲突引脚恢复成功次数。 */
+    uint32_t conflict_pin_restore_error_count;   /* 冲突引脚恢复失败次数。 */
+    uint32_t conflict_pins_released;             /* 三个冲突引脚当前是否处于释放状态。 */
+    uint32_t last_conflict_pin_error_code;       /* 最近一次冲突引脚操作错误码。 */
+    uint32_t last_conflict_pin_operation_ms;     /* 最近一次冲突引脚操作耗时。 */
 } CameraSdStorageStatus_t;
 
 /* 初始化纯软件状态，不访问 SDIO、GPIO 或文件系统。 */
@@ -62,10 +74,10 @@ void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status);
 /* 记录一次初始化请求；当前返回 NEED_TAKEOVER，不执行真实初始化。 */
 uint32_t Camera_SDStorage_RequestInit(void);
 
-/* 记录进入 SDIO 接管模式的请求，本阶段不停止 DCMI 或切换 GPIO。 */
+/* 前置检查通过后释放冲突引脚；本阶段不配置 SDIO 复用。 */
 uint32_t Camera_SDStorage_RequestTakeoverEnter(void);
 
-/* 记录退出 SDIO 接管模式的请求，本阶段不恢复 DCMI 或切换 GPIO。 */
+/* 将冲突引脚恢复为 DCMI AF13；本阶段不重启 DCMI。 */
 uint32_t Camera_SDStorage_RequestTakeoverExit(void);
 
 /* 将 SD 卡模块返回码转换为 CLI 可读文本。 */

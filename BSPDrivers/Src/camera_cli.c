@@ -635,6 +635,46 @@ static void Camera_CLI_PrintSdTakeoverFields(
         huart,
         Camera_SDStorage_ErrorToString(
             status->last_takeover_precheck_error_code));
+    Camera_CLI_WriteStatLine(
+        huart,
+        "conflict_pin_release_attempt_count",
+        status->conflict_pin_release_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "conflict_pin_release_success_count",
+        status->conflict_pin_release_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "conflict_pin_release_error_count",
+        status->conflict_pin_release_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "conflict_pin_restore_attempt_count",
+        status->conflict_pin_restore_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "conflict_pin_restore_success_count",
+        status->conflict_pin_restore_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "conflict_pin_restore_error_count",
+        status->conflict_pin_restore_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "conflict_pins_released",
+        status->conflict_pins_released);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_conflict_pin_error_code",
+        status->last_conflict_pin_error_code);
+    Camera_CLI_WriteText(huart, "  last_conflict_pin_error_text=");
+    Camera_CLI_WriteLine(
+        huart,
+        Camera_SDStorage_ErrorToString(status->last_conflict_pin_error_code));
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_conflict_pin_operation_ms",
+        status->last_conflict_pin_operation_ms);
 }
 
 /* 输出完整 SD 卡软件状态，不访问 SDIO 或 FATFS。 */
@@ -724,7 +764,13 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
         {
             Camera_CLI_WriteLine(
                 huart,
-                "SD TAKEOVER ENTER: precheck OK, GPIO switch is not implemented yet.");
+                "SD TAKEOVER ENTER: conflict pins released, GPIO switch to SDIO is not implemented yet.");
+        }
+        else if (result == CAMERA_SD_ERR_CONFLICT_PIN_RELEASE_FAILED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD TAKEOVER ENTER: conflict pin release failed.");
         }
         else
         {
@@ -744,7 +790,13 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
         {
             Camera_CLI_WriteLine(
                 huart,
-                "SD TAKEOVER EXIT: deferred, GPIO restore is not implemented yet.");
+                "SD TAKEOVER EXIT: conflict pins restored to DCMI AF13, SDIO restore is not implemented yet.");
+        }
+        else if (result == CAMERA_SD_ERR_CONFLICT_PIN_RESTORE_FAILED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD TAKEOVER EXIT: conflict pin restore failed.");
         }
         else
         {
