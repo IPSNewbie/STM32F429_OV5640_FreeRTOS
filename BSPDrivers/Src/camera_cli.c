@@ -253,6 +253,7 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart) // 输出当前 CLI 
     Camera_CLI_WriteLine(huart, "RESET");        // RESET：恢复 BYPASS 模式和默认阈值 128
     Camera_CLI_WriteLine(huart, "DUMP");         // DUMP：触发一次图像采集并发送 OV56RGB5 二进制帧
     Camera_CLI_WriteLine(huart, "SD STATUS - show SD storage status"); // 查询 SD 卡模块的软件状态
+    Camera_CLI_WriteLine(huart, "SD CARDINFO - show cached SD card information"); // 只输出最近一次缓存的卡信息
     Camera_CLI_WriteLine(huart, "SD INIT - request SD card init, currently deferred until SDIO takeover"); // 请求初始化，本阶段延后到 SDIO 接管完成后
     Camera_CLI_WriteLine(huart, "SD TAKEOVER STATUS - show SDIO takeover status"); // 查询 SDIO 接管软件状态
     Camera_CLI_WriteLine(huart, "SD TAKEOVER ENTER - request SDIO takeover, currently deferred"); // 请求进入接管模式，本阶段只记录请求
@@ -572,6 +573,68 @@ static CameraCliStatus_t Camera_CLI_HandleThreshold(UART_HandleTypeDef *huart, /
     return CAMERA_CLI_OK;                                              // 返回处理成功
 }
 
+/* 只输出缓存的 SD 卡基础信息，不重新初始化或访问 SD 卡。 */
+static void Camera_CLI_PrintSdCardInfoFields(
+    UART_HandleTypeDef *huart,
+    const CameraSdStorageStatus_t *status)
+{
+    Camera_CLI_WriteStatLine(
+        huart,
+        "card_info_read_attempt_count",
+        status->card_info_read_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "card_info_read_success_count",
+        status->card_info_read_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "card_info_read_error_count",
+        status->card_info_read_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_card_info_status",
+        status->last_card_info_status);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_card_info_error",
+        status->last_card_info_error);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_card_info_operation_ms",
+        status->last_card_info_operation_ms);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_hal_sd_state",
+        status->last_hal_sd_state);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_hal_sd_card_state",
+        status->last_hal_sd_card_state);
+    Camera_CLI_WriteStatLine(huart, "card_type", status->card_type);
+    Camera_CLI_WriteStatLine(huart, "card_version", status->card_version);
+    Camera_CLI_WriteStatLine(huart, "card_class", status->card_class);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "card_rel_card_add",
+        status->card_rel_card_add);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "card_block_nbr",
+        status->card_block_nbr);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "card_block_size",
+        status->card_block_size);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "card_log_block_nbr",
+        status->card_log_block_nbr);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "card_log_block_size",
+        status->card_log_block_size);
+}
+
 /* 输出 SDIO 接管状态字段，供 SD STATUS 和 SD TAKEOVER STATUS 复用。 */
 static void Camera_CLI_PrintSdTakeoverFields(
     UART_HandleTypeDef *huart,
@@ -824,6 +887,7 @@ static void Camera_CLI_PrintSdTakeoverFields(
         huart,
         "last_sdio_hal_deinit_operation_ms",
         status->last_sdio_hal_deinit_operation_ms);
+    Camera_CLI_PrintSdCardInfoFields(huart, status);
 }
 
 /* 输出完整 SD 卡软件状态，不访问 SDIO 或 FATFS。 */
@@ -860,7 +924,16 @@ static void Camera_CLI_PrintSdTakeoverStatus(UART_HandleTypeDef *huart)
     Camera_CLI_PrintSdTakeoverFields(huart, &status);
 }
 
-/* 处理 SD 命令；Stage 11C-3 只验证 HAL SD 初始化，不接入 FATFS 或块读写。 */
+static void Camera_CLI_PrintSdCardInfo(UART_HandleTypeDef *huart)
+{
+    CameraSdStorageStatus_t status;
+
+    Camera_SDStorage_GetStatus(&status);
+    Camera_CLI_WriteLine(huart, "SD CARDINFO:");
+    Camera_CLI_PrintSdCardInfoFields(huart, &status);
+}
+
+/* 处理 SD 命令；Stage 11C-4 只读取 HAL 卡信息，不接入 FATFS 或块读写。 */
 static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
                                              const char *arg,
                                              uint32_t arg_len)
@@ -870,6 +943,12 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
     if (Camera_CLI_TokenEquals(arg, arg_len, "STATUS") != 0U)
     {
         Camera_CLI_PrintSdStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "CARDINFO") != 0U)
+    {
+        Camera_CLI_PrintSdCardInfo(huart);
         return CAMERA_CLI_OK;
     }
 
@@ -890,7 +969,13 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
         {
             Camera_CLI_WriteLine(
                 huart,
-                "SD INIT: HAL_SD_Init OK, FATFS is not mounted.");
+                "SD INIT: HAL_SD_Init OK, card info OK, FATFS is not mounted.");
+        }
+        else if (result == CAMERA_SD_ERR_CARD_INFO_FAILED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD INIT: HAL_SD_Init OK, card info failed, FATFS is not mounted.");
         }
         else if (result == CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED)
         {

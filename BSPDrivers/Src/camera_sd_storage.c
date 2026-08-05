@@ -9,7 +9,7 @@
  * Stage 11C-1 在既有冲突引脚切换成功后，将 PC8～PC12 和 PD2 配置为 SDIO AF12，
  * 并在 EXIT 时先将六个引脚退回 GPIO 输入态，再恢复 PC8、PC9、PC11 的 DCMI AF13。
  * PC8、PC9、PC11 同时被 DCMI 和 SDIO 使用，后续必须先停止 DCMI 和相关 DMA，
- * 再进入 SDIO 接管流程。Stage 11C-3 只在完整 AF12 状态下验证 HAL_SD_Init，
+ * 再进入 SDIO 接管流程。Stage 11C-4 在 HAL_SD_Init 成功后读取 HAL 层卡信息，
  * 不接入 FATFS，不执行块读写，也不启用 SDIO 中断或 DMA。
  */
 static CameraSdStorageStatus_t s_camera_sd_status;
@@ -66,13 +66,13 @@ static void Camera_SDStorage_PrepareSdHandle(void)
     hsd_snapshot.Init.ClockEdge = SDIO_CLOCK_EDGE_RISING;
     hsd_snapshot.Init.ClockBypass = SDIO_CLOCK_BYPASS_DISABLE;
     hsd_snapshot.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
-    /* 本轮只验证 1-bit 初始化，不切换 4-bit，也不调用 HAL_SD_ConfigWideBusOperation。 */
+    /* Stage 11C-4 保持 1-bit 初始化，不切换 4-bit，也不配置宽总线。 */
     hsd_snapshot.Init.BusWide = SDIO_BUS_WIDE_1B;
     hsd_snapshot.Init.HardwareFlowControl =
         SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
     /* ClockDiv=118U 用于保守的 SDIO 初始化低速阶段。 */
     hsd_snapshot.Init.ClockDiv = 118U;
-    /* Stage 11C-3 只验证 HAL_SD_Init 调用路径，不接 FATFS，不执行块读写。 */
+    /* Stage 11C-4 读取 HAL 层卡信息，不接 FATFS，不执行块读写。 */
 }
 
 static void Camera_SDStorage_EnableSdioClock(void)
@@ -85,6 +85,51 @@ static void Camera_SDStorage_DisableSdioClock(void)
 {
     __HAL_RCC_SDIO_CLK_DISABLE();
     s_camera_sd_status.sdio_clock_enabled = 0U;
+}
+
+static uint32_t Camera_SDStorage_ReadCardInfo(void)
+{
+    uint32_t start_ms;
+    HAL_StatusTypeDef hal_status;
+    HAL_SD_CardInfoTypeDef card_info;
+
+    if ((s_camera_sd_status.is_initialized != 1U) ||
+        (s_camera_sd_status.sdio_ready != 1U))
+    {
+        /* HAL_SD_Init 未成功时禁止访问卡信息，也不增加实际读取计数。 */
+        return CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED;
+    }
+
+    ++s_camera_sd_status.card_info_read_attempt_count;
+    start_ms = HAL_GetTick();
+    hal_status = HAL_SD_GetCardInfo(&hsd_snapshot, &card_info);
+    s_camera_sd_status.last_card_info_operation_ms =
+        HAL_GetTick() - start_ms;
+    s_camera_sd_status.last_card_info_status = (uint32_t)hal_status;
+    s_camera_sd_status.last_card_info_error = HAL_SD_GetError(&hsd_snapshot);
+    s_camera_sd_status.last_hal_sd_state =
+        (uint32_t)HAL_SD_GetState(&hsd_snapshot);
+    s_camera_sd_status.last_hal_sd_card_state =
+        (uint32_t)HAL_SD_GetCardState(&hsd_snapshot);
+
+    if (hal_status == HAL_OK)
+    {
+        ++s_camera_sd_status.card_info_read_success_count;
+        s_camera_sd_status.card_type = card_info.CardType;
+        s_camera_sd_status.card_version = card_info.CardVersion;
+        s_camera_sd_status.card_class = card_info.Class;
+        s_camera_sd_status.card_rel_card_add = card_info.RelCardAdd;
+        s_camera_sd_status.card_block_nbr = card_info.BlockNbr;
+        s_camera_sd_status.card_block_size = card_info.BlockSize;
+        s_camera_sd_status.card_log_block_nbr = card_info.LogBlockNbr;
+        s_camera_sd_status.card_log_block_size = card_info.LogBlockSize;
+        s_camera_sd_status.last_error_code = CAMERA_SD_OK;
+        return CAMERA_SD_OK;
+    }
+
+    ++s_camera_sd_status.card_info_read_error_count;
+    s_camera_sd_status.last_error_code = CAMERA_SD_ERR_CARD_INFO_FAILED;
+    return CAMERA_SD_ERR_CARD_INFO_FAILED;
 }
 
 static uint32_t Camera_SDStorage_ReleaseConflictPins(void)
@@ -408,6 +453,22 @@ void Camera_SDStorage_InitState(void)
     s_camera_sd_status.last_hal_sd_error = HAL_SD_ERROR_NONE;
     s_camera_sd_status.last_sdio_hal_init_operation_ms = 0U;
     s_camera_sd_status.last_sdio_hal_deinit_operation_ms = 0U;
+    s_camera_sd_status.card_info_read_attempt_count = 0U;
+    s_camera_sd_status.card_info_read_success_count = 0U;
+    s_camera_sd_status.card_info_read_error_count = 0U;
+    s_camera_sd_status.last_card_info_status = (uint32_t)HAL_OK;
+    s_camera_sd_status.last_card_info_error = HAL_SD_ERROR_NONE;
+    s_camera_sd_status.last_card_info_operation_ms = 0U;
+    s_camera_sd_status.last_hal_sd_state = 0U;
+    s_camera_sd_status.last_hal_sd_card_state = 0U;
+    s_camera_sd_status.card_type = 0U;
+    s_camera_sd_status.card_version = 0U;
+    s_camera_sd_status.card_class = 0U;
+    s_camera_sd_status.card_rel_card_add = 0U;
+    s_camera_sd_status.card_block_nbr = 0U;
+    s_camera_sd_status.card_block_size = 0U;
+    s_camera_sd_status.card_log_block_nbr = 0U;
+    s_camera_sd_status.card_log_block_size = 0U;
 }
 
 void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status)
@@ -454,13 +515,15 @@ uint32_t Camera_SDStorage_RequestInit(void)
 
     if (hal_status == HAL_OK)
     {
+        uint32_t card_info_result;
+
         ++s_camera_sd_status.init_success_count;
         ++s_camera_sd_status.sdio_hal_init_success_count;
         s_camera_sd_status.is_initialized = 1U;
         s_camera_sd_status.sdio_ready = 1U;
-        s_camera_sd_status.last_error_code = CAMERA_SD_OK;
+        card_info_result = Camera_SDStorage_ReadCardInfo();
         s_camera_sd_status.last_operation_ms = HAL_GetTick() - start_ms;
-        return CAMERA_SD_OK;
+        return card_info_result;
     }
 
     ++s_camera_sd_status.init_error_count;
@@ -746,6 +809,9 @@ const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
 
         case CAMERA_SD_ERR_SDIO_HAL_DEINIT_FAILED:
             return "SDIO_HAL_DEINIT_FAILED";
+
+        case CAMERA_SD_ERR_CARD_INFO_FAILED:
+            return "CARD_INFO_FAILED";
 
         default:
             return "UNKNOWN_ERROR";

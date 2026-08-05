@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-/* SD 卡模块返回码。Stage 11C-3 允许受控执行最小 HAL SD 初始化。 */
+/* SD 卡模块返回码。Stage 11C-4 允许受控初始化并读取 HAL 层卡信息。 */
 #define CAMERA_SD_OK                         0U
 #define CAMERA_SD_ERR_NOT_IMPLEMENTED        1U
 #define CAMERA_SD_ERR_PIN_CONFLICT           2U
@@ -24,6 +24,7 @@
 #define CAMERA_SD_ERR_SDIO_FULL_GPIO_RESTORE_FAILED 17U
 #define CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED           18U
 #define CAMERA_SD_ERR_SDIO_HAL_DEINIT_FAILED         19U
+#define CAMERA_SD_ERR_CARD_INFO_FAILED                20U
 
 /* SDIO 接管状态。Stage 11B-2 只会进入请求延后状态，不会进入 ACTIVE。 */
 #define CAMERA_SD_TAKEOVER_STATE_IDLE             0U
@@ -42,7 +43,7 @@ typedef struct
     uint32_t is_initialized;     /* SD 卡 HAL 初始化是否成功。 */
     uint32_t takeover_required;  /* 是否需要停止 DCMI 并由 SDIO 接管冲突引脚。 */
     uint32_t sdio_ready;         /* SDIO 是否已完成 HAL 初始化。 */
-    uint32_t fatfs_ready;        /* FATFS 是否已挂载，Stage 11C-3 固定为 0。 */
+    uint32_t fatfs_ready;        /* FATFS 是否已挂载，Stage 11C-4 固定为 0。 */
     uint32_t last_operation_ms;  /* 最近一次 SD INIT 请求的处理耗时。 */
     uint32_t takeover_state;     /* 当前 SDIO 接管状态。 */
     uint32_t takeover_enter_attempt_count; /* 请求进入接管模式的次数。 */
@@ -100,6 +101,22 @@ typedef struct
     uint32_t last_hal_sd_error;                     /* 最近一次 HAL_SD_GetError 返回值。 */
     uint32_t last_sdio_hal_init_operation_ms;       /* 最近一次 HAL_SD_Init 调用耗时。 */
     uint32_t last_sdio_hal_deinit_operation_ms;     /* 最近一次 HAL_SD_DeInit 调用耗时。 */
+    uint32_t card_info_read_attempt_count;          /* 实际调用 HAL_SD_GetCardInfo 的次数。 */
+    uint32_t card_info_read_success_count;          /* HAL_SD_GetCardInfo 返回 HAL_OK 的次数。 */
+    uint32_t card_info_read_error_count;            /* HAL_SD_GetCardInfo 返回非 HAL_OK 的次数。 */
+    uint32_t last_card_info_status;                 /* 最近一次 HAL_SD_GetCardInfo 返回值。 */
+    uint32_t last_card_info_error;                  /* 读取卡信息后的 HAL_SD_GetError 返回值。 */
+    uint32_t last_card_info_operation_ms;           /* 最近一次 HAL_SD_GetCardInfo 调用耗时。 */
+    uint32_t last_hal_sd_state;                     /* 最近一次 HAL_SD_GetState 返回值。 */
+    uint32_t last_hal_sd_card_state;                /* 最近一次 HAL_SD_GetCardState 返回值。 */
+    uint32_t card_type;                             /* 最近一次成功读取的 CardType。 */
+    uint32_t card_version;                          /* 最近一次成功读取的 CardVersion。 */
+    uint32_t card_class;                            /* 最近一次成功读取的 Class。 */
+    uint32_t card_rel_card_add;                     /* 最近一次成功读取的 RelCardAdd。 */
+    uint32_t card_block_nbr;                        /* 最近一次成功读取的 BlockNbr。 */
+    uint32_t card_block_size;                       /* 最近一次成功读取的 BlockSize。 */
+    uint32_t card_log_block_nbr;                    /* 最近一次成功读取的 LogBlockNbr。 */
+    uint32_t card_log_block_size;                   /* 最近一次成功读取的 LogBlockSize。 */
 } CameraSdStorageStatus_t;
 
 /* 初始化纯软件状态，不访问 SDIO、GPIO 或文件系统。 */
