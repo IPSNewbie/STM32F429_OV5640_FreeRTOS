@@ -1547,3 +1547,281 @@ Stage 11B-6 验证通过。`SNAPSHOT PREPARE` 中真实调用 `HAL_DCMI_Stop` �
 - 验证多次调用 `HAL_DCMI_Stop` 后系统是否仍稳定，无死机、复位或 IWDG 异常。
 - 验证每轮 RESTORE 后 `basic` 是否都能恢复，并检查 frame_id、CRC 和耗时。
 - 根据多轮测试结果确认现有恢复机制，再决定是否需要显式 `HAL_DCMI_Start_DMA` 恢复路径。
+
+## Stage 11B-7 多轮 Stop/Restore 循环稳定性验证
+
+### 1. 本轮目的
+
+- 新增独立测试工具 `tools/uart_snapshot_cycle_test.py`。
+- 自动执行多轮 `SNAPSHOT PREPARE` / `SNAPSHOT RESTORE` 循环。
+- 验证多次执行现有 `HAL_DCMI_Stop` 后系统是否保持稳定。
+- 验证每轮 guard 状态下文本 DUMP 和二进制图像请求持续被阻止。
+- 验证每轮 RESTORE 清除 guard 后，二进制图像请求持续恢复并通过帧格式及 CRC 校验。
+- 检查 RESTORE 后有效图像帧的 `frame_id` 是否连续递增。
+
+### 2. 本轮明确不做
+
+- 不修改任何固件 C/H 源码，包括 `camera_snapshot_control`、`camera_rtos` 和 `camera_cli`。
+- 不新增或修改 `HAL_DCMI_Stop` 调用，不调用 `HAL_DCMI_Start_DMA`。
+- 不调用 `HAL_DMA_Abort` 或 `HAL_DMA_DeInit`。
+- 不修改 DCMI、DMA、UART DMA、二进制请求协议或 OV56RGB5 图像帧格式。
+- 不释放或切换 PC8、PC9、PC11，不出现 `GPIO_AF12_SDIO`。
+- 不初始化 SDIO，不接入 FATFS，不读写 SD 卡。
+- 不修改或导入现有 Python 工具，不保存 PNG，不做图像质量分析。
+
+### 3. 循环测试脚本
+
+脚本路径为 `tools/uart_snapshot_cycle_test.py`，只依赖 pyserial 和 Python 标准库。默认参数如下：
+
+```text
+--port COM4
+--baud 115200
+--cycles 5
+--guard-timeout 2.0
+--frame-timeout 10.0
+--interval 0.2
+--tag stage11_b7_snapshot_cycle
+```
+
+脚本在打开串口前设置 `rtscts=False`、`dsrdtr=False`、`DTR=False` 和 `RTS=False`，打开后打印串口、波特率、循环次数以及 DTR/RTS 状态。
+
+每轮测试顺序：
+
+1. 发送 `SNAPSHOT PREPARE`，确认响应包含 `DCMI stop OK`。
+2. 发送文本 `DUMP`，确认响应为 `DUMP blocked: snapshot software guard active.`，且未进入 OV56RGB5 发送流程。
+3. 发送一帧合法 14 字节二进制图像请求；guard 状态下没有收到合法 OV56RGB5 图像帧即为 PASS，0 B 或超时均属于预期。
+4. 发送 `SNAPSHOT RESTORE`，确认响应包含 `SNAPSHOT RESTORE` 和 `RESTORE_DEFERRED`。
+5. 再次发送二进制图像请求；此时必须收到完整 38426 B OV56RGB5 帧，并通过版本、像素格式、160×120 尺寸、38400 B payload 和 payload CRC32 校验。
+6. 记录恢复帧的 `frame_id` 和耗时，然后等待 `interval` 秒进入下一轮。
+
+单项失败时脚本打印失败原因、写入该轮 CSV 记录，并默认继续后续步骤和下一轮；只有串口打开失败时直接结束。
+
+### 4. 测试统计与输出
+
+脚本统计以下结果：
+
+- `cycle_total`
+- `prepare_ok_count`
+- `text_dump_block_ok_count`
+- `binary_block_ok_count`
+- `restore_command_ok_count`
+- `restore_binary_ok_count`
+- `fail_count`
+- `first_frame_id`
+- `last_frame_id`
+- `frame_id_continuous`
+- `avg_restore_binary_time_ms`
+- `min_restore_binary_time_ms`
+- `max_restore_binary_time_ms`
+
+脚本自动创建 `captures` 目录并输出：
+
+```text
+captures/snapshot_cycle_<tag>_<timestamp>.csv
+captures/snapshot_cycle_<tag>_<timestamp>_summary.txt
+```
+
+CSV 保存每轮五项结果、frame_id、RESTORE 后二进制请求耗时和错误原因。summary 保存测试参数、全部统计、frame_id 连续性和最终 PASS/FAIL，并明确说明 guard 状态下二进制请求超时属于预期、RESTORE 后二进制请求必须 PASS。
+
+总测试仅在所有循环的 PREPARE、文本 DUMP 阻止、二进制请求阻止、RESTORE 命令和 RESTORE 后二进制请求均通过，且恢复帧 `frame_id` 连续递增、串口过程无异常中断时判定为 PASS。
+
+### 5. 后续板测计划
+
+1. 先执行 5 轮测试：
+
+   ```text
+   python tools/uart_snapshot_cycle_test.py --cycles 5 --tag stage11_b7_5cycle
+   ```
+
+2. 若 5 轮通过，再执行 20 轮测试：
+
+   ```text
+   python tools/uart_snapshot_cycle_test.py --cycles 20 --tag stage11_b7_20cycle
+   ```
+
+3. 测试完成后通过串口执行 `STATUS`，检查 IWDG、Hook、心跳、堆栈、UART RX DMA、StreamBuffer 和图像请求统计。
+4. 若 20 轮全部通过且运行保护状态正常，再进入下一阶段。
+
+本轮 Codex 只进行脚本静态编译检查，不打开串口、不执行硬件测试；循环结果由用户烧录现有固件后在开发板上验证并回填。
+
+### 6. 后续 Stage 11B-8 建议
+
+- 如果 Stage 11B-7 多轮测试稳定，结合测试结果继续梳理是否需要显式 `HAL_DCMI_Start_DMA` 恢复路径。
+- 如果现有 DUMP 路径能够持续自行恢复，则进入“释放/恢复 PC8、PC9、PC11 的软件状态设计”。
+- 如果多轮测试暴露恢复失败或 frame_id 异常，则先进行显式 DCMI Start 恢复验证，再处理冲突引脚。
+
+### 7. Stage 11B-7 板测结果
+
+#### 7.1 5 轮循环测试
+
+执行命令：
+
+```text
+python tools/uart_snapshot_cycle_test.py --cycles 5 --tag stage11_b7_5cycle
+```
+
+测试统计：
+
+```text
+cycle_total=5
+prepare_ok_count=5
+text_dump_block_ok_count=5
+binary_block_ok_count=5
+restore_command_ok_count=5
+restore_binary_ok_count=5
+fail_count=0
+first_frame_id=1
+last_frame_id=5
+frame_id_continuous=是
+avg_restore_binary_time_ms=3442.12
+min_restore_binary_time_ms=3433.17
+max_restore_binary_time_ms=3451.42
+测试结果=PASS
+```
+
+输出文件：
+
+```text
+captures\snapshot_cycle_stage11_b7_5cycle_20260805_131553.csv
+captures\snapshot_cycle_stage11_b7_5cycle_20260805_131553_summary.txt
+```
+
+#### 7.2 20 轮循环测试
+
+执行命令：
+
+```text
+python tools/uart_snapshot_cycle_test.py --cycles 20 --tag stage11_b7_20cycle
+```
+
+测试统计：
+
+```text
+cycle_total=20
+prepare_ok_count=20
+text_dump_block_ok_count=20
+binary_block_ok_count=20
+restore_command_ok_count=20
+restore_binary_ok_count=20
+fail_count=0
+first_frame_id=6
+last_frame_id=25
+frame_id_continuous=是
+avg_restore_binary_time_ms=3445.54
+min_restore_binary_time_ms=3426.49
+max_restore_binary_time_ms=3486.38
+测试结果=PASS
+```
+
+输出文件：
+
+```text
+captures\snapshot_cycle_stage11_b7_20cycle_20260805_131629.csv
+captures\snapshot_cycle_stage11_b7_20cycle_20260805_131629_summary.txt
+```
+
+#### 7.3 合计 25 轮结果
+
+5 轮和 20 轮连续测试均通过，合计完成 25 轮 `SNAPSHOT PREPARE` / `DUMP_BLOCK` / `BINARY_BLOCK` / `SNAPSHOT RESTORE` / `RESTORE_BINARY` 循环：
+
+- 25 次 `SNAPSHOT PREPARE` 均成功进入 `CAMERA_PAUSED` 和 guard 状态。
+- guard 状态下 25 次文本 DUMP 均被阻止。
+- guard 状态下 25 次二进制图像请求均未收到合法 OV56RGB5 图像帧，属于预期现象。
+- `SNAPSHOT RESTORE` 后 25 次二进制图像请求均恢复 PASS。
+- RESTORE 后 `frame_id` 从 1 到 25 连续递增。
+- 测试期间未观察到复位、FATAL 或串口异常。
+
+### 8. 最终 STATUS 关键字段
+
+`RTOS`：
+
+```text
+dump_request_count=75
+dump_success_count=25
+dump_error_count=50
+binary_request_count=50
+binary_request_success_count=25
+binary_request_error_count=0
+binary_request_crc_error_count=0
+binary_request_version_error_count=0
+binary_request_type_error_count=0
+binary_request_length_error_count=0
+binary_request_eof_error_count=0
+binary_request_timeout_count=0
+last_binary_request_seq=40
+last_binary_error_code=0
+last_error_code=8
+```
+
+统计解释：
+
+- `dump_request_count=75` 是预期结果，对应每轮 1 次 guard 文本 DUMP、1 次 guard binary 请求和 1 次 RESTORE 后 binary 请求。
+- `dump_success_count=25` 是预期结果，对应 RESTORE 后 25 次 binary 图像导出成功。
+- `dump_error_count=50` 是预期结果，对应 25 次 guard 文本 DUMP 阻止和 25 次 guard binary 阻止。
+- `binary_request_count=50` 是预期结果，对应 25 次 guard binary 请求和 25 次 RESTORE 后 binary 请求。
+- `binary_request_success_count=25` 是预期结果，对应 RESTORE 后 25 次 binary 请求成功。
+- `binary_request_error_count=0` 是正确结果，因为 guard 状态下二进制请求格式正确，只是被 snapshot guard 拦截，不属于协议错误。
+- `last_error_code=8` 对应 snapshot guard active 类错误，属于 guard 阻止路径的预期记录。
+
+`HEALTH`：
+
+```text
+camera_service_stack_min_free_bytes=7648
+monitor_stack_min_free_bytes=1864
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+`HOOK`：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+`HEARTBEAT`：
+
+```text
+camera_service_heartbeat_age_ms=5
+monitor_heartbeat_age_ms=504
+```
+
+`IWDG`：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=1402
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_test_mode=0
+```
+
+`UART RX DMA`：
+
+```text
+uart_dma_event_count=152
+uart_dma_rx_bytes=1683
+stream_buffer_write_bytes=1683
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+### 9. Stage 11B-7 板测结论与适用边界
+
+Stage 11B-7 验证通过。新增 `uart_snapshot_cycle_test.py` 后，5 轮和 20 轮多轮 Stop/Restore 循环测试均 PASS。合计 25 轮测试中，`SNAPSHOT PREPARE`、guard 文本 DUMP 阻止、guard binary 阻止、`SNAPSHOT RESTORE`、RESTORE 后 binary 图像恢复均正常；RESTORE 后 `frame_id` 从 1 到 25 连续递增。
+
+最终 STATUS 显示 IWDG 未跳过喂狗、Hook 未触发，UART RX DMA 无错误、无溢出、无恢复、无重同步，说明多轮 `HAL_DCMI_Stop` + guard + RESTORE 软件流程稳定。
+
+需要严谨说明：当前多轮测试说明 `HAL_DCMI_Stop` 在本工程中可反复安全执行，且 RESTORE 清除 guard 后图像请求可以恢复。但是本阶段仍未切换 PC8、PC9、PC11，也未初始化 SDIO 或 FATFS，因此该结果不能证明 SDIO 接管后的相机恢复一定可靠。
+
+### 10. 后续 Stage 11B-8 建议
+
+Stage 11B-8 建议进入“冲突引脚释放/恢复的软件状态设计与安全检查”，仍先不真正切换 PC8、PC9、PC11：
+
+- 明确 DCMI 停止并进入 `CAMERA_PAUSED` 后，允许 `SD TAKEOVER ENTER` 的前置条件。
+- 明确接管和恢复过程完成前禁止 DUMP 与二进制图像请求的条件。
+- 明确任何接管异常路径都必须进入可执行 RESTORE 的安全状态。
+- 先设计状态关联、顺序检查、错误码和回滚边界，再进入真实 GPIO 复用切换。
