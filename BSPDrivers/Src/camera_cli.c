@@ -675,6 +675,46 @@ static void Camera_CLI_PrintSdTakeoverFields(
         huart,
         "last_conflict_pin_operation_ms",
         status->last_conflict_pin_operation_ms);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_af12_switch_attempt_count",
+        status->sdio_af12_switch_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_af12_switch_success_count",
+        status->sdio_af12_switch_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_af12_switch_error_count",
+        status->sdio_af12_switch_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_af12_restore_attempt_count",
+        status->sdio_af12_restore_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_af12_restore_success_count",
+        status->sdio_af12_restore_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_af12_restore_error_count",
+        status->sdio_af12_restore_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_af12_selected",
+        status->sdio_af12_selected);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_sdio_af12_error_code",
+        status->last_sdio_af12_error_code);
+    Camera_CLI_WriteText(huart, "  last_sdio_af12_error_text=");
+    Camera_CLI_WriteLine(
+        huart,
+        Camera_SDStorage_ErrorToString(status->last_sdio_af12_error_code));
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_sdio_af12_operation_ms",
+        status->last_sdio_af12_operation_ms);
 }
 
 /* 输出完整 SD 卡软件状态，不访问 SDIO 或 FATFS。 */
@@ -711,7 +751,7 @@ static void Camera_CLI_PrintSdTakeoverStatus(UART_HandleTypeDef *huart)
     Camera_CLI_PrintSdTakeoverFields(huart, &status);
 }
 
-/* 处理 SD 命令；初始化和接管请求当前都只记录软件状态。 */
+/* 处理 SD 命令；接管命令只切换冲突 GPIO，不初始化 SDIO 或 FATFS。 */
 static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
                                              const char *arg,
                                              uint32_t arg_len)
@@ -764,13 +804,19 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
         {
             Camera_CLI_WriteLine(
                 huart,
-                "SD TAKEOVER ENTER: conflict pins released, GPIO switch to SDIO is not implemented yet.");
+                "SD TAKEOVER ENTER: conflict pins switched to SDIO AF12, SD init is not implemented yet.");
         }
         else if (result == CAMERA_SD_ERR_CONFLICT_PIN_RELEASE_FAILED)
         {
             Camera_CLI_WriteLine(
                 huart,
                 "SD TAKEOVER ENTER: conflict pin release failed.");
+        }
+        else if (result == CAMERA_SD_ERR_SDIO_AF12_SWITCH_FAILED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD TAKEOVER ENTER: SDIO AF12 switch failed.");
         }
         else
         {
@@ -790,7 +836,13 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
         {
             Camera_CLI_WriteLine(
                 huart,
-                "SD TAKEOVER EXIT: conflict pins restored to DCMI AF13, SDIO restore is not implemented yet.");
+                "SD TAKEOVER EXIT: conflict pins restored to DCMI AF13 from SDIO AF12.");
+        }
+        else if (result == CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD TAKEOVER EXIT: SDIO AF12 restore failed.");
         }
         else if (result == CAMERA_SD_ERR_CONFLICT_PIN_RESTORE_FAILED)
         {

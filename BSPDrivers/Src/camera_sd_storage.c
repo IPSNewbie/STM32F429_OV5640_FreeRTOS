@@ -6,9 +6,10 @@
 #include <stddef.h>
 
 /*
- * Stage 11B-9 在前置检查通过后释放 PC8、PC9、PC11，并在 EXIT 时恢复 AF13。
+ * Stage 11B-11 在前置检查通过后释放 PC8、PC9、PC11，再切换到 SDIO AF12，
+ * 并在 EXIT 时先退回 GPIO 输入态，再恢复 DCMI AF13。
  * PC8、PC9、PC11 同时被 DCMI 和 SDIO 使用，后续必须先停止 DCMI 和相关 DMA，
- * 再进入 SDIO 接管流程；本文件不配置 AF12，也不初始化 SDIO 或 FATFS。
+ * 再进入 SDIO 接管流程；本文件只验证复用切换，不初始化 SDIO 或 FATFS。
  */
 static CameraSdStorageStatus_t s_camera_sd_status;
 
@@ -20,8 +21,12 @@ static CameraSdStorageStatus_t s_camera_sd_status;
     ((2UL << (8U * 2U)) | (2UL << (9U * 2U)) | (2UL << (11U * 2U)))
 #define CAMERA_SD_CONFLICT_SPEED_VERY_HIGH \
     CAMERA_SD_CONFLICT_MODE_MASK
+#define CAMERA_SD_CONFLICT_PULLUP \
+    ((1UL << (8U * 2U)) | (1UL << (9U * 2U)) | (1UL << (11U * 2U)))
 #define CAMERA_SD_CONFLICT_AFRH_MASK \
     ((0xFUL << 0U) | (0xFUL << 4U) | (0xFUL << 12U))
+#define CAMERA_SD_CONFLICT_AFRH_AF12 \
+    ((12UL << 0U) | (12UL << 4U) | (12UL << 12U))
 #define CAMERA_SD_CONFLICT_AFRH_AF13 \
     ((13UL << 0U) | (13UL << 4U) | (13UL << 12U))
 
@@ -55,6 +60,87 @@ static uint32_t Camera_SDStorage_ReleaseConflictPins(void)
     s_camera_sd_status.conflict_pins_released = 1U;
     s_camera_sd_status.last_conflict_pin_error_code = CAMERA_SD_OK;
     s_camera_sd_status.last_conflict_pin_operation_ms =
+        HAL_GetTick() - start_ms;
+    return CAMERA_SD_OK;
+}
+
+static uint32_t Camera_SDStorage_SwitchConflictPinsToSdioAf12(void)
+{
+    uint32_t start_ms = HAL_GetTick();
+    GPIO_InitTypeDef gpio = {0};
+
+    ++s_camera_sd_status.sdio_af12_switch_attempt_count;
+
+    /* 只将 PC8、PC9、PC11 切换为 SDIO AF12，不处理 PC10、PC12、PD2。 */
+    gpio.Pin = CAMERA_SD_CONFLICT_PIN_MASK;
+    gpio.Mode = GPIO_MODE_AF_PP;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio.Alternate = GPIO_AF12_SDIO;
+    HAL_GPIO_Init(GPIOC, &gpio);
+
+    /* 进入复用态后已不再是 GPIO 输入释放态。 */
+    s_camera_sd_status.conflict_pins_released = 0U;
+
+    if (((GPIOC->MODER & CAMERA_SD_CONFLICT_MODE_MASK) !=
+         CAMERA_SD_CONFLICT_AF_MODE) ||
+        ((GPIOC->PUPDR & CAMERA_SD_CONFLICT_MODE_MASK) !=
+         CAMERA_SD_CONFLICT_PULLUP) ||
+        ((GPIOC->OSPEEDR & CAMERA_SD_CONFLICT_MODE_MASK) !=
+         CAMERA_SD_CONFLICT_SPEED_VERY_HIGH) ||
+        ((GPIOC->OTYPER & CAMERA_SD_CONFLICT_PIN_MASK) != 0U) ||
+        ((GPIOC->AFR[1] & CAMERA_SD_CONFLICT_AFRH_MASK) !=
+         CAMERA_SD_CONFLICT_AFRH_AF12))
+    {
+        ++s_camera_sd_status.sdio_af12_switch_error_count;
+        s_camera_sd_status.sdio_af12_selected = 0U;
+        s_camera_sd_status.last_sdio_af12_error_code =
+            CAMERA_SD_ERR_SDIO_AF12_SWITCH_FAILED;
+        s_camera_sd_status.last_sdio_af12_operation_ms =
+            HAL_GetTick() - start_ms;
+        return CAMERA_SD_ERR_SDIO_AF12_SWITCH_FAILED;
+    }
+
+    ++s_camera_sd_status.sdio_af12_switch_success_count;
+    s_camera_sd_status.sdio_af12_selected = 1U;
+    s_camera_sd_status.last_sdio_af12_error_code = CAMERA_SD_OK;
+    s_camera_sd_status.last_sdio_af12_operation_ms =
+        HAL_GetTick() - start_ms;
+    return CAMERA_SD_OK;
+}
+
+static uint32_t Camera_SDStorage_LeaveSdioAf12ToInput(void)
+{
+    uint32_t start_ms = HAL_GetTick();
+    GPIO_InitTypeDef gpio = {0};
+
+    ++s_camera_sd_status.sdio_af12_restore_attempt_count;
+
+    /* 只将 PC8、PC9、PC11 从 SDIO AF12 退回无上下拉的 GPIO 输入态。 */
+    gpio.Pin = CAMERA_SD_CONFLICT_PIN_MASK;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &gpio);
+
+    if (((GPIOC->MODER & CAMERA_SD_CONFLICT_MODE_MASK) != 0U) ||
+        ((GPIOC->PUPDR & CAMERA_SD_CONFLICT_MODE_MASK) != 0U))
+    {
+        ++s_camera_sd_status.sdio_af12_restore_error_count;
+        s_camera_sd_status.sdio_af12_selected = 0U;
+        s_camera_sd_status.conflict_pins_released = 0U;
+        s_camera_sd_status.last_sdio_af12_error_code =
+            CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED;
+        s_camera_sd_status.last_sdio_af12_operation_ms =
+            HAL_GetTick() - start_ms;
+        return CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED;
+    }
+
+    ++s_camera_sd_status.sdio_af12_restore_success_count;
+    s_camera_sd_status.sdio_af12_selected = 0U;
+    s_camera_sd_status.conflict_pins_released = 1U;
+    s_camera_sd_status.last_sdio_af12_error_code = CAMERA_SD_OK;
+    s_camera_sd_status.last_sdio_af12_operation_ms =
         HAL_GetTick() - start_ms;
     return CAMERA_SD_OK;
 }
@@ -136,6 +222,15 @@ void Camera_SDStorage_InitState(void)
     s_camera_sd_status.conflict_pins_released = 0U;
     s_camera_sd_status.last_conflict_pin_error_code = CAMERA_SD_OK;
     s_camera_sd_status.last_conflict_pin_operation_ms = 0U;
+    s_camera_sd_status.sdio_af12_switch_attempt_count = 0U;
+    s_camera_sd_status.sdio_af12_switch_success_count = 0U;
+    s_camera_sd_status.sdio_af12_switch_error_count = 0U;
+    s_camera_sd_status.sdio_af12_restore_attempt_count = 0U;
+    s_camera_sd_status.sdio_af12_restore_success_count = 0U;
+    s_camera_sd_status.sdio_af12_restore_error_count = 0U;
+    s_camera_sd_status.sdio_af12_selected = 0U;
+    s_camera_sd_status.last_sdio_af12_error_code = CAMERA_SD_OK;
+    s_camera_sd_status.last_sdio_af12_operation_ms = 0U;
 }
 
 void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status)
@@ -175,6 +270,8 @@ uint32_t Camera_SDStorage_RequestTakeoverEnter(void)
         ++s_camera_sd_status.takeover_precheck_fail_count;
         s_camera_sd_status.snapshot_pause_confirmed = 0U;
         s_camera_sd_status.conflict_pin_release_ready = 0U;
+        s_camera_sd_status.conflict_pins_released = 0U;
+        s_camera_sd_status.sdio_af12_selected = 0U;
         /* 前置条件失败时保持 IDLE，避免误认为接管流程已经开始。 */
         s_camera_sd_status.takeover_state = CAMERA_SD_TAKEOVER_STATE_IDLE;
         s_camera_sd_status.last_takeover_error_code =
@@ -195,17 +292,36 @@ uint32_t Camera_SDStorage_RequestTakeoverEnter(void)
         pin_result = Camera_SDStorage_ReleaseConflictPins();
         if (pin_result == CAMERA_SD_OK)
         {
-            /* 冲突引脚已释放，但本阶段仍不配置 SDIO AF12。 */
-            s_camera_sd_status.takeover_state =
-                CAMERA_SD_TAKEOVER_STATE_ENTER_DEFERRED;
-            s_camera_sd_status.last_takeover_error_code =
-                CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
-            result = CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
+            uint32_t af12_result;
+
+            af12_result = Camera_SDStorage_SwitchConflictPinsToSdioAf12();
+            if (af12_result == CAMERA_SD_OK)
+            {
+                /* 已完成 GPIO 复用切换，但 SDIO 外设初始化仍未实现。 */
+                s_camera_sd_status.takeover_state =
+                    CAMERA_SD_TAKEOVER_STATE_ENTER_DEFERRED;
+                s_camera_sd_status.last_conflict_pin_error_code = CAMERA_SD_OK;
+                s_camera_sd_status.last_sdio_af12_error_code = CAMERA_SD_OK;
+                s_camera_sd_status.last_takeover_error_code =
+                    CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
+                result = CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
+            }
+            else
+            {
+                ++s_camera_sd_status.takeover_error_count;
+                s_camera_sd_status.sdio_af12_selected = 0U;
+                s_camera_sd_status.takeover_state =
+                    CAMERA_SD_TAKEOVER_STATE_ERROR;
+                s_camera_sd_status.last_takeover_error_code =
+                    CAMERA_SD_ERR_SDIO_AF12_SWITCH_FAILED;
+                result = CAMERA_SD_ERR_SDIO_AF12_SWITCH_FAILED;
+            }
         }
         else
         {
             ++s_camera_sd_status.takeover_error_count;
             s_camera_sd_status.conflict_pin_release_ready = 0U;
+            s_camera_sd_status.sdio_af12_selected = 0U;
             s_camera_sd_status.takeover_state =
                 CAMERA_SD_TAKEOVER_STATE_ERROR;
             s_camera_sd_status.last_takeover_error_code =
@@ -226,14 +342,35 @@ uint32_t Camera_SDStorage_RequestTakeoverExit(void)
     uint32_t result;
 
     ++s_camera_sd_status.takeover_exit_attempt_count;
-    pin_result = Camera_SDStorage_RestoreConflictPins();
     s_camera_sd_status.conflict_pin_release_ready = 0U;
+
+    if (s_camera_sd_status.sdio_af12_selected != 0U)
+    {
+        uint32_t af12_result = Camera_SDStorage_LeaveSdioAf12ToInput();
+
+        if (af12_result != CAMERA_SD_OK)
+        {
+            ++s_camera_sd_status.takeover_error_count;
+            s_camera_sd_status.takeover_state = CAMERA_SD_TAKEOVER_STATE_ERROR;
+            s_camera_sd_status.last_takeover_error_code =
+                CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED;
+            s_camera_sd_status.last_takeover_operation_ms =
+                HAL_GetTick() - start_ms;
+            return CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED;
+        }
+    }
+
+    pin_result = Camera_SDStorage_RestoreConflictPins();
 
     if (pin_result == CAMERA_SD_OK)
     {
+        s_camera_sd_status.conflict_pins_released = 0U;
+        s_camera_sd_status.sdio_af12_selected = 0U;
         s_camera_sd_status.snapshot_pause_confirmed = 0U;
         s_camera_sd_status.takeover_state =
             CAMERA_SD_TAKEOVER_STATE_EXIT_DEFERRED;
+        s_camera_sd_status.last_conflict_pin_error_code = CAMERA_SD_OK;
+        s_camera_sd_status.last_sdio_af12_error_code = CAMERA_SD_OK;
         s_camera_sd_status.last_takeover_error_code =
             CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
         result = CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
@@ -297,6 +434,12 @@ const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
 
         case CAMERA_SD_ERR_CONFLICT_PIN_NOT_RELEASED:
             return "CONFLICT_PIN_NOT_RELEASED";
+
+        case CAMERA_SD_ERR_SDIO_AF12_SWITCH_FAILED:
+            return "SDIO_AF12_SWITCH_FAILED";
+
+        case CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED:
+            return "SDIO_AF12_RESTORE_FAILED";
 
         default:
             return "UNKNOWN_ERROR";

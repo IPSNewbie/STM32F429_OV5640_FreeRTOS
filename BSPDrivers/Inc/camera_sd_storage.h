@@ -18,6 +18,8 @@
 #define CAMERA_SD_ERR_CONFLICT_PIN_RELEASE_FAILED 11U
 #define CAMERA_SD_ERR_CONFLICT_PIN_RESTORE_FAILED 12U
 #define CAMERA_SD_ERR_CONFLICT_PIN_NOT_RELEASED   13U
+#define CAMERA_SD_ERR_SDIO_AF12_SWITCH_FAILED     14U
+#define CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED    15U
 
 /* SDIO 接管状态。Stage 11B-2 只会进入请求延后状态，不会进入 ACTIVE。 */
 #define CAMERA_SD_TAKEOVER_STATE_IDLE             0U
@@ -63,6 +65,15 @@ typedef struct
     uint32_t conflict_pins_released;             /* 三个冲突引脚当前是否处于释放状态。 */
     uint32_t last_conflict_pin_error_code;       /* 最近一次冲突引脚操作错误码。 */
     uint32_t last_conflict_pin_operation_ms;     /* 最近一次冲突引脚操作耗时。 */
+    uint32_t sdio_af12_switch_attempt_count;     /* 尝试切换 PC8、PC9、PC11 到 SDIO AF12 的次数。 */
+    uint32_t sdio_af12_switch_success_count;     /* SDIO AF12 切换成功次数。 */
+    uint32_t sdio_af12_switch_error_count;       /* SDIO AF12 切换失败次数。 */
+    uint32_t sdio_af12_restore_attempt_count;    /* 尝试从 SDIO AF12 退回输入态的次数。 */
+    uint32_t sdio_af12_restore_success_count;    /* 从 SDIO AF12 退回输入态成功次数。 */
+    uint32_t sdio_af12_restore_error_count;      /* 从 SDIO AF12 退回输入态失败次数。 */
+    uint32_t sdio_af12_selected;                 /* 三个冲突引脚当前是否处于 SDIO AF12。 */
+    uint32_t last_sdio_af12_error_code;          /* 最近一次 SDIO AF12 切换或退出错误码。 */
+    uint32_t last_sdio_af12_operation_ms;        /* 最近一次 SDIO AF12 切换或退出耗时。 */
 } CameraSdStorageStatus_t;
 
 /* 初始化纯软件状态，不访问 SDIO、GPIO 或文件系统。 */
@@ -74,10 +85,10 @@ void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status);
 /* 记录一次初始化请求；当前返回 NEED_TAKEOVER，不执行真实初始化。 */
 uint32_t Camera_SDStorage_RequestInit(void);
 
-/* 前置检查通过后释放冲突引脚；本阶段不配置 SDIO 复用。 */
+/* 前置检查通过后释放冲突引脚，并切换到 SDIO AF12；不初始化 SDIO。 */
 uint32_t Camera_SDStorage_RequestTakeoverEnter(void);
 
-/* 将冲突引脚恢复为 DCMI AF13；本阶段不重启 DCMI。 */
+/* 先退出 SDIO AF12，再将冲突引脚恢复为 DCMI AF13；不重启 DCMI。 */
 uint32_t Camera_SDStorage_RequestTakeoverExit(void);
 
 /* 将 SD 卡模块返回码转换为 CLI 可读文本。 */

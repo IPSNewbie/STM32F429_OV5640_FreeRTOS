@@ -2936,3 +2936,482 @@ DCMI AF13 -> GPIO 输入态 -> SDIO AF12 -> GPIO 输入态 -> DCMI AF13
 ```
 
 Stage 11B-11 仍不调用 `HAL_SD_Init`，不接入 FATFS，不读写 SD 卡；应先验证纯 GPIO 复用闭环和 RESTORE 后图像恢复，再考虑真实 SD 卡初始化。
+
+## Stage 11B-11 SDIO AF12切换但不初始化SD卡
+
+### 1. 本轮目的
+
+- `SNAPSHOT PREPARE` 后，`SD TAKEOVER ENTER` 先将 PC8、PC9、PC11 从 DCMI AF13 释放为 GPIO 输入态，再切换为 `GPIO_AF12_SDIO`。
+- `SD TAKEOVER EXIT` 先将 PC8、PC9、PC11 从 SDIO AF12 退回 GPIO 输入态，再恢复为 DCMI AF13。
+- 验证在不初始化 SDIO/FATFS 的情况下，以下纯 GPIO 复用闭环不会破坏 RESTORE 后的图像导出：
+
+  ```text
+  DCMI AF13 -> GPIO 输入态 -> SDIO AF12 -> GPIO 输入态 -> DCMI AF13
+  ```
+
+`conflict_pins_released` 仅表示三个冲突引脚当前处于 GPIO 输入释放态。切换到 SDIO AF12 后该字段为 0，并由 `sdio_af12_selected=1` 表示当前复用状态。
+
+### 2. 本轮不做
+
+- 不调用 `HAL_SD_Init`、`HAL_SD_ConfigWideBusOperation`、`HAL_SD_ReadBlocks` 或 `HAL_SD_WriteBlocks`。
+- 不读写 SD 卡，不接入 FATFS。
+- 不配置 PC10、PC12、PD2，不形成完整 SDIO 总线。
+- 不调用 `HAL_DCMI_Start_DMA`，不调用 `HAL_DMA_Abort` 或 `HAL_DMA_DeInit`。
+- 不重新初始化 OV5640，不重新初始化 DCMI 外设。
+- 不修改 UART DMA、二进制请求帧格式、OV56RGB5 图像帧格式、IWDG、FreeRTOS 任务优先级或任务栈大小。
+
+### 3. 新增状态字段
+
+- `sdio_af12_switch_attempt_count`：尝试将 PC8、PC9、PC11 切换到 SDIO AF12 的次数。
+- `sdio_af12_switch_success_count`：SDIO AF12 切换成功次数。
+- `sdio_af12_switch_error_count`：SDIO AF12 切换失败次数。
+- `sdio_af12_restore_attempt_count`：尝试从 SDIO AF12 退回 GPIO 输入态的次数。
+- `sdio_af12_restore_success_count`：从 SDIO AF12 退回 GPIO 输入态成功次数。
+- `sdio_af12_restore_error_count`：从 SDIO AF12 退回 GPIO 输入态失败次数。
+- `sdio_af12_selected`：PC8、PC9、PC11 当前是否处于 SDIO AF12 复用状态。
+- `last_sdio_af12_error_code`：最近一次 SDIO AF12 切换或退出错误码。
+- `last_sdio_af12_operation_ms`：最近一次 SDIO AF12 切换或退出的实际处理耗时，按出口 tick 减入口 tick 记录。
+
+`SD STATUS` 和 `SD TAKEOVER STATUS` 同时输出以上字段，并补充 `last_sdio_af12_error_text` 文本字段。新增错误码为 `SDIO_AF12_SWITCH_FAILED` 和 `SDIO_AF12_RESTORE_FAILED`。
+
+### 4. 预期命令行为
+
+- 未执行 `SNAPSHOT PREPARE` 时，`SD TAKEOVER ENTER` 保持被阻止，不释放冲突引脚，也不切换 SDIO AF12。
+- `SNAPSHOT PREPARE` 后，`SD TAKEOVER ENTER` 释放 PC8、PC9、PC11 并使用推挽复用、上拉、超高速和 AF12 配置切换到 SDIO 引脚状态。
+- AF12 切换成功后进入 `ENTER_DEFERRED`，返回 `TAKEOVER_NOT_IMPLEMENTED`；该返回值表示 SDIO 外设、SD 卡和 FATFS 尚未初始化，并非 GPIO 切换失败。
+- `SD TAKEOVER EXIT` 在 `sdio_af12_selected=1` 时先退回 GPIO 输入态，再调用既有恢复流程配置为 DCMI AF13；未处于 AF12 时仍允许直接恢复 DCMI AF13。
+- EXIT 成功后 `conflict_pins_released=0`、`sdio_af12_selected=0`，状态进入 `EXIT_DEFERRED`，仍返回 `TAKEOVER_NOT_IMPLEMENTED`。
+- `SNAPSHOT RESTORE` 后，`basic`、`pc_dump`、`repeat` 应恢复正常。
+- `SD INIT` 仍保持 `NEED_TAKEOVER`，即使三个冲突引脚已切换到 AF12，也不会继续执行 SDIO 初始化。
+
+### 5. 风险说明
+
+- 本轮开始真实配置 `GPIO_AF12_SDIO`，但没有初始化 SDIO 外设，因此不会真正访问 SD 卡。
+- 本轮只处理 PC8、PC9、PC11，没有处理 PC10、PC12、PD2，SDIO 数据、时钟和命令线并不完整。
+- OV5640 传感器本身可能仍在输出 DVP 数据，本轮仍未处理传感器 PWDN 或寄存器停流。
+- GPIO 配置完成后通过 GPIOC 的 MODER、PUPDR、OSPEEDR、OTYPER 和 AFR[1] 做最小回读验证；回读失败时进入 ERROR，不继续任何 SDIO 初始化。
+- 后续真实初始化 SDIO 前，仍需谨慎处理全部 SDIO 引脚、初始化阶段不超过 400 kHz 的时钟、CMD 线和总线状态。
+
+### 6. 板测计划
+
+1. 确认启动正常，无 FATAL、反复复位或 IWDG 复位循环。
+2. 未执行 `SNAPSHOT PREPARE` 时运行 `SD TAKEOVER ENTER`，确认返回 blocked 且 AF12 切换计数不增加。
+3. 执行 `SNAPSHOT PREPARE`，确认相机暂停且软件 guard 生效。
+4. 执行 `SD TAKEOVER ENTER`，确认 PC8、PC9、PC11 切换到 SDIO AF12，`sdio_af12_selected=1`。
+5. 确认 guard 状态下文本 DUMP 和 binary 请求均被阻止。
+6. 执行 `SD TAKEOVER EXIT`，确认先退出 AF12，再恢复 DCMI AF13，`sdio_af12_selected=0`。
+7. 执行 `SNAPSHOT RESTORE`，确认 guard 清除。
+8. 执行 `SD INIT`，确认仍返回 `NEED_TAKEOVER`。
+9. 执行 `basic`、`pc_dump` 和 `repeat 20`，确认图像导出恢复且 frame_id 连续。
+10. 检查 STATUS 中 IWDG、Hook、UART RX DMA、堆栈和协议统计均正常。
+
+本轮 Codex 不执行硬件测试；烧录、串口命令和图像回归由用户在开发板上完成。
+
+### 7. 后续 Stage 11B-12 建议
+
+- 如果本轮单次切换验证通过，下一步执行多轮 SDIO AF12 切换循环稳定性验证。
+- Stage 11B-12 仍不调用 `HAL_SD_Init`，仍不接入 FATFS，不读写 SD 卡。
+- 重点验证多次 `DCMI AF13 -> GPIO 输入态 -> SDIO AF12 -> GPIO 输入态 -> DCMI AF13` 后，RESTORE 图像链路、IWDG、Hook 和 UART RX DMA 是否持续稳定。
+
+### 8. Stage 11B-11 板测结果
+
+#### 8.1 启动情况
+
+- 启动正常。
+- `reset: iwdg=0`。
+- `OV5640 ID = 0x5640`。
+- `Camera init OK`。
+- 无 FATAL。
+- 无反复复位。
+- 无 IWDG 复位循环。
+
+#### 8.2 未执行 SNAPSHOT PREPARE 时的前置条件保护
+
+直接执行 `SD TAKEOVER ENTER`，输出：
+
+```text
+SD TAKEOVER ENTER: blocked, run SNAPSHOT PREPARE first.
+```
+
+`SD TAKEOVER STATUS` 结果：
+
+```text
+takeover_state=0
+takeover_state_text=IDLE
+takeover_enter_attempt_count=1
+takeover_precheck_attempt_count=1
+takeover_precheck_success_count=0
+takeover_precheck_fail_count=1
+snapshot_pause_confirmed=0
+conflict_pin_release_ready=0
+conflict_pins_released=0
+sdio_af12_switch_attempt_count=0
+sdio_af12_selected=0
+last_takeover_error_code=9
+last_takeover_error_text=SNAPSHOT_NOT_PAUSED
+last_takeover_precheck_error_code=9
+last_takeover_precheck_error_text=SNAPSHOT_NOT_PAUSED
+```
+
+结果符合预期：未执行 `SNAPSHOT PREPARE` 时，`SD TAKEOVER ENTER` 被正确阻止；PC8、PC9、PC11 没有被释放，也没有切换到 SDIO AF12。
+
+#### 8.3 SNAPSHOT PREPARE
+
+执行 `SNAPSHOT PREPARE`，输出：
+
+```text
+SNAPSHOT PREPARE: DCMI stop OK, snapshot software guard active.
+```
+
+状态结果：
+
+```text
+camera_control_state=2
+camera_control_state_text=CAMERA_PAUSED
+prepare_attempt_count=1
+prepare_success_count=1
+real_dcmi_stop_enabled=1
+dcmi_stop_attempt_count=1
+dcmi_stop_success_count=1
+dcmi_stop_error_count=0
+last_dcmi_stop_hal_status=0
+software_guard_active=1
+dump_block_required=1
+last_error_code=0
+last_error_text=OK
+```
+
+`HAL_DCMI_Stop` 成功，相机控制状态进入 `CAMERA_PAUSED`，软件 guard 和 DUMP 阻止条件均已生效。
+
+#### 8.4 PREPARE 后切换 PC8、PC9、PC11 到 SDIO AF12
+
+执行 `SD TAKEOVER ENTER`，输出：
+
+```text
+SD TAKEOVER ENTER: conflict pins switched to SDIO AF12, SD init is not implemented yet.
+```
+
+`SD TAKEOVER STATUS` 结果：
+
+```text
+takeover_state=1
+takeover_state_text=ENTER_DEFERRED
+takeover_enter_attempt_count=2
+takeover_precheck_attempt_count=2
+takeover_precheck_success_count=1
+takeover_precheck_fail_count=1
+snapshot_pause_confirmed=1
+conflict_pin_release_ready=1
+conflict_pin_release_attempt_count=1
+conflict_pin_release_success_count=1
+conflict_pin_release_error_count=0
+conflict_pins_released=0
+sdio_af12_switch_attempt_count=1
+sdio_af12_switch_success_count=1
+sdio_af12_switch_error_count=0
+sdio_af12_selected=1
+last_sdio_af12_error_code=0
+last_sdio_af12_error_text=OK
+last_takeover_error_code=6
+last_takeover_error_text=TAKEOVER_NOT_IMPLEMENTED
+```
+
+PC8、PC9、PC11 已先释放为 GPIO 输入态，随后成功切换为 `GPIO_AF12_SDIO`。`conflict_pins_released=0` 是合理结果，因为此时三个引脚已经不是 GPIO 输入释放态，而是 SDIO AF12 复用态；当前复用状态由 `sdio_af12_selected=1` 表示。
+
+返回 `TAKEOVER_NOT_IMPLEMENTED` 属于预期行为：本阶段只完成 GPIO 复用切换，仍未调用 `HAL_SD_Init`，也未接入 FATFS。
+
+#### 8.5 AF12 状态下的 SD INIT 边界验证
+
+在 `sdio_af12_selected=1` 时执行 `SD INIT`，输出：
+
+```text
+SD INIT: deferred, need SDIO takeover because PC8/PC9/PC11 conflict with DCMI.
+```
+
+SD 状态：
+
+```text
+is_initialized=0
+takeover_required=1
+sdio_ready=0
+fatfs_ready=0
+init_attempt_count=1
+init_success_count=0
+init_error_count=0
+last_error_code=3
+last_error_text=NEED_TAKEOVER
+takeover_state_text=ENTER_DEFERRED
+sdio_af12_selected=1
+```
+
+即使 PC8、PC9、PC11 已切换到 SDIO AF12，`SD INIT` 仍保持 `NEED_TAKEOVER`：本轮没有真实初始化 SDIO，没有接入 FATFS，没有读写 SD 卡，也没有配置 PC10、PC12、PD2。
+
+本次记录的 `last_operation_ms=57447` 仍更像系统绝对 tick，而不是本次命令处理耗时。这属于既有耗时统计问题，不影响 Stage 11B-11 的 AF12 切换验证结论，后续应单独修正。
+
+#### 8.6 guard 状态下 DUMP 和 binary 阻止验证
+
+文本 DUMP 输出：
+
+```text
+DUMP blocked: snapshot software guard active.
+```
+
+- 未发送 OV56RGB5 图像帧。
+- `dump_block_count=1`。
+- guard 状态下执行 binary basic，响应长度为 0 B，PC 端接收超时，测试结果为 FAIL。
+- 此处 FAIL 是软件 guard 生效后的预期现象。
+- `binary_block_count=1`。
+
+#### 8.7 SD TAKEOVER EXIT 恢复 DCMI AF13
+
+执行 `SD TAKEOVER EXIT`，输出：
+
+```text
+SD TAKEOVER EXIT: conflict pins restored to DCMI AF13 from SDIO AF12.
+```
+
+状态结果：
+
+```text
+takeover_state=3
+takeover_state_text=EXIT_DEFERRED
+takeover_exit_attempt_count=1
+sdio_af12_restore_attempt_count=1
+sdio_af12_restore_success_count=1
+sdio_af12_restore_error_count=0
+sdio_af12_selected=0
+conflict_pin_restore_attempt_count=1
+conflict_pin_restore_success_count=1
+conflict_pin_restore_error_count=0
+conflict_pins_released=0
+snapshot_pause_confirmed=0
+conflict_pin_release_ready=0
+last_sdio_af12_error_code=0
+last_sdio_af12_error_text=OK
+last_conflict_pin_error_code=0
+last_conflict_pin_error_text=OK
+```
+
+PC8、PC9、PC11 已从 SDIO AF12 退出，并恢复为 DCMI AF13。本轮仍未调用 `HAL_DCMI_Start_DMA`，也未重新初始化 OV5640 或 DCMI 外设。
+
+#### 8.8 SNAPSHOT RESTORE 与前置条件复位
+
+执行 `SNAPSHOT RESTORE`，输出：
+
+```text
+SNAPSHOT RESTORE: deferred, camera restore and DCMI restart are not implemented yet.
+```
+
+状态结果：
+
+```text
+camera_control_state=3
+camera_control_state_text=RESTORE_DEFERRED
+restore_attempt_count=1
+software_guard_active=0
+dump_block_required=0
+dump_block_count=1
+binary_block_count=1
+```
+
+RESTORE 后再次执行 `SD TAKEOVER ENTER`，输出：
+
+```text
+SD TAKEOVER ENTER: blocked, run SNAPSHOT PREPARE first.
+```
+
+此时状态为：
+
+```text
+takeover_state=0
+takeover_state_text=IDLE
+takeover_enter_attempt_count=3
+takeover_precheck_attempt_count=3
+takeover_precheck_success_count=1
+takeover_precheck_fail_count=2
+snapshot_pause_confirmed=0
+conflict_pin_release_ready=0
+conflict_pins_released=0
+sdio_af12_selected=0
+last_takeover_error_code=9
+last_takeover_error_text=SNAPSHOT_NOT_PAUSED
+last_takeover_precheck_error_code=9
+last_takeover_precheck_error_text=SNAPSHOT_NOT_PAUSED
+```
+
+`SNAPSHOT RESTORE` 后接管前置条件重新失效，说明 AF12 切换流程退出后，软件安全门状态已恢复正常。
+
+#### 8.9 RESTORE 后图像功能回归
+
+- 第一次 guard 状态下 binary basic 响应长度为 0 B、结果 FAIL，属于预期阻止现象。
+- RESTORE 后 basic：PASS，`frame_id=1`。
+- RESTORE 后 pc_dump：PASS，`frame_id=2`，图像质量无警告。
+- RESTORE 后 repeat：20/20 PASS。
+- repeat 的 `frame_id` 从 3 到 22 连续递增。
+- repeat 平均耗时 3466.07 ms。
+- repeat 最短耗时 3453.78 ms。
+- repeat 最长耗时 3469.20 ms。
+
+#### 8.10 最终 SD TAKEOVER STATUS
+
+```text
+takeover_state=0
+takeover_state_text=IDLE
+takeover_enter_attempt_count=3
+takeover_exit_attempt_count=1
+takeover_error_count=0
+last_takeover_error_code=9
+last_takeover_error_text=SNAPSHOT_NOT_PAUSED
+takeover_precheck_attempt_count=3
+takeover_precheck_success_count=1
+takeover_precheck_fail_count=2
+snapshot_pause_confirmed=0
+conflict_pin_release_ready=0
+conflict_pin_release_attempt_count=1
+conflict_pin_release_success_count=1
+conflict_pin_release_error_count=0
+conflict_pin_restore_attempt_count=1
+conflict_pin_restore_success_count=1
+conflict_pin_restore_error_count=0
+conflict_pins_released=0
+last_conflict_pin_error_code=0
+last_conflict_pin_error_text=OK
+sdio_af12_switch_attempt_count=1
+sdio_af12_switch_success_count=1
+sdio_af12_switch_error_count=0
+sdio_af12_restore_attempt_count=1
+sdio_af12_restore_success_count=1
+sdio_af12_restore_error_count=0
+sdio_af12_selected=0
+last_sdio_af12_error_code=0
+last_sdio_af12_error_text=OK
+```
+
+最终状态表明 AF12 切换与退出各成功一次、错误计数均为 0，三个冲突引脚最终不处于输入释放态或 SDIO AF12 状态。最终 `takeover_state=IDLE` 和 `SNAPSHOT_NOT_PAUSED` 来自 RESTORE 后再次执行 ENTER 的预期前置条件阻止。
+
+#### 8.11 最终 SNAPSHOT STATUS
+
+```text
+camera_control_state=3
+camera_control_state_text=RESTORE_DEFERRED
+prepare_attempt_count=1
+restore_attempt_count=1
+prepare_success_count=1
+restore_success_count=0
+control_error_count=0
+last_error_code=3
+last_error_text=CAMERA_RESTORE_NOT_IMPLEMENTED
+dcmi_stop_attempt_count=1
+dcmi_stop_success_count=1
+dcmi_stop_error_count=0
+last_dcmi_stop_hal_status=0
+software_guard_active=0
+dump_block_required=0
+dump_block_count=1
+binary_block_count=1
+```
+
+`restore_success_count=0` 和 `CAMERA_RESTORE_NOT_IMPLEMENTED` 符合当前阶段边界：RESTORE 负责清除软件 guard，但尚未实现 DCMI 硬件重启；现有图像请求链路在后续回归中仍可恢复工作。
+
+#### 8.12 最终 STATUS 关键字段
+
+`RTOS`：
+
+```text
+dump_request_count=24
+dump_success_count=22
+dump_error_count=2
+binary_request_count=22
+binary_request_success_count=21
+binary_request_error_count=0
+binary_request_crc_error_count=0
+binary_request_version_error_count=0
+binary_request_type_error_count=0
+binary_request_length_error_count=0
+binary_request_eof_error_count=0
+binary_request_timeout_count=0
+last_binary_request_seq=20
+last_binary_error_code=0
+last_error_code=8
+```
+
+统计解释：
+
+- `dump_error_count=2` 是预期结果，对应 guard 状态下文本 DUMP 和 binary 图像请求各被阻止一次。
+- `binary_request_error_count=0` 是正确结果，因为二进制请求帧格式正确，只是被 snapshot guard 拦截，不属于协议错误。
+- `last_error_code=8` 对应 snapshot guard active 类错误，属于本轮 guard 阻止路径的预期记录。
+
+`HEALTH`：
+
+```text
+camera_service_stack_min_free_bytes=7552
+monitor_stack_min_free_bytes=1864
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+`HOOK`：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+`HEARTBEAT`：
+
+```text
+camera_service_heartbeat_age_ms=1
+monitor_heartbeat_age_ms=620
+```
+
+`IWDG`：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=880
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_test_mode=0
+```
+
+`UART RX DMA`：
+
+```text
+uart_dma_event_count=53
+uart_dma_rx_bytes=647
+stream_buffer_write_bytes=647
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+#### 8.13 板测结论
+
+Stage 11B-11 验证通过。未执行 `SNAPSHOT PREPARE` 时，`SD TAKEOVER ENTER` 被正确阻止，且未释放冲突引脚、未切换 SDIO AF12。`SNAPSHOT PREPARE` 成功后，`SD TAKEOVER ENTER` 能将 PC8、PC9、PC11 先释放为 GPIO 输入态，再切换为 `GPIO_AF12_SDIO`，并记录 `sdio_af12_selected=1`。
+
+AF12 状态下 `SD INIT` 仍保持 `NEED_TAKEOVER`，没有初始化 SDIO 或 FATFS。`SD TAKEOVER EXIT` 能将 PC8、PC9、PC11 从 SDIO AF12 退出，并恢复为 DCMI AF13，最终记录 `sdio_af12_selected=0`。随后 `SNAPSHOT RESTORE` 清除 guard，RESTORE 后 basic、pc_dump、repeat 均恢复正常。
+
+最终 STATUS 显示 IWDG 未跳过喂狗，Hook 未触发，UART RX DMA 无错误、无溢出、无恢复、无重同步，说明本轮单次 SDIO AF12 GPIO 复用切换闭环没有破坏现有摄像头采集、DUMP、二进制请求和运行保护机制。
+
+#### 8.14 适用边界与严谨说明
+
+本轮虽然真实配置了 PC8、PC9、PC11 的 `GPIO_AF12_SDIO`，但没有配置 PC10、PC12、PD2，没有初始化 SDIO 外设，没有调用 `HAL_SD_Init`，也没有接入 FATFS 或读写 SD 卡。因此，本轮通过只能说明 MCU 侧部分 SDIO 数据线的 AF12 切换闭环可用，不能说明 SD 卡通信已经可用。
+
+#### 8.15 后续 Stage 11B-12 建议
+
+Stage 11B-12 建议新增 PC 端自动化脚本，执行多轮以下完整流程：
+
+```text
+SNAPSHOT PREPARE
+SD TAKEOVER ENTER
+SD INIT 保持 NEED_TAKEOVER
+DUMP_BLOCK
+BINARY_BLOCK
+SD TAKEOVER EXIT
+SNAPSHOT RESTORE
+RESTORE_BINARY
+```
+
+Stage 11B-12 仍不调用 `HAL_SD_Init`，不接入 FATFS；先验证多轮 SDIO AF12 切换闭环、guard 阻止路径和 RESTORE 后图像恢复的稳定性。
