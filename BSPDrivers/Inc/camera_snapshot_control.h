@@ -17,6 +17,7 @@
 #define CAMERA_SNAPSHOT_ERR_CAMERA_RESTORE_NOT_IMPLEMENTED 3U
 #define CAMERA_SNAPSHOT_ERR_INVALID_ARGUMENT            4U
 #define CAMERA_SNAPSHOT_ERR_INVALID_STATE               5U
+#define CAMERA_SNAPSHOT_ERR_DCMI_STOP_FAILED             6U
 
 /* 相机停止、冲突引脚释放和恢复流程的纯软件状态。 */
 typedef struct
@@ -28,6 +29,11 @@ typedef struct
     uint32_t control_error_count;   /* 真实控制错误次数，deferred 请求不计为错误。 */
     uint32_t last_error_code;       /* 最近一次 PREPARE 或 RESTORE 的返回码。 */
     uint32_t last_operation_ms;     /* 最近一次命令从函数入口到出口的处理耗时。 */
+    uint32_t real_dcmi_stop_enabled;    /* 是否启用真实 HAL_DCMI_Stop 验证，固定为 1。 */
+    uint32_t dcmi_stop_attempt_count;   /* HAL_DCMI_Stop 调用次数。 */
+    uint32_t dcmi_stop_success_count;   /* HAL_DCMI_Stop 返回 HAL_OK 的次数。 */
+    uint32_t dcmi_stop_error_count;     /* HAL_DCMI_Stop 返回非 HAL_OK 的次数。 */
+    uint32_t last_dcmi_stop_hal_status; /* 最近一次 HAL_DCMI_Stop 返回值。 */
 
     uint32_t camera_control_state;          /* 当前相机控制边界状态。 */
     uint32_t dcmi_stop_required;            /* 是否必须停止 DCMI，固定为 1。 */
@@ -42,13 +48,13 @@ typedef struct
     uint32_t binary_block_count;            /* 软件保护阻止二进制图像请求的次数。 */
 } CameraSnapshotControlStatus_t;
 
-/* 初始化纯软件状态，不访问 DCMI、DMA、GPIO、SDIO 或 FATFS。 */
+/* 初始化 SNAPSHOT 控制状态，不访问 DCMI、DMA、GPIO、SDIO 或 FATFS。 */
 void Camera_SnapshotControl_InitState(void);
 
 /* 将当前软件状态复制给调用者；空指针输入直接返回。 */
 void Camera_SnapshotControl_GetStatus(CameraSnapshotControlStatus_t *status);
 
-/* 记录拍照保存前的准备请求，本阶段不停止任何硬件。 */
+/* 激活软件保护并尝试通过 HAL_DCMI_Stop 停止 DCMI。 */
 uint32_t Camera_SnapshotControl_RequestPrepare(void);
 
 /* 记录拍照保存后的恢复请求，本阶段不恢复任何硬件。 */

@@ -1272,3 +1272,278 @@ Stage 11B-5 验证通过。`SNAPSHOT PREPARE` 后软件保护状态生效，文�
 最终 STATUS 显示 IWDG 未跳过喂狗、Hook 未触发，UART RX DMA 无错误、无溢出、无恢复、无重同步，说明本轮软件状态保护没有破坏现有摄像头采集、DUMP、二进制请求和运行保护机制。
 
 后续 Stage 11B-6 建议在软件保护基础上尝试真实 `HAL_DCMI_Stop`，暂时仍不切换 PC8、PC9、PC11，也不初始化 SDIO；先验证停止采集后系统不会死锁，并确认 RESTORE 后图像导出能够恢复。
+
+## Stage 11B-6 真实 HAL_DCMI_Stop 最小验证
+
+### 1. 本轮目的
+
+- 在 `SNAPSHOT PREPARE` 中先激活软件保护，再真实调用一次 `HAL_DCMI_Stop(&g_camera_dcmi)`。
+- 记录 HAL 返回状态，验证停止 DCMI 不会导致系统死机、复位或 IWDG 异常。
+- 验证软件保护状态下文本 DUMP 和二进制图像请求仍被阻止。
+- 验证 `SNAPSHOT RESTORE` 清除 guard 后，现有图像导出链路是否能够自行恢复。
+
+项目现有 DCMI 句柄为 `g_camera_dcmi`，定义在 `camera_dcmi_dma.c`，并已通过 `camera_dcmi_dma.h` 导出。本轮直接使用该公开声明，不移动句柄、不修改 Core，也不重构 DCMI 初始化代码。
+
+### 2. 本轮明确不做
+
+- 不调用 `HAL_DCMI_Start_DMA`。
+- 不直接调用 `HAL_DMA_Abort` 或 `HAL_DMA_DeInit`。
+- 不释放或切换 PC8、PC9、PC11。
+- 不初始化 SDIO，不出现 `GPIO_AF12_SDIO`。
+- 不接入 FATFS，不读写 SD 卡或图片文件。
+- 不修改 UART DMA、二进制请求帧格式、OV56RGB5 图像帧格式、IWDG、FreeRTOS 任务优先级或任务栈大小。
+
+本轮唯一新增的真实硬件动作是 `HAL_DCMI_Stop(&g_camera_dcmi)`，且只位于 `Camera_SnapshotControl_RequestPrepare()` 中。
+
+### 3. 新增状态字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `real_dcmi_stop_enabled` | 是否启用真实 `HAL_DCMI_Stop` 验证，本轮固定为 1。 |
+| `dcmi_stop_attempt_count` | `HAL_DCMI_Stop` 调用次数。 |
+| `dcmi_stop_success_count` | `HAL_DCMI_Stop` 返回 `HAL_OK` 的次数。 |
+| `dcmi_stop_error_count` | `HAL_DCMI_Stop` 返回非 `HAL_OK` 的次数。 |
+| `last_dcmi_stop_hal_status` | 最近一次 `HAL_DCMI_Stop` 的 HAL 返回值。 |
+
+上述字段追加到 `SNAPSHOT STATUS`，原有字段名以及 `software_guard_active`、`dump_block_required`、`dump_block_count`、`binary_block_count` 均保持不变。新增错误码 `CAMERA_SNAPSHOT_ERR_DCMI_STOP_FAILED`，CLI 文本为 `DCMI_STOP_FAILED`。
+
+### 4. SNAPSHOT PREPARE 状态处理
+
+执行 `SNAPSHOT PREPARE` 时先记录入口 tick、增加 `prepare_attempt_count`，并将 `software_guard_active` 和 `dump_block_required` 置 1；随后增加 `dcmi_stop_attempt_count`，调用 `HAL_DCMI_Stop(&g_camera_dcmi)` 并记录 `last_dcmi_stop_hal_status`。`last_operation_ms` 按出口 tick 减入口 tick 计算。
+
+如果返回 `HAL_OK`：
+
+- 增加 `dcmi_stop_success_count` 和 `prepare_success_count`。
+- 将 `camera_control_state` 设置为 `CAMERA_PAUSED`。
+- 将 `last_error_code` 设置为 `CAMERA_SNAPSHOT_OK` 并返回该结果。
+- CLI 输出 `SNAPSHOT PREPARE: DCMI stop OK, snapshot software guard active.`。
+
+如果返回非 `HAL_OK`：
+
+- 增加 `dcmi_stop_error_count` 和 `control_error_count`。
+- 将 `camera_control_state` 设置为 `ERROR`。这是一次已经执行但失败的真实硬件动作，因此不再使用仅表示功能延后的 `PREPARE_DEFERRED`。
+- 将 `last_error_code` 设置为 `CAMERA_SNAPSHOT_ERR_DCMI_STOP_FAILED` 并返回该结果。
+- 保持 `software_guard_active=1` 和 `dump_block_required=1`，不触发复位，也不执行恢复动作。
+- CLI 输出 `SNAPSHOT PREPARE: DCMI stop failed, snapshot software guard remains active.`。
+
+### 5. 当前 RESTORE 策略
+
+`SNAPSHOT RESTORE` 保持最小化：只增加 `restore_attempt_count`，清除 `software_guard_active` 和 `dump_block_required`，将状态设置为 `RESTORE_DEFERRED`，返回 `CAMERA_RESTORE_NOT_IMPLEMENTED`，并记录真实命令处理耗时。
+
+本轮 RESTORE 不调用 `HAL_DCMI_Start_DMA`，也不调用 `HAL_DMA_Abort`、`HAL_DMA_DeInit`，不切换 GPIO，不初始化 SDIO。RESTORE 后 basic、pc_dump、repeat 能否恢复，由板测判断。
+
+### 6. DUMP 保护策略保持
+
+- `software_guard_active=1` 时，文本 DUMP 继续被阻止并增加 `dump_block_count`。
+- `software_guard_active=1` 时，合法二进制图像请求继续被阻止并增加 `binary_block_count`；PC 端接收超时是预期现象。
+- 不修改 OV56RGB5 图像帧或二进制请求帧格式，不修改 Python 工具。
+- RESTORE 清除 guard 后，DUMP 与二进制请求重新获准进入原有处理链路。
+
+### 7. 风险说明
+
+- 如果当前项目的 DUMP 流程会为每次请求重新配置并启动 DCMI DMA，RESTORE 后图像导出可能正常恢复。
+- 如果现有流程依赖停止前的持续采集状态，RESTORE 后可能无法导出；下一阶段需要单独设计 `HAL_DCMI_Start_DMA` 恢复路径。
+- `HAL_DCMI_Stop` 返回失败时 guard 仍保持激活，避免新的 DUMP 请求进入状态不确定的采集链路。
+- 本轮不处理 GPIO 复用，不会切换 PC8、PC9、PC11，也不处理 SDIO 或 FATFS。
+
+### 8. 板测计划
+
+1. 启动后执行 `SNAPSHOT STATUS`，确认 `real_dcmi_stop_enabled=1` 且 stop 计数均为 0。
+2. guard 前执行 `basic`，确认 PASS。
+3. 执行 `SNAPSHOT PREPARE`，检查 CLI 提示和 `last_dcmi_stop_hal_status`。
+4. 确认 `dcmi_stop_attempt_count=1`。
+5. 若返回 `HAL_OK`，确认成功计数为 1、错误计数为 0、状态为 `CAMERA_PAUSED`。
+6. 若返回非 `HAL_OK`，确认成功计数为 0、错误计数为 1、错误文本为 `DCMI_STOP_FAILED`，同时系统无复位或 FATAL。
+7. guard 状态下执行文本 DUMP，确认被阻止且无 OV56RGB5 图像帧。
+8. guard 状态下执行合法二进制图像请求，确认被阻止或 PC 端超时。
+9. 执行 `SNAPSHOT RESTORE`，确认 `software_guard_active=0`、`dump_block_required=0`。
+10. RESTORE 后依次执行 basic、pc_dump、repeat 20/20，判断原有 DUMP 流程是否能自行恢复采集。
+11. 执行最终 `STATUS`，检查 IWDG、HOOK 和 UART RX DMA，无复位、Hook 故障、UART 错误或 StreamBuffer 溢出。
+
+本轮 Codex 不执行硬件测试；上述结果由用户烧录后在开发板上验证并回填。
+
+### 9. Stage 11B-6 板测结果
+
+#### 9.1 启动与初始状态
+
+系统启动正常，启动信息为 `reset: iwdg=0`；测试期间无 FATAL、无反复复位、无 IWDG 复位循环。
+
+初始 `SNAPSHOT STATUS`：
+
+```text
+camera_control_state=0
+camera_control_state_text=IDLE
+real_dcmi_stop_enabled=1
+dcmi_stop_attempt_count=0
+dcmi_stop_success_count=0
+dcmi_stop_error_count=0
+last_dcmi_stop_hal_status=0
+software_guard_active=0
+dump_block_required=0
+dump_block_count=0
+binary_block_count=0
+```
+
+激活 guard 前执行 `basic`，结果 PASS，`frame_id=1`，CRC 校验一致。
+
+#### 9.2 SNAPSHOT PREPARE 与真实 DCMI Stop 结果
+
+执行 `SNAPSHOT PREPARE` 后输出：
+
+```text
+SNAPSHOT PREPARE: DCMI stop OK, snapshot software guard active.
+```
+
+`HAL_DCMI_Stop` 返回 `HAL_OK`，状态记录如下：
+
+```text
+camera_control_state=2
+camera_control_state_text=CAMERA_PAUSED
+prepare_attempt_count=1
+prepare_success_count=1
+dcmi_stop_attempt_count=1
+dcmi_stop_success_count=1
+dcmi_stop_error_count=0
+last_dcmi_stop_hal_status=0
+last_error_code=0
+last_error_text=OK
+software_guard_active=1
+dump_block_required=1
+```
+
+结果表明真实 DCMI Stop 执行成功，系统进入 `CAMERA_PAUSED`，软件保护同时保持激活。
+
+#### 9.3 guard 状态下的请求阻止结果
+
+guard 状态下执行文本 `DUMP`：
+
+- 输出 `DUMP blocked: snapshot software guard active.`。
+- 未发送 OV56RGB5 图像帧。
+- `dump_block_count` 从 0 增加到 1。
+
+guard 状态下执行二进制 `basic`：
+
+- 响应长度为 0 B，PC 端接收超时，只收到 0/38426 B，测试结果为 FAIL。
+- 该 FAIL 是本轮软件保护生效后的预期现象。
+- `binary_block_count` 从 0 增加到 1。
+- 未增加协议解析错误。
+
+#### 9.4 SNAPSHOT RESTORE 与图像功能回归
+
+执行 `SNAPSHOT RESTORE` 后输出：
+
+```text
+SNAPSHOT RESTORE: deferred, camera restore and DCMI restart are not implemented yet.
+```
+
+RESTORE 后状态：
+
+```text
+camera_control_state=3
+camera_control_state_text=RESTORE_DEFERRED
+restore_attempt_count=1
+restore_success_count=0
+last_error_code=3
+last_error_text=CAMERA_RESTORE_NOT_IMPLEMENTED
+software_guard_active=0
+dump_block_required=0
+dump_block_count=1
+binary_block_count=1
+dcmi_stop_attempt_count=1
+dcmi_stop_success_count=1
+dcmi_stop_error_count=0
+```
+
+软件保护解除后的图像功能回归结果：
+
+- `basic`：PASS，`frame_id=2`。
+- `pc_dump`：PASS，`frame_id=3`，图像质量无警告。
+- `repeat`：20/20 PASS，`frame_id` 从 4 到 23 连续。
+- `repeat` 平均耗时 3465.81 ms，最短耗时 3449.45 ms，最长耗时 3468.23 ms。
+
+#### 9.5 最终 STATUS 关键字段
+
+`RTOS`：
+
+```text
+dump_request_count=25
+dump_success_count=23
+dump_error_count=2
+binary_request_count=23
+binary_request_success_count=22
+binary_request_error_count=0
+binary_request_crc_error_count=0
+binary_request_version_error_count=0
+binary_request_type_error_count=0
+binary_request_length_error_count=0
+binary_request_eof_error_count=0
+binary_request_timeout_count=0
+last_binary_request_seq=20
+last_binary_error_code=0
+last_error_code=8
+last_dump_time_ms=3513
+```
+
+`dump_error_count=2` 是预期结果，对应 guard 状态下文本 DUMP 和二进制图像请求各被阻止一次。`binary_request_error_count=0` 是正确结果：二进制请求帧格式正确，只是被 snapshot guard 拦截，不属于协议错误。`last_error_code=8` 对应 snapshot guard active 类错误，属于本轮预期行为。
+
+`HEALTH`：
+
+```text
+camera_service_stack_min_free_bytes=7648
+monitor_stack_min_free_bytes=1864
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+`HOOK`：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+`HEARTBEAT`：
+
+```text
+camera_service_heartbeat_age_ms=79
+monitor_heartbeat_age_ms=79
+```
+
+`IWDG`：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=924
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_test_mode=0
+```
+
+`UART RX DMA`：
+
+```text
+uart_dma_event_count=40
+uart_dma_rx_bytes=462
+stream_buffer_write_bytes=462
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+### 10. Stage 11B-6 板测结论
+
+Stage 11B-6 验证通过。`SNAPSHOT PREPARE` 中真实调用 `HAL_DCMI_Stop` 后返回 `HAL_OK`，系统进入 `CAMERA_PAUSED` 状态，软件保护状态生效；guard 状态下文本 DUMP 和二进制图像请求均被阻止，未发送 OV56RGB5 图像帧。`SNAPSHOT RESTORE` 清除 guard 后，basic、pc_dump、repeat 均恢复正常。
+
+最终 STATUS 显示 IWDG 未跳过喂狗、Hook 未触发，UART RX DMA 无错误、无溢出、无恢复、无重同步，说明本轮真实 `HAL_DCMI_Stop` 最小验证没有破坏现有系统稳定性。
+
+需要严谨说明：RESTORE 后 basic、pc_dump、repeat 能恢复，说明当前工程在 `HAL_DCMI_Stop` 后仍可恢复图像导出；但本轮并未实现显式 `HAL_DCMI_Start_DMA` 恢复路径，因此目前不能仅凭本轮结果断定具体恢复机制。后续仍需确认恢复是由现有 DUMP 路径重新启动采集，还是由现有帧缓存或其他采集机制支撑。
+
+### 11. 后续 Stage 11B-7 建议
+
+- 执行多轮 `SNAPSHOT PREPARE` / `SNAPSHOT RESTORE` 循环测试。
+- 暂时仍不切换 PC8、PC9、PC11，也不初始化 SDIO。
+- 验证多次调用 `HAL_DCMI_Stop` 后系统是否仍稳定，无死机、复位或 IWDG 异常。
+- 验证每轮 RESTORE 后 `basic` 是否都能恢复，并检查 frame_id、CRC 和耗时。
+- 根据多轮测试结果确认现有恢复机制，再决定是否需要显式 `HAL_DCMI_Start_DMA` 恢复路径。

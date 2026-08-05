@@ -242,7 +242,7 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart) // 输出当前 CLI 
     Camera_CLI_WriteLine(huart, "SD TAKEOVER ENTER - request SDIO takeover, currently deferred"); // 请求进入接管模式，本阶段只记录请求
     Camera_CLI_WriteLine(huart, "SD TAKEOVER EXIT - request leaving SDIO takeover, currently deferred"); // 请求退出接管模式，本阶段只记录请求
     Camera_CLI_WriteLine(huart, "SNAPSHOT STATUS - show snapshot camera control status"); // 查询相机控制边界软件状态
-    Camera_CLI_WriteLine(huart, "SNAPSHOT PREPARE - request camera stop boundary before SD save, currently deferred"); // 请求准备相机停止边界
+    Camera_CLI_WriteLine(huart, "SNAPSHOT PREPARE - stop DCMI before SD save and activate software guard"); // 停止 DCMI 并激活软件保护
     Camera_CLI_WriteLine(huart, "SNAPSHOT RESTORE - request camera restore boundary after SD save, currently deferred"); // 请求恢复相机采集边界
     Camera_CLI_WriteLine(huart, "IWDGTEST CAMERA_TIMEOUT - simulate camera heartbeat timeout and wait for IWDG reset"); // IWDG故障路径测试
 }
@@ -764,6 +764,26 @@ static void Camera_CLI_PrintSnapshotStatus(UART_HandleTypeDef *huart)
         status.last_operation_ms);
     Camera_CLI_WriteStatLine(
         huart,
+        "real_dcmi_stop_enabled",
+        status.real_dcmi_stop_enabled);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dcmi_stop_attempt_count",
+        status.dcmi_stop_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dcmi_stop_success_count",
+        status.dcmi_stop_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dcmi_stop_error_count",
+        status.dcmi_stop_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_dcmi_stop_hal_status",
+        status.last_dcmi_stop_hal_status);
+    Camera_CLI_WriteStatLine(
+        huart,
         "dcmi_stop_required",
         status.dcmi_stop_required);
     Camera_CLI_WriteStatLine(
@@ -804,7 +824,7 @@ static void Camera_CLI_PrintSnapshotStatus(UART_HandleTypeDef *huart)
         status.binary_block_count);
 }
 
-/* 处理 SNAPSHOT 控制边界命令；PREPARE 和 RESTORE 当前只记录 deferred 状态。 */
+/* 处理 SNAPSHOT 控制边界命令；PREPARE 停止 DCMI，RESTORE 仍不重启 DCMI。 */
 static CameraCliStatus_t Camera_CLI_HandleSnapshot(UART_HandleTypeDef *huart,
                                                    const char *arg,
                                                    uint32_t arg_len)
@@ -821,11 +841,17 @@ static CameraCliStatus_t Camera_CLI_HandleSnapshot(UART_HandleTypeDef *huart,
     {
         result = Camera_SnapshotControl_RequestPrepare();
 
-        if (result == CAMERA_SNAPSHOT_ERR_CAMERA_STOP_NOT_IMPLEMENTED)
+        if (result == CAMERA_SNAPSHOT_OK)
         {
             Camera_CLI_WriteLine(
                 huart,
-                "SNAPSHOT PREPARE: deferred, DCMI stop, DMA stop and PC8/PC9/PC11 release are not implemented yet.");
+                "SNAPSHOT PREPARE: DCMI stop OK, snapshot software guard active.");
+        }
+        else if (result == CAMERA_SNAPSHOT_ERR_DCMI_STOP_FAILED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SNAPSHOT PREPARE: DCMI stop failed, snapshot software guard remains active.");
         }
         else
         {

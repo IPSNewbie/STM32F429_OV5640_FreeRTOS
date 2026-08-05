@@ -1,12 +1,13 @@
 #include "camera_snapshot_control.h"
 
+#include "camera_dcmi_dma.h"
 #include "stm32f4xx_hal.h"
 
 #include <stddef.h>
 
 /*
- * Stage 11B-5 增加拍照保存前后的软件保护状态。
- * 本模块不停止或恢复 DCMI/DMA，不释放冲突引脚，也不访问 SDIO 或 FATFS。
+ * Stage 11B-6 在软件保护生效后最小验证 HAL_DCMI_Stop。
+ * 本模块不重新启动 DCMI，不释放冲突引脚，也不访问 SDIO 或 FATFS。
  */
 static CameraSnapshotControlStatus_t s_snapshot_control_status;
 
@@ -19,6 +20,11 @@ void Camera_SnapshotControl_InitState(void)
     s_snapshot_control_status.control_error_count = 0U;
     s_snapshot_control_status.last_error_code = CAMERA_SNAPSHOT_OK;
     s_snapshot_control_status.last_operation_ms = 0U;
+    s_snapshot_control_status.real_dcmi_stop_enabled = 1U;
+    s_snapshot_control_status.dcmi_stop_attempt_count = 0U;
+    s_snapshot_control_status.dcmi_stop_success_count = 0U;
+    s_snapshot_control_status.dcmi_stop_error_count = 0U;
+    s_snapshot_control_status.last_dcmi_stop_hal_status = (uint32_t)HAL_OK;
     s_snapshot_control_status.camera_control_state = CAMERA_SNAPSHOT_STATE_IDLE;
     s_snapshot_control_status.dcmi_stop_required = 1U;
     s_snapshot_control_status.dcmi_dma_stop_required = 1U;
@@ -45,18 +51,41 @@ void Camera_SnapshotControl_GetStatus(CameraSnapshotControlStatus_t *status)
 uint32_t Camera_SnapshotControl_RequestPrepare(void)
 {
     uint32_t start_ms = HAL_GetTick();
+    HAL_StatusTypeDef hal_status;
+    uint32_t result;
 
-    /* deferred 只表示硬件停止边界尚未实现，不计为真实硬件错误。 */
     ++s_snapshot_control_status.prepare_attempt_count;
     s_snapshot_control_status.software_guard_active = 1U;
     s_snapshot_control_status.dump_block_required = 1U;
-    s_snapshot_control_status.camera_control_state =
-        CAMERA_SNAPSHOT_STATE_PREPARE_DEFERRED;
-    s_snapshot_control_status.last_error_code =
-        CAMERA_SNAPSHOT_ERR_CAMERA_STOP_NOT_IMPLEMENTED;
+    ++s_snapshot_control_status.dcmi_stop_attempt_count;
+
+    hal_status = HAL_DCMI_Stop(&g_camera_dcmi);
+    s_snapshot_control_status.last_dcmi_stop_hal_status = (uint32_t)hal_status;
+
+    if (hal_status == HAL_OK)
+    {
+        ++s_snapshot_control_status.dcmi_stop_success_count;
+        ++s_snapshot_control_status.prepare_success_count;
+        s_snapshot_control_status.camera_control_state =
+            CAMERA_SNAPSHOT_STATE_CAMERA_PAUSED;
+        s_snapshot_control_status.last_error_code = CAMERA_SNAPSHOT_OK;
+        result = CAMERA_SNAPSHOT_OK;
+    }
+    else
+    {
+        ++s_snapshot_control_status.dcmi_stop_error_count;
+        ++s_snapshot_control_status.control_error_count;
+        /* 真实停止动作已经失败，因此使用 ERROR；guard 保持激活以阻止新请求。 */
+        s_snapshot_control_status.camera_control_state =
+            CAMERA_SNAPSHOT_STATE_ERROR;
+        s_snapshot_control_status.last_error_code =
+            CAMERA_SNAPSHOT_ERR_DCMI_STOP_FAILED;
+        result = CAMERA_SNAPSHOT_ERR_DCMI_STOP_FAILED;
+    }
+
     s_snapshot_control_status.last_operation_ms = HAL_GetTick() - start_ms;
 
-    return CAMERA_SNAPSHOT_ERR_CAMERA_STOP_NOT_IMPLEMENTED;
+    return result;
 }
 
 uint32_t Camera_SnapshotControl_RequestRestore(void)
@@ -117,6 +146,9 @@ const char *Camera_SnapshotControl_ErrorToString(uint32_t error_code)
 
         case CAMERA_SNAPSHOT_ERR_INVALID_STATE:
             return "INVALID_STATE";
+
+        case CAMERA_SNAPSHOT_ERR_DCMI_STOP_FAILED:
+            return "DCMI_STOP_FAILED";
 
         default:
             return "UNKNOWN_ERROR";
