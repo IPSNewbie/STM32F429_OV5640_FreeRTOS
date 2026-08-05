@@ -13,6 +13,8 @@
 #define CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED 6U
 #define CAMERA_SD_ERR_TAKEOVER_NOT_ACTIVE    7U
 #define CAMERA_SD_ERR_TAKEOVER_ALREADY_ACTIVE 8U
+#define CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED     9U
+#define CAMERA_SD_ERR_TAKEOVER_PRECHECK_FAILED 10U
 
 /* SDIO 接管状态。Stage 11B-2 只会进入请求延后状态，不会进入 ACTIVE。 */
 #define CAMERA_SD_TAKEOVER_STATE_IDLE             0U
@@ -41,6 +43,14 @@ typedef struct
     uint32_t takeover_error_count;         /* 接管硬件错误次数，延后请求不计为硬件错误。 */
     uint32_t last_takeover_error_code;     /* 最近一次接管请求的返回码。 */
     uint32_t last_takeover_operation_ms;   /* 最近一次接管命令的软件处理耗时。 */
+    uint32_t takeover_precheck_required;      /* ENTER 前是否必须检查 SNAPSHOT 状态，固定为 1。 */
+    uint32_t takeover_precheck_attempt_count; /* ENTER 前置检查次数。 */
+    uint32_t takeover_precheck_success_count; /* 前置检查成功次数。 */
+    uint32_t takeover_precheck_fail_count;    /* 前置检查失败次数。 */
+    uint32_t snapshot_pause_required;         /* 是否要求相机处于暂停状态，固定为 1。 */
+    uint32_t snapshot_pause_confirmed;        /* 最近一次前置检查是否确认相机已暂停。 */
+    uint32_t conflict_pin_release_ready;      /* 软件条件是否允许进入冲突引脚释放流程。 */
+    uint32_t last_takeover_precheck_error_code; /* 最近一次前置检查错误码。 */
 } CameraSdStorageStatus_t;
 
 /* 初始化纯软件状态，不访问 SDIO、GPIO 或文件系统。 */

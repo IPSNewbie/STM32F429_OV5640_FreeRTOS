@@ -1,11 +1,12 @@
 #include "camera_sd_storage.h"
 
+#include "camera_snapshot_control.h"
 #include "stm32f4xx_hal.h"
 
 #include <stddef.h>
 
 /*
- * Stage 11B-2 仅保存软件状态和接管请求。
+ * Stage 11B-8 在进入接管请求前检查 SNAPSHOT 暂停和软件保护状态。
  * PC8、PC9、PC11 同时被 DCMI 和 SDIO 使用，后续必须先停止 DCMI 和相关 DMA，
  * 再进入 SDIO 接管流程；本文件不停止 DCMI、不切换引脚，也不初始化 SDIO 或 FATFS。
  */
@@ -30,6 +31,14 @@ void Camera_SDStorage_InitState(void)
     s_camera_sd_status.takeover_error_count = 0U;
     s_camera_sd_status.last_takeover_error_code = CAMERA_SD_OK;
     s_camera_sd_status.last_takeover_operation_ms = 0U;
+    s_camera_sd_status.takeover_precheck_required = 1U;
+    s_camera_sd_status.takeover_precheck_attempt_count = 0U;
+    s_camera_sd_status.takeover_precheck_success_count = 0U;
+    s_camera_sd_status.takeover_precheck_fail_count = 0U;
+    s_camera_sd_status.snapshot_pause_required = 1U;
+    s_camera_sd_status.snapshot_pause_confirmed = 0U;
+    s_camera_sd_status.conflict_pin_release_ready = 0U;
+    s_camera_sd_status.last_takeover_precheck_error_code = CAMERA_SD_OK;
 }
 
 void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status)
@@ -59,15 +68,41 @@ uint32_t Camera_SDStorage_RequestInit(void)
 uint32_t Camera_SDStorage_RequestTakeoverEnter(void)
 {
     uint32_t start_ms = HAL_GetTick();
+    uint32_t result;
 
-    /* 只记录进入请求，不停止 DCMI/DMA，不释放或切换冲突引脚。 */
     ++s_camera_sd_status.takeover_enter_attempt_count;
-    s_camera_sd_status.takeover_state = CAMERA_SD_TAKEOVER_STATE_ENTER_DEFERRED;
-    s_camera_sd_status.last_takeover_error_code =
-        CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
+    ++s_camera_sd_status.takeover_precheck_attempt_count;
+
+    if (Camera_SnapshotControl_IsTakeoverPreconditionReady() == 0U)
+    {
+        ++s_camera_sd_status.takeover_precheck_fail_count;
+        s_camera_sd_status.snapshot_pause_confirmed = 0U;
+        s_camera_sd_status.conflict_pin_release_ready = 0U;
+        /* 前置条件失败时保持 IDLE，避免误认为接管流程已经开始。 */
+        s_camera_sd_status.takeover_state = CAMERA_SD_TAKEOVER_STATE_IDLE;
+        s_camera_sd_status.last_takeover_error_code =
+            CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED;
+        s_camera_sd_status.last_takeover_precheck_error_code =
+            CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED;
+        result = CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED;
+    }
+    else
+    {
+        ++s_camera_sd_status.takeover_precheck_success_count;
+        s_camera_sd_status.snapshot_pause_confirmed = 1U;
+        s_camera_sd_status.conflict_pin_release_ready = 1U;
+        /* 条件已满足，但本阶段仍不释放或切换冲突引脚。 */
+        s_camera_sd_status.takeover_state =
+            CAMERA_SD_TAKEOVER_STATE_ENTER_DEFERRED;
+        s_camera_sd_status.last_takeover_precheck_error_code = CAMERA_SD_OK;
+        s_camera_sd_status.last_takeover_error_code =
+            CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
+        result = CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
+    }
+
     s_camera_sd_status.last_takeover_operation_ms = HAL_GetTick() - start_ms;
 
-    return CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
+    return result;
 }
 
 uint32_t Camera_SDStorage_RequestTakeoverExit(void)
@@ -77,6 +112,8 @@ uint32_t Camera_SDStorage_RequestTakeoverExit(void)
     /* 只记录退出请求，不恢复 DCMI/DMA，不释放或切换冲突引脚。 */
     ++s_camera_sd_status.takeover_exit_attempt_count;
     s_camera_sd_status.takeover_state = CAMERA_SD_TAKEOVER_STATE_EXIT_DEFERRED;
+    s_camera_sd_status.snapshot_pause_confirmed = 0U;
+    s_camera_sd_status.conflict_pin_release_ready = 0U;
     s_camera_sd_status.last_takeover_error_code =
         CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
     s_camera_sd_status.last_takeover_operation_ms = HAL_GetTick() - start_ms;
@@ -114,6 +151,12 @@ const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
 
         case CAMERA_SD_ERR_TAKEOVER_ALREADY_ACTIVE:
             return "TAKEOVER_ALREADY_ACTIVE";
+
+        case CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED:
+            return "SNAPSHOT_NOT_PAUSED";
+
+        case CAMERA_SD_ERR_TAKEOVER_PRECHECK_FAILED:
+            return "TAKEOVER_PRECHECK_FAILED";
 
         default:
             return "UNKNOWN_ERROR";

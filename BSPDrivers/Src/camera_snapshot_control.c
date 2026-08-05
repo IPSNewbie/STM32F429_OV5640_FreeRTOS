@@ -115,6 +115,20 @@ uint32_t Camera_SnapshotControl_IsSoftwareGuardActive(void)
     return s_snapshot_control_status.software_guard_active;
 }
 
+uint32_t Camera_SnapshotControl_IsCameraPausedForSnapshot(void)
+{
+    return (s_snapshot_control_status.camera_control_state ==
+            CAMERA_SNAPSHOT_STATE_CAMERA_PAUSED) ? 1U : 0U;
+}
+
+uint32_t Camera_SnapshotControl_IsTakeoverPreconditionReady(void)
+{
+    /* 只读取软件状态，不访问或修改 DCMI、DMA、GPIO、SDIO。 */
+    return ((Camera_SnapshotControl_IsCameraPausedForSnapshot() != 0U) &&
+            (s_snapshot_control_status.software_guard_active == 1U) &&
+            (s_snapshot_control_status.dump_block_required == 1U)) ? 1U : 0U;
+}
+
 void Camera_SnapshotControl_RecordDumpBlocked(void)
 {
     ++s_snapshot_control_status.dump_block_count;

@@ -598,6 +598,43 @@ static void Camera_CLI_PrintSdTakeoverFields(
         huart,
         "last_takeover_operation_ms",
         status->last_takeover_operation_ms);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "takeover_precheck_required",
+        status->takeover_precheck_required);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "takeover_precheck_attempt_count",
+        status->takeover_precheck_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "takeover_precheck_success_count",
+        status->takeover_precheck_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "takeover_precheck_fail_count",
+        status->takeover_precheck_fail_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "snapshot_pause_required",
+        status->snapshot_pause_required);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "snapshot_pause_confirmed",
+        status->snapshot_pause_confirmed);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "conflict_pin_release_ready",
+        status->conflict_pin_release_ready);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_takeover_precheck_error_code",
+        status->last_takeover_precheck_error_code);
+    Camera_CLI_WriteText(huart, "  last_takeover_precheck_error_text=");
+    Camera_CLI_WriteLine(
+        huart,
+        Camera_SDStorage_ErrorToString(
+            status->last_takeover_precheck_error_code));
 }
 
 /* 输出完整 SD 卡软件状态，不访问 SDIO 或 FATFS。 */
@@ -677,11 +714,17 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
     {
         result = Camera_SDStorage_RequestTakeoverEnter();
 
-        if (result == CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED)
+        if (result == CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED)
         {
             Camera_CLI_WriteLine(
                 huart,
-                "SD TAKEOVER ENTER: deferred, DCMI stop and PC8/PC9/PC11 switch are not implemented yet.");
+                "SD TAKEOVER ENTER: blocked, run SNAPSHOT PREPARE first.");
+        }
+        else if (result == CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD TAKEOVER ENTER: precheck OK, GPIO switch is not implemented yet.");
         }
         else
         {
@@ -701,7 +744,7 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
         {
             Camera_CLI_WriteLine(
                 huart,
-                "SD TAKEOVER EXIT: deferred, DCMI restore is not implemented yet.");
+                "SD TAKEOVER EXIT: deferred, GPIO restore is not implemented yet.");
         }
         else
         {

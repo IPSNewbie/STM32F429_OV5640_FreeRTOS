@@ -1825,3 +1825,373 @@ Stage 11B-8 建议进入“冲突引脚释放/恢复的软件状态设计与安�
 - 明确接管和恢复过程完成前禁止 DUMP 与二进制图像请求的条件。
 - 明确任何接管异常路径都必须进入可执行 RESTORE 的安全状态。
 - 先设计状态关联、顺序检查、错误码和回滚边界，再进入真实 GPIO 复用切换。
+
+## Stage 11B-8 SDIO接管前置条件检查
+
+### 1. 本轮目的
+
+- 为 `SD TAKEOVER ENTER` 增加 SNAPSHOT 状态前置检查。
+- 没有先执行 `SNAPSHOT PREPARE` 并成功进入 `CAMERA_PAUSED` 时，禁止进入 SDIO 接管流程。
+- `SNAPSHOT PREPARE` 成功后，允许 `SD TAKEOVER ENTER` 进入 `ENTER_DEFERRED`，但仍不执行 GPIO 切换。
+- `SNAPSHOT RESTORE` 清除软件 guard 后，前置条件自动失效，再次执行 `SD TAKEOVER ENTER` 必须被阻止。
+- 记录前置检查的尝试、成功、失败和最近错误状态，为后续真实冲突引脚释放提供安全门。
+
+### 2. 本轮明确不做
+
+- 不新增 `HAL_DCMI_Stop`，保留 Stage 11B-6 已有调用。
+- 不调用 `HAL_DCMI_Start_DMA`、`HAL_DMA_Abort` 或 `HAL_DMA_DeInit`。
+- 不释放或切换 PC8、PC9、PC11，不出现 `GPIO_AF12_SDIO`。
+- 不初始化 SDIO，不调用 SD 卡块读写接口。
+- 不接入 FATFS，不读写 SD 卡或文件。
+- 不修改 DUMP、二进制请求协议、OV56RGB5 图像帧、UART DMA、IWDG 或 FreeRTOS 任务配置。
+- 不修改现有 Python 工具。
+
+### 3. SNAPSHOT 只读查询接口
+
+新增两个只读软件状态接口：
+
+- `Camera_SnapshotControl_IsCameraPausedForSnapshot()`：仅在 `camera_control_state == CAMERA_SNAPSHOT_STATE_CAMERA_PAUSED` 时返回 1。
+- `Camera_SnapshotControl_IsTakeoverPreconditionReady()`：仅在相机处于 `CAMERA_PAUSED`，且 `software_guard_active == 1`、`dump_block_required == 1` 三项同时满足时返回 1。
+
+两个接口只读取 SNAPSHOT 软件状态，不修改状态，也不访问 DCMI、DMA、GPIO、SDIO 或任何 HAL API。`camera_sd_storage` 仅在处理 ENTER 请求时调用查询接口，`SNAPSHOT RESTORE` 不反向修改 SD 模块状态，从而避免两个模块双向强耦合。
+
+### 4. 新增 SD 接管前置检查字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `takeover_precheck_required` | ENTER 前是否必须执行 SNAPSHOT 状态检查，本项目固定为 1。 |
+| `takeover_precheck_attempt_count` | `SD TAKEOVER ENTER` 前置检查次数。 |
+| `takeover_precheck_success_count` | 前置检查成功次数。 |
+| `takeover_precheck_fail_count` | 前置检查失败次数。 |
+| `snapshot_pause_required` | 是否要求相机处于暂停状态，本项目固定为 1。 |
+| `snapshot_pause_confirmed` | 最近一次前置检查是否确认相机已暂停。 |
+| `conflict_pin_release_ready` | 软件条件是否允许进入冲突引脚释放流程；不表示 GPIO 已释放。 |
+| `last_takeover_precheck_error_code` | 最近一次前置检查错误码。 |
+
+这些字段以及 `last_takeover_precheck_error_text` 同时追加到 `SD STATUS` 和 `SD TAKEOVER STATUS`，原有字段名保持不变。新增错误码 `SNAPSHOT_NOT_PAUSED` 和 `TAKEOVER_PRECHECK_FAILED`。
+
+### 5. SD TAKEOVER ENTER 安全门行为
+
+每次执行 `SD TAKEOVER ENTER` 都增加 ENTER 尝试次数和 precheck 尝试次数，并实时调用 `Camera_SnapshotControl_IsTakeoverPreconditionReady()`。
+
+前置条件不满足时：
+
+- 增加 `takeover_precheck_fail_count`。
+- 将 `snapshot_pause_confirmed` 和 `conflict_pin_release_ready` 清零。
+- `takeover_state` 保持或恢复为 `IDLE`，避免误认为接管流程已经开始。
+- 最近接管错误码和前置检查错误码均记录为 `SNAPSHOT_NOT_PAUSED`。
+- CLI 输出 `SD TAKEOVER ENTER: blocked, run SNAPSHOT PREPARE first.`。
+- 不修改 `sdio_ready` 或 `is_initialized`，不访问 GPIO、SDIO、FATFS。
+
+前置条件满足时：
+
+- 增加 `takeover_precheck_success_count`。
+- 将 `snapshot_pause_confirmed` 和 `conflict_pin_release_ready` 置 1。
+- 将 `takeover_state` 设置为 `ENTER_DEFERRED`，不设置为 `ACTIVE`。
+- 前置检查错误码清为 `OK`，接管返回码仍为 `TAKEOVER_NOT_IMPLEMENTED`。
+- CLI 输出 `SD TAKEOVER ENTER: precheck OK, GPIO switch is not implemented yet.`。
+- 不释放或切换 PC8、PC9、PC11，不初始化 SDIO 或 FATFS。
+
+### 6. EXIT、RESTORE 与 SD INIT 行为
+
+`SD TAKEOVER EXIT` 仍只进入 `EXIT_DEFERRED`，同时清除 `snapshot_pause_confirmed` 和 `conflict_pin_release_ready`，CLI 输出 `SD TAKEOVER EXIT: deferred, GPIO restore is not implemented yet.`，不执行 GPIO 恢复。
+
+`SNAPSHOT RESTORE` 继续只清除 SNAPSHOT guard，不主动修改 `camera_sd_storage`。RESTORE 后 `Camera_SnapshotControl_IsTakeoverPreconditionReady()` 返回 0，因此下一次 `SD TAKEOVER ENTER` 会重新检查并返回 `SNAPSHOT_NOT_PAUSED`。
+
+`SD INIT` 行为保持不变，继续返回 `NEED_TAKEOVER`；不调用 `HAL_SD_Init`，不初始化 SDIO，不接入 FATFS，也不切换 GPIO。
+
+### 7. 预期命令行为
+
+1. 启动后直接执行 `SD TAKEOVER ENTER`：被阻止，提示先运行 `SNAPSHOT PREPARE`，状态保持 `IDLE`。
+2. 执行 `SNAPSHOT PREPARE` 后再执行 `SD TAKEOVER ENTER`：前置检查通过，状态进入 `ENTER_DEFERRED`，但提示 GPIO switch 尚未实现。
+3. guard 状态下文本 DUMP 和二进制图像请求仍被阻止。
+4. 执行 `SD TAKEOVER EXIT`：进入 `EXIT_DEFERRED` 并清除接管准备标志，不恢复 GPIO。
+5. 执行 `SNAPSHOT RESTORE` 后再次执行 `SD TAKEOVER ENTER`：前置检查再次失败并返回 `SNAPSHOT_NOT_PAUSED`。
+6. 执行 `SD INIT`：仍返回 `NEED_TAKEOVER`。
+
+### 8. 后续板测计划
+
+1. 启动后检查 `SD STATUS` 和 `SD TAKEOVER STATUS` 的新增字段初始值。
+2. 直接执行 `SD TAKEOVER ENTER`，确认被阻止、失败计数增加且状态为 `IDLE`。
+3. 执行 `SNAPSHOT PREPARE`，确认进入 `CAMERA_PAUSED`、guard 生效。
+4. 再执行 `SD TAKEOVER ENTER`，确认 precheck 成功计数增加、`snapshot_pause_confirmed=1`、`conflict_pin_release_ready=1`、状态为 `ENTER_DEFERRED`。
+5. guard 状态下分别验证文本 DUMP 和合法二进制图像请求仍被阻止。
+6. 执行 `SD TAKEOVER EXIT`，确认输出 deferred，且两个软件准备标志清零。
+7. 执行 `SNAPSHOT RESTORE`，然后再次执行 `SD TAKEOVER ENTER`，确认再次被阻止。
+8. RESTORE 后执行 basic、pc_dump、repeat 20/20 回归。
+9. 执行最终 `STATUS`，检查 IWDG、HOOK、心跳、UART RX DMA 和 StreamBuffer 状态。
+
+本轮 Codex 不执行硬件测试；上述命令和回归结果由用户烧录后在开发板上验证并回填。
+
+### 9. 后续 Stage 11B-9 建议
+
+- 在软件前置检查和顺序保护板测稳定后，设计 PC8、PC9、PC11 真实 GPIO 释放/恢复最小验证。
+- Stage 11B-9 仍先不初始化 SDIO 或 FATFS，只验证冲突引脚能从 DCMI 复用态安全切出并恢复为 DCMI。
+- 真实切出前必须确认相机处于 `CAMERA_PAUSED`、guard 已激活且 precheck 已通过。
+- 恢复 DCMI 复用后验证 basic、pc_dump、repeat 和多轮 Stop/Restore 链路能否继续正常运行。
+
+### 10. Stage 11B-8 板测结果
+
+#### 10.1 启动与首次安全门检查
+
+系统启动正常，启动信息为 `reset: iwdg=0`；测试期间无 FATAL、无反复复位、无 IWDG 复位循环。
+
+启动后直接执行 `SD TAKEOVER ENTER`，输出：
+
+```text
+SD TAKEOVER ENTER: blocked, run SNAPSHOT PREPARE first.
+```
+
+状态如下：
+
+```text
+takeover_state=0
+takeover_state_text=IDLE
+takeover_enter_attempt_count=1
+takeover_precheck_attempt_count=1
+takeover_precheck_success_count=0
+takeover_precheck_fail_count=1
+snapshot_pause_required=1
+snapshot_pause_confirmed=0
+conflict_pin_release_ready=0
+last_takeover_error_code=9
+last_takeover_error_text=SNAPSHOT_NOT_PAUSED
+last_takeover_precheck_error_code=9
+last_takeover_precheck_error_text=SNAPSHOT_NOT_PAUSED
+```
+
+结果表明未暂停摄像头时安全门能够阻止接管请求，接管状态保持 `IDLE`。
+
+#### 10.2 SNAPSHOT PREPARE 与前置检查通过
+
+执行 `SNAPSHOT PREPARE`，输出：
+
+```text
+SNAPSHOT PREPARE: DCMI stop OK, snapshot software guard active.
+```
+
+SNAPSHOT 状态：
+
+```text
+camera_control_state=2
+camera_control_state_text=CAMERA_PAUSED
+prepare_attempt_count=1
+prepare_success_count=1
+real_dcmi_stop_enabled=1
+dcmi_stop_attempt_count=1
+dcmi_stop_success_count=1
+dcmi_stop_error_count=0
+last_dcmi_stop_hal_status=0
+software_guard_active=1
+dump_block_required=1
+last_error_code=0
+last_error_text=OK
+```
+
+随后执行 `SD TAKEOVER ENTER`，输出：
+
+```text
+SD TAKEOVER ENTER: precheck OK, GPIO switch is not implemented yet.
+```
+
+接管状态：
+
+```text
+takeover_state=1
+takeover_state_text=ENTER_DEFERRED
+takeover_enter_attempt_count=2
+takeover_precheck_attempt_count=2
+takeover_precheck_success_count=1
+takeover_precheck_fail_count=1
+snapshot_pause_confirmed=1
+conflict_pin_release_ready=1
+last_takeover_precheck_error_code=0
+last_takeover_precheck_error_text=OK
+last_takeover_error_code=6
+last_takeover_error_text=TAKEOVER_NOT_IMPLEMENTED
+```
+
+结果表明 `CAMERA_PAUSED`、`software_guard_active=1` 和 `dump_block_required=1` 同时满足后，前置检查通过并进入 `ENTER_DEFERRED`；本轮仍未切换 GPIO。
+
+#### 10.3 guard 状态下 DUMP 与 binary 阻止
+
+- 文本 DUMP 输出 `DUMP blocked: snapshot software guard active.`。
+- 未发送 OV56RGB5 图像帧，`dump_block_count=1`。
+- guard 状态下二进制 basic 响应长度为 0 B，PC 端接收超时，测试结果为 FAIL。
+- 该 FAIL 是 guard 生效后的预期现象，`binary_block_count=1`。
+
+#### 10.4 SD TAKEOVER EXIT 与 SNAPSHOT RESTORE
+
+执行 `SD TAKEOVER EXIT`，输出：
+
+```text
+SD TAKEOVER EXIT: deferred, GPIO restore is not implemented yet.
+```
+
+状态如下：
+
+```text
+takeover_state=3
+takeover_state_text=EXIT_DEFERRED
+takeover_exit_attempt_count=1
+snapshot_pause_confirmed=0
+conflict_pin_release_ready=0
+```
+
+执行 `SNAPSHOT RESTORE`，输出：
+
+```text
+SNAPSHOT RESTORE: deferred, camera restore and DCMI restart are not implemented yet.
+```
+
+SNAPSHOT 状态：
+
+```text
+camera_control_state=3
+camera_control_state_text=RESTORE_DEFERRED
+restore_attempt_count=1
+software_guard_active=0
+dump_block_required=0
+dump_block_count=1
+binary_block_count=1
+```
+
+RESTORE 后再次执行 `SD TAKEOVER ENTER`，输出：
+
+```text
+SD TAKEOVER ENTER: blocked, run SNAPSHOT PREPARE first.
+```
+
+接管状态：
+
+```text
+takeover_state=0
+takeover_state_text=IDLE
+takeover_enter_attempt_count=3
+takeover_precheck_attempt_count=3
+takeover_precheck_success_count=1
+takeover_precheck_fail_count=2
+snapshot_pause_confirmed=0
+conflict_pin_release_ready=0
+last_takeover_error_code=9
+last_takeover_error_text=SNAPSHOT_NOT_PAUSED
+last_takeover_precheck_error_code=9
+last_takeover_precheck_error_text=SNAPSHOT_NOT_PAUSED
+```
+
+结果表明 RESTORE 清除 guard 后前置条件正确失效，新的 ENTER 请求再次被阻止。
+
+#### 10.5 SD INIT 保持原有行为
+
+执行 `SD INIT`，输出：
+
+```text
+SD INIT: deferred, need SDIO takeover because PC8/PC9/PC11 conflict with DCMI.
+```
+
+状态如下：
+
+```text
+is_initialized=0
+takeover_required=1
+sdio_ready=0
+fatfs_ready=0
+init_attempt_count=1
+init_success_count=0
+init_error_count=0
+last_error_code=3
+last_error_text=NEED_TAKEOVER
+```
+
+该结果说明 `SD INIT` 仍未真实初始化 SDIO、未接入 FATFS、未切换 PC8、PC9、PC11。`last_operation_ms=118564` 仍更像系统 tick，而不是本次命令耗时，属于既有耗时统计问题，后续单独修正，不影响本轮安全门验证结论。
+
+#### 10.6 RESTORE 后图像功能回归
+
+- 首次 guard 状态下执行 binary basic，响应长度为 0 B、结果 FAIL，属于预期阻止现象。
+- 测试期间出现一次 COM4 `PermissionError`，原因为 PC 端串口被其他程序占用，不属于固件错误；释放串口占用后继续测试。
+- RESTORE 后 `basic`：PASS，`frame_id=1`。
+- RESTORE 后 `pc_dump`：PASS，`frame_id=2`，图像质量无警告。
+- RESTORE 后 `repeat`：20/20 PASS，`frame_id` 从 3 到 22 连续。
+- `repeat` 平均耗时 3466.81 ms，最短耗时 3461.54 ms，最长耗时 3471.45 ms。
+
+### 11. 最终 STATUS 关键字段
+
+`RTOS`：
+
+```text
+dump_request_count=24
+dump_success_count=22
+dump_error_count=2
+binary_request_count=22
+binary_request_success_count=21
+binary_request_error_count=0
+binary_request_crc_error_count=0
+binary_request_version_error_count=0
+binary_request_type_error_count=0
+binary_request_length_error_count=0
+binary_request_eof_error_count=0
+binary_request_timeout_count=0
+last_binary_request_seq=20
+last_binary_error_code=0
+last_error_code=8
+```
+
+`dump_error_count=2` 是预期结果，对应 guard 状态下文本 DUMP 和 guard 状态下 binary 请求各被阻止一次。`binary_request_error_count=0` 是正确结果，因为二进制请求帧格式正确，只是被 snapshot guard 拦截，不属于协议错误。`last_error_code=8` 对应 snapshot guard active 类错误，属于本轮预期行为。
+
+`HEALTH`：
+
+```text
+camera_service_stack_min_free_bytes=7624
+monitor_stack_min_free_bytes=1864
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+`HOOK`：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+`HEARTBEAT`：
+
+```text
+camera_service_heartbeat_age_ms=0
+monitor_heartbeat_age_ms=576
+```
+
+`IWDG`：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=186
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_test_mode=0
+```
+
+`UART RX DMA`：
+
+```text
+uart_dma_event_count=48
+uart_dma_rx_bytes=578
+stream_buffer_write_bytes=578
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+### 12. Stage 11B-8 板测结论与适用边界
+
+Stage 11B-8 验证通过。`SD TAKEOVER ENTER` 的前置条件检查生效：未执行 `SNAPSHOT PREPARE` 时会被阻止；`SNAPSHOT PREPARE` 成功进入 `CAMERA_PAUSED` 且 `software_guard_active=1` 后，`SD TAKEOVER ENTER` 前置检查通过并进入 `ENTER_DEFERRED`，但仍不切换 GPIO；`SNAPSHOT RESTORE` 后前置条件失效，`SD TAKEOVER ENTER` 再次被阻止。
+
+`SD INIT` 仍保持 `NEED_TAKEOVER`。RESTORE 后 basic、pc_dump、repeat 回归通过，最终 STATUS 显示 IWDG 未跳过喂狗、Hook 未触发，UART RX DMA 无错误、无溢出、无恢复、无重同步。
+
+需要严谨说明：本轮只验证了 SDIO 接管前的软件安全门，没有真正释放或切换 PC8、PC9、PC11，也没有初始化 SDIO 或 FATFS。因此本轮通过只能说明“接管前置条件判断正确”，不能说明真实 SDIO 接管已经可用。
+
+### 13. 后续 Stage 11B-9 建议
+
+Stage 11B-9 建议进入“冲突引脚释放/恢复的软件状态设计与最小验证”。仍先不初始化 SDIO 或 FATFS，先验证 PC8、PC9、PC11 从 DCMI 复用切出再恢复后，basic、pc_dump、repeat 是否还能正常。

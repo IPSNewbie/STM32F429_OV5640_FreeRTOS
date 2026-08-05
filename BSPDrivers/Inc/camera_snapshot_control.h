@@ -66,6 +66,12 @@ uint32_t Camera_SnapshotControl_IsDumpAllowed(void);
 /* 返回当前 SNAPSHOT 软件保护状态。 */
 uint32_t Camera_SnapshotControl_IsSoftwareGuardActive(void);
 
+/* 相机控制状态为 CAMERA_PAUSED 时返回 1，否则返回 0。 */
+uint32_t Camera_SnapshotControl_IsCameraPausedForSnapshot(void);
+
+/* 相机已暂停且软件保护完整生效时返回 1，否则返回 0。 */
+uint32_t Camera_SnapshotControl_IsTakeoverPreconditionReady(void);
+
 /* 记录一次被软件保护阻止的文本 DUMP。 */
 void Camera_SnapshotControl_RecordDumpBlocked(void);
 
