@@ -3415,3 +3415,411 @@ RESTORE_BINARY
 ```
 
 Stage 11B-12 仍不调用 `HAL_SD_Init`，不接入 FATFS；先验证多轮 SDIO AF12 切换闭环、guard 阻止路径和 RESTORE 后图像恢复的稳定性。
+
+## Stage 11B-12 多轮 SDIO AF12 切换闭环稳定性验证
+
+### 1. 本轮目的
+
+- 新增独立 PC 端测试工具 `tools/uart_snapshot_sdio_af12_cycle_test.py`。
+- 自动执行多轮 `SNAPSHOT PREPARE / SD TAKEOVER ENTER / SD INIT / DUMP_BLOCK / BINARY_BLOCK / SD TAKEOVER EXIT / SNAPSHOT RESTORE / RESTORE_BINARY` 完整流程。
+- 验证 PC8、PC9、PC11 多次切换到 SDIO AF12、再退出 AF12 并恢复为 DCMI AF13 后，图像请求链路是否持续稳定。
+- 验证 AF12 状态下 `SD INIT` 始终保持 `NEED_TAKEOVER`，不会真实初始化 SDIO 或 FATFS。
+- 验证 snapshot guard 生效期间，文本 DUMP 和 binary 图像请求持续被阻止。
+- 验证 `SNAPSHOT RESTORE` 后 binary 图像请求持续恢复，并检查 `frame_id` 连续递增。
+
+### 2. 本轮不做
+
+- 不修改任何固件 C/H 源码，不修改 Core 或 BSPDrivers。
+- 不新增 `HAL_DCMI_Stop`，不调用 `HAL_DCMI_Start_DMA`、`HAL_DMA_Abort` 或 `HAL_DMA_DeInit`。
+- 不修改 PC8、PC9、PC11 的 GPIO/AF 切换固件实现，不新增 `GPIO_AF12_SDIO` 固件代码。
+- 不配置 PC10、PC12、PD2。
+- 不初始化 SDIO，不调用任何 HAL SD API。
+- 不接入 FATFS，不读写 SD 卡。
+- 不修改 UART/二进制图像请求协议，也不修改任何现有 Python 工具。
+
+### 3. 测试脚本
+
+脚本路径：
+
+```text
+tools/uart_snapshot_sdio_af12_cycle_test.py
+```
+
+默认参数：
+
+```text
+port=COM4
+baud=115200
+cycles=5
+guard_timeout=2.0 s
+frame_timeout=10.0 s
+interval=0.2 s
+tag=stage11_b12_sdio_af12_cycle
+DTR=False
+RTS=False
+```
+
+脚本只依赖 pyserial 和 Python 标准库，不导入现有项目脚本，不使用类、线程或 async，不保存 PNG，也不做图像质量分析。
+
+每轮按以下顺序执行：
+
+1. `SNAPSHOT PREPARE` 必须包含 `DCMI stop OK`。
+2. `SD TAKEOVER ENTER` 必须包含 `conflict pins switched to SDIO AF12`、`sdio_af12_selected=1` 和 AF12 切换成功计数字段。
+3. `SD INIT` 必须包含 `NEED_TAKEOVER`、`is_initialized=0`、`sdio_ready=0`、`fatfs_ready=0` 和 `sdio_af12_selected=1`。
+4. 文本 `DUMP` 必须被 snapshot guard 阻止。
+5. guard 状态下发送 binary 图像请求，不得收到合法 OV56RGB5 图像帧；0 B、超时或无合法 magic 均属于预期。
+6. `SD TAKEOVER EXIT` 必须包含 `conflict pins restored to DCMI AF13 from SDIO AF12`、`sdio_af12_selected=0`、AF12 退出成功计数和 DCMI AF13 恢复成功计数。
+7. `SNAPSHOT RESTORE` 响应必须包含 `SNAPSHOT RESTORE` 或 `RESTORE_DEFERRED`。
+8. RESTORE 后 binary 请求必须收到合法 OV56RGB5 图像帧，并通过 version、pixel format、160x120 尺寸、38400 B payload 和 CRC32 校验。
+
+每轮输出格式为：
+
+```text
+[01/05] PREPARE=PASS AF12_ENTER=PASS SD_INIT_DEFERRED=PASS DUMP_BLOCK=PASS BINARY_BLOCK=PASS AF12_EXIT=PASS RESTORE=PASS RESTORE_BINARY=PASS frame_id=xx time=xxxx ms
+```
+
+单项失败时，脚本打印失败原因、写入本轮 CSV，默认继续后续步骤和下一轮；只有串口打开失败时直接结束。
+
+### 4. 协议和结果校验
+
+脚本自行构造 14 字节二进制图像请求：请求 magic 为 `A5 5A`，version 为 1，type 为 `0x20`，seq 为小端 uint16，len 固定为 0，对 version/type/seq/len 六字节计算 CRC32，结尾为 `0D 0A`。
+
+RESTORE 后响应必须是总长 38426 B 的 OV56RGB5 图像帧：22 B header、38400 B RGB565 payload 和 4 B CRC。脚本检查 magic、version、pixel format、width、height、payload_len 和 payload CRC，并使用 `frame_id` 判断跨轮图像是否逐帧加一。
+
+### 5. 测试统计与输出文件
+
+脚本统计以下字段：
+
+- `cycle_total`
+- `prepare_ok_count`
+- `takeover_enter_ok_count`
+- `sd_init_deferred_ok_count`
+- `text_dump_block_ok_count`
+- `binary_block_ok_count`
+- `takeover_exit_ok_count`
+- `restore_command_ok_count`
+- `restore_binary_ok_count`
+- `fail_count`
+- `first_frame_id`
+- `last_frame_id`
+- `frame_id_continuous`
+- `avg_restore_binary_time_ms`
+- `min_restore_binary_time_ms`
+- `max_restore_binary_time_ms`
+
+脚本自动创建 `captures` 目录并生成：
+
+```text
+captures/sdio_af12_cycle_<tag>_<timestamp>.csv
+captures/sdio_af12_cycle_<tag>_<timestamp>_summary.txt
+```
+
+CSV 保存每轮八项结果、`frame_id`、RESTORE 后图像请求耗时和错误原因。summary 保存测试参数、全部统计、`frame_id` 连续性、最终 PASS/FAIL，并明确说明 guard binary 超时是预期现象、ENTER 后必须处于 AF12、`SD INIT` 必须保持 `NEED_TAKEOVER`、EXIT 后必须恢复 DCMI AF13、RESTORE 后 binary 必须 PASS。
+
+总测试只有在每轮八项检查全部通过、`fail_count=0`、RESTORE 后成功帧数量等于循环次数且 `frame_id` 连续递增时才判定为 PASS。
+
+### 6. 后续板测计划
+
+1. 先执行 5 轮：
+
+   ```text
+   python tools/uart_snapshot_sdio_af12_cycle_test.py --cycles 5 --tag stage11_b12_5cycle
+   ```
+
+2. 5 轮通过后再执行 20 轮：
+
+   ```text
+   python tools/uart_snapshot_sdio_af12_cycle_test.py --cycles 20 --tag stage11_b12_20cycle
+   ```
+
+3. 最后通过串口依次执行：
+
+   ```text
+   SD TAKEOVER STATUS
+   SNAPSHOT STATUS
+   STATUS
+   ```
+
+4. 确认最终 `sdio_af12_selected=0`，AF12 切换/退出和冲突引脚恢复计数符合循环次数，错误计数均为 0。
+5. 检查 IWDG、Hook、UART RX DMA、StreamBuffer、任务心跳、堆栈和图像请求统计。
+6. 若 20 轮全部通过且运行保护状态正常，再进入下一阶段。
+
+本轮 Codex 只进行脚本静态编译检查，不打开 COM4，也不执行硬件测试；循环结果由用户在开发板上验证并回填。
+
+### 7. 后续 Stage 11C 建议
+
+- 如果 Stage 11B-12 多轮验证稳定，可认为 Stage 11B 已完成“SDIO 接管前 GPIO/AF 切换安全闭环验证”。
+- 下一阶段进入 Stage 11C：SDIO 最小初始化验证。
+- Stage 11C 应先只验证 SDIO 初始化和 SD 卡信息读取，不立即接入 FATFS 写文件。
+- Stage 11C 必须继续保持 `SNAPSHOT PREPARE -> SD TAKEOVER ENTER -> SD INIT` 的安全顺序。
+- 真实 SDIO 初始化前仍需配置并检查 PC10、PC12、PD2，严格控制初始化阶段 SDIO_CK 不超过 400 kHz，并制定失败路径下退出 AF12、恢复 DCMI AF13 和清除 guard 的闭环。
+
+### 8. Stage 11B-12 板测结果
+
+#### 8.1 5 轮循环测试
+
+执行命令：
+
+```text
+python tools/uart_snapshot_sdio_af12_cycle_test.py --cycles 5 --tag stage11_b12_5cycle
+```
+
+测试结果：
+
+```text
+cycle_total=5
+prepare_ok_count=5
+takeover_enter_ok_count=5
+sd_init_deferred_ok_count=5
+text_dump_block_ok_count=5
+binary_block_ok_count=5
+takeover_exit_ok_count=5
+restore_command_ok_count=5
+restore_binary_ok_count=5
+fail_count=0
+first_frame_id=1
+last_frame_id=5
+frame_id_continuous=是
+avg_restore_binary_time_ms=3470.54
+min_restore_binary_time_ms=3461.26
+max_restore_binary_time_ms=3489.82
+测试结果=PASS
+```
+
+输出文件：
+
+```text
+captures\sdio_af12_cycle_stage11_b12_5cycle_20260805_162534.csv
+captures\sdio_af12_cycle_stage11_b12_5cycle_20260805_162534_summary.txt
+```
+
+#### 8.2 20 轮循环测试
+
+执行命令：
+
+```text
+python tools/uart_snapshot_sdio_af12_cycle_test.py --cycles 20 --tag stage11_b12_20cycle
+```
+
+测试结果：
+
+```text
+cycle_total=20
+prepare_ok_count=20
+takeover_enter_ok_count=20
+sd_init_deferred_ok_count=20
+text_dump_block_ok_count=20
+binary_block_ok_count=20
+takeover_exit_ok_count=20
+restore_command_ok_count=20
+restore_binary_ok_count=20
+fail_count=0
+first_frame_id=6
+last_frame_id=25
+frame_id_continuous=是
+avg_restore_binary_time_ms=3459.91
+min_restore_binary_time_ms=3448.30
+max_restore_binary_time_ms=3472.37
+测试结果=PASS
+```
+
+输出文件：
+
+```text
+captures\sdio_af12_cycle_stage11_b12_20cycle_20260805_162651.csv
+captures\sdio_af12_cycle_stage11_b12_20cycle_20260805_162651_summary.txt
+```
+
+#### 8.3 合计 25 轮结果
+
+5 轮和 20 轮测试均通过，合计完成 25 轮以下完整流程：
+
+```text
+SNAPSHOT PREPARE
+SD TAKEOVER ENTER
+SD INIT
+guard 文本 DUMP 阻止
+guard binary 阻止
+SD TAKEOVER EXIT
+SNAPSHOT RESTORE
+RESTORE 后 binary PASS
+```
+
+合计结果：
+
+- `SNAPSHOT PREPARE` 成功 25 次。
+- `SD TAKEOVER ENTER` 成功检测到 `conflict pins switched to SDIO AF12` 25 次。
+- `SD INIT` 保持 `NEED_TAKEOVER` 25 次。
+- guard 状态下文本 DUMP 被阻止 25 次。
+- guard 状态下 binary 请求被阻止 25 次。
+- `SD TAKEOVER EXIT` 成功检测到 `conflict pins restored to DCMI AF13 from SDIO AF12` 25 次。
+- `SNAPSHOT RESTORE` 响应正常 25 次。
+- RESTORE 后 binary 请求成功 25 次。
+- RESTORE 后 `frame_id` 从 1 到 25 连续递增。
+- 测试期间未观察到复位、FATAL 或 COM4 占用。
+
+#### 8.4 最终 SD TAKEOVER STATUS
+
+```text
+takeover_state=3
+takeover_state_text=EXIT_DEFERRED
+takeover_enter_attempt_count=25
+takeover_exit_attempt_count=25
+takeover_error_count=0
+last_takeover_error_code=6
+last_takeover_error_text=TAKEOVER_NOT_IMPLEMENTED
+takeover_precheck_attempt_count=25
+takeover_precheck_success_count=25
+takeover_precheck_fail_count=0
+snapshot_pause_confirmed=0
+conflict_pin_release_ready=0
+conflict_pin_release_attempt_count=25
+conflict_pin_release_success_count=25
+conflict_pin_release_error_count=0
+conflict_pin_restore_attempt_count=25
+conflict_pin_restore_success_count=25
+conflict_pin_restore_error_count=0
+conflict_pins_released=0
+last_conflict_pin_error_code=0
+last_conflict_pin_error_text=OK
+sdio_af12_switch_attempt_count=25
+sdio_af12_switch_success_count=25
+sdio_af12_switch_error_count=0
+sdio_af12_restore_attempt_count=25
+sdio_af12_restore_success_count=25
+sdio_af12_restore_error_count=0
+sdio_af12_selected=0
+last_sdio_af12_error_code=0
+last_sdio_af12_error_text=OK
+```
+
+状态解释：
+
+- `sdio_af12_switch_success_count=25` 表明 PC8、PC9、PC11 切换到 SDIO AF12 成功 25 次。
+- `sdio_af12_restore_success_count=25` 表明 PC8、PC9、PC11 从 SDIO AF12 退出成功 25 次。
+- `conflict_pin_restore_success_count=25` 表明 PC8、PC9、PC11 恢复为 DCMI AF13 成功 25 次。
+- `sdio_af12_selected=0` 和 `conflict_pins_released=0` 表明最终已退出 AF12，并恢复到非输入释放状态。
+- `last_takeover_error_text=TAKEOVER_NOT_IMPLEMENTED` 是预期现象，因为本阶段仍未实现真实 SDIO 初始化。
+- `last_sdio_af12_operation_ms=0` 可以接受，GPIO 复用切换很快，在当前 tick 分辨率下可能显示为 0 ms。
+
+#### 8.5 最终 SNAPSHOT STATUS
+
+```text
+camera_control_state=3
+camera_control_state_text=RESTORE_DEFERRED
+prepare_attempt_count=25
+restore_attempt_count=25
+prepare_success_count=25
+restore_success_count=0
+control_error_count=0
+last_error_code=3
+last_error_text=CAMERA_RESTORE_NOT_IMPLEMENTED
+real_dcmi_stop_enabled=1
+dcmi_stop_attempt_count=25
+dcmi_stop_success_count=25
+dcmi_stop_error_count=0
+last_dcmi_stop_hal_status=0
+software_guard_active=0
+dump_block_required=0
+dump_block_count=25
+binary_block_count=25
+```
+
+`dcmi_stop_success_count=25` 表明 `HAL_DCMI_Stop` 多轮调用稳定。最终 `software_guard_active=0`、`dump_block_required=0` 表明 RESTORE 后 guard 已清除。`dump_block_count=25` 和 `binary_block_count=25` 是预期结果，对应每轮 guard 状态下各阻止一次。
+
+#### 8.6 最终 STATUS 关键字段
+
+`RTOS`：
+
+```text
+dump_request_count=75
+dump_success_count=25
+dump_error_count=50
+binary_request_count=50
+binary_request_success_count=25
+binary_request_error_count=0
+binary_request_crc_error_count=0
+binary_request_version_error_count=0
+binary_request_type_error_count=0
+binary_request_length_error_count=0
+binary_request_eof_error_count=0
+binary_request_timeout_count=0
+last_binary_request_seq=40
+last_binary_error_code=0
+last_error_code=8
+```
+
+统计解释：
+
+- `dump_request_count=75` 是预期结果，对应每轮 1 次 guard 文本 DUMP、1 次 guard binary 请求和 1 次 RESTORE 后 binary 请求。`SD INIT` 不计入 `dump_request_count`；此前将其考虑在该计数内的预估不严谨，本轮实际值 75 正确。
+- `dump_success_count=25` 是预期结果，对应 RESTORE 后 25 次 binary 图像导出成功。
+- `dump_error_count=50` 是预期结果，对应 25 次 guard 文本 DUMP 阻止和 25 次 guard binary 阻止。
+- `binary_request_count=50` 是预期结果，对应 25 次 guard binary 请求和 25 次 RESTORE 后 binary 请求。
+- `binary_request_success_count=25` 是预期结果，对应 RESTORE 后 25 次 binary 请求成功。
+- `binary_request_error_count=0` 是正确结果，因为 guard 状态下二进制请求格式正确，只是被 snapshot guard 拦截，不属于协议错误。
+
+`HEALTH`：
+
+```text
+camera_service_stack_min_free_bytes=7552
+monitor_stack_min_free_bytes=1864
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+`HOOK`：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+`HEARTBEAT`：
+
+```text
+camera_service_heartbeat_age_ms=75
+monitor_heartbeat_age_ms=38
+```
+
+`IWDG`：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=191
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_test_mode=0
+```
+
+`UART RX DMA`：
+
+```text
+uart_dma_event_count=249
+uart_dma_rx_bytes=2945
+stream_buffer_write_bytes=2945
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+#### 8.7 板测结论与适用边界
+
+Stage 11B-12 验证通过。新增 `uart_snapshot_sdio_af12_cycle_test.py` 后，5 轮和 20 轮多轮 SDIO AF12 切换闭环测试均 PASS。合计 25 轮测试中，`SNAPSHOT PREPARE`、`SD TAKEOVER ENTER`、`SD INIT deferred`、guard 文本 DUMP 阻止、guard binary 阻止、`SD TAKEOVER EXIT`、`SNAPSHOT RESTORE`、RESTORE 后 binary 图像恢复均正常；RESTORE 后 `frame_id` 从 1 到 25 连续递增。
+
+最终 SD TAKEOVER STATUS 显示 PC8、PC9、PC11 切换到 SDIO AF12 成功 25 次、从 SDIO AF12 退出成功 25 次、恢复为 DCMI AF13 成功 25 次，错误均为 0，最终 `sdio_af12_selected=0`、`conflict_pins_released=0`。最终 STATUS 显示 IWDG 未跳过喂狗，Hook 未触发，UART RX DMA 无错误、无溢出、无恢复、无重同步，说明多轮 SDIO AF12 切换闭环稳定。
+
+需要严谨说明：本轮只验证了 PC8、PC9、PC11 在 DCMI AF13、GPIO 输入态和 SDIO AF12 之间的多轮切换稳定性。虽然 AF12 状态下 `SD INIT` 保持 `NEED_TAKEOVER`，且 RESTORE 后图像导出持续恢复正常，但本轮没有配置 PC10、PC12、PD2，没有初始化 SDIO 外设，没有调用 `HAL_SD_Init`，没有接入 FATFS，也没有访问 SD 卡。因此，本轮通过不能说明真实 SD 卡通信已经可用。
+
+#### 8.8 后续 Stage 11C 建议
+
+Stage 11B 到此可以认为完成“SDIO 接管前 GPIO/AF 切换安全闭环验证”。下一阶段进入 Stage 11C：SDIO 最小初始化验证，建议继续拆分为：
+
+- Stage 11C-1：SDIO 全引脚 AF12 切换骨架，只配置 PC8、PC9、PC10、PC11、PC12、PD2，不初始化 SDIO。
+- Stage 11C-2：`HAL_SD_Init` 最小初始化，不接入 FATFS。
+- Stage 11C-3：读取 SD 卡基础信息，不写卡。
+- Stage 11C-4：多轮 SD 初始化/退出稳定性验证。
+- Stage 11C-5：再考虑 FATFS mount 和最小文件写入。
+
+Stage 11C 必须继续保持 `SNAPSHOT PREPARE -> SD TAKEOVER ENTER -> SD INIT` 的安全顺序，并为任一初始化失败路径保留退出 SDIO、恢复 DCMI AF13 和清除 guard 的闭环。
