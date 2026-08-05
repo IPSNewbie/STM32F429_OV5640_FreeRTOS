@@ -78,6 +78,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         # Add user sources here
         ${BSPDRIVERS}
         Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_dcmi.c
+        Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_sd.c
+        Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_ll_sdmmc.c
         Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_sram.c
         Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_ll_fmc.c
 )

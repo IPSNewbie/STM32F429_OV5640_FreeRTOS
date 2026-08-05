@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-/* SD 卡模块返回码。Stage 11B-1 只提供受控入口，不执行硬件初始化。 */
+/* SD 卡模块返回码。Stage 11C-3 允许受控执行最小 HAL SD 初始化。 */
 #define CAMERA_SD_OK                         0U
 #define CAMERA_SD_ERR_NOT_IMPLEMENTED        1U
 #define CAMERA_SD_ERR_PIN_CONFLICT           2U
@@ -22,6 +22,8 @@
 #define CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED    15U
 #define CAMERA_SD_ERR_SDIO_FULL_GPIO_SWITCH_FAILED  16U
 #define CAMERA_SD_ERR_SDIO_FULL_GPIO_RESTORE_FAILED 17U
+#define CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED           18U
+#define CAMERA_SD_ERR_SDIO_HAL_DEINIT_FAILED         19U
 
 /* SDIO 接管状态。Stage 11B-2 只会进入请求延后状态，不会进入 ACTIVE。 */
 #define CAMERA_SD_TAKEOVER_STATE_IDLE             0U
@@ -34,14 +36,14 @@
 typedef struct
 {
     uint32_t init_attempt_count; /* SD INIT 调用次数。 */
-    uint32_t init_success_count; /* SD 卡初始化成功次数，本阶段保持为 0。 */
-    uint32_t init_error_count;   /* 硬件初始化失败次数，本阶段不计入延后请求。 */
+    uint32_t init_success_count; /* SD 卡 HAL 初始化成功次数。 */
+    uint32_t init_error_count;   /* SD 卡 HAL 初始化失败次数，不计入延后请求。 */
     uint32_t last_error_code;    /* 最近一次 SD INIT 请求的返回码。 */
-    uint32_t is_initialized;     /* SD 卡是否已初始化，本阶段固定为 0。 */
+    uint32_t is_initialized;     /* SD 卡 HAL 初始化是否成功。 */
     uint32_t takeover_required;  /* 是否需要停止 DCMI 并由 SDIO 接管冲突引脚。 */
-    uint32_t sdio_ready;         /* SDIO 是否已就绪，本阶段固定为 0。 */
-    uint32_t fatfs_ready;        /* FATFS 是否已挂载，本阶段固定为 0。 */
-    uint32_t last_operation_ms;  /* 最近一次 SD INIT 请求的系统时间。 */
+    uint32_t sdio_ready;         /* SDIO 是否已完成 HAL 初始化。 */
+    uint32_t fatfs_ready;        /* FATFS 是否已挂载，Stage 11C-3 固定为 0。 */
+    uint32_t last_operation_ms;  /* 最近一次 SD INIT 请求的处理耗时。 */
     uint32_t takeover_state;     /* 当前 SDIO 接管状态。 */
     uint32_t takeover_enter_attempt_count; /* 请求进入接管模式的次数。 */
     uint32_t takeover_exit_attempt_count;  /* 请求退出接管模式的次数。 */
@@ -85,6 +87,19 @@ typedef struct
     uint32_t sdio_full_gpio_af12_selected;         /* 六个 SDIO 引脚是否均处于 AF12。 */
     uint32_t last_sdio_full_gpio_error_code;       /* 最近一次完整 SDIO GPIO 操作错误码。 */
     uint32_t last_sdio_full_gpio_operation_ms;     /* 最近一次完整 SDIO GPIO 操作耗时。 */
+    uint32_t real_hal_sd_init_enabled;              /* 真实 HAL_SD_Init 路径是否启用，Stage 11C-3 固定为 1。 */
+    uint32_t sdio_clock_enabled;                    /* SDIO 外设时钟当前是否已打开。 */
+    uint32_t sdio_hal_init_attempt_count;           /* 实际调用 HAL_SD_Init 的次数。 */
+    uint32_t sdio_hal_init_success_count;           /* HAL_SD_Init 返回 HAL_OK 的次数。 */
+    uint32_t sdio_hal_init_error_count;             /* HAL_SD_Init 返回非 HAL_OK 的次数。 */
+    uint32_t sdio_hal_deinit_attempt_count;         /* 实际调用 HAL_SD_DeInit 的次数。 */
+    uint32_t sdio_hal_deinit_success_count;         /* HAL_SD_DeInit 返回 HAL_OK 的次数。 */
+    uint32_t sdio_hal_deinit_error_count;           /* HAL_SD_DeInit 返回非 HAL_OK 的次数。 */
+    uint32_t last_hal_sd_init_status;               /* 最近一次 HAL_SD_Init 返回值。 */
+    uint32_t last_hal_sd_deinit_status;             /* 最近一次 HAL_SD_DeInit 返回值。 */
+    uint32_t last_hal_sd_error;                     /* 最近一次 HAL_SD_GetError 返回值。 */
+    uint32_t last_sdio_hal_init_operation_ms;       /* 最近一次 HAL_SD_Init 调用耗时。 */
+    uint32_t last_sdio_hal_deinit_operation_ms;     /* 最近一次 HAL_SD_DeInit 调用耗时。 */
 } CameraSdStorageStatus_t;
 
 /* 初始化纯软件状态，不访问 SDIO、GPIO 或文件系统。 */
@@ -93,13 +108,13 @@ void Camera_SDStorage_InitState(void);
 /* 将当前软件状态复制到调用者提供的结构体。 */
 void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status);
 
-/* 记录一次初始化请求；当前返回 NEED_TAKEOVER，不执行真实初始化。 */
+/* 完整 SDIO GPIO 已接管时执行最小 HAL_SD_Init，否则返回 NEED_TAKEOVER。 */
 uint32_t Camera_SDStorage_RequestInit(void);
 
 /* 前置检查通过后释放冲突引脚，并将完整 SDIO GPIO 切换到 AF12。 */
 uint32_t Camera_SDStorage_RequestTakeoverEnter(void);
 
-/* 先将完整 SDIO GPIO 退回输入态，再将冲突引脚恢复为 DCMI AF13。 */
+/* 先反初始化并关闭 SDIO 时钟，再退出 AF12 并恢复冲突引脚的 DCMI AF13。 */
 uint32_t Camera_SDStorage_RequestTakeoverExit(void);
 
 /* 将 SD 卡模块返回码转换为 CLI 可读文本。 */

@@ -1,5 +1,5 @@
 #include "camera_cli.h"          // 引入 CLI 模块自身的声明，例如 Camera_CLI_Init()、Camera_CLI_HandleLine() 和相关枚举类型
-#include "camera_sd_storage.h"   // 引入 SD 卡软件状态和受控初始化请求接口，本阶段不操作 SDIO 硬件
+#include "camera_sd_storage.h"   // 引入 SD 卡状态、SDIO 接管及最小 HAL SD 初始化接口
 #include "camera_snapshot_control.h" // 引入拍照保存前后的相机控制边界软件接口
 #include "camera_frame_buffer.h" // 引入帧缓冲区尺寸宏，例如 CAMERA_FB_WIDTH 和 CAMERA_FB_HEIGHT
 #include "camera_rtos.h"         // 引入 RTOS 运行统计接口，用于记录 CLI 命令次数并读取 CameraRtosStats_t
@@ -144,6 +144,22 @@ static void Camera_CLI_WriteU32(UART_HandleTypeDef *huart, uint32_t value) // �
              (pos > 0U));                         // 同时确保不会越过数组起始地址
 
     Camera_CLI_WriteText(huart, &buf[pos]); // 从当前第一个有效数字字符开始发送，前面未使用的数组空间不会被发送
+}
+
+static void Camera_CLI_WriteHexU32(UART_HandleTypeDef *huart, uint32_t value)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    char buf[9];
+    uint32_t i;
+
+    for (i = 0U; i < 8U; ++i)
+    {
+        uint32_t shift = (7U - i) * 4U;
+        buf[i] = digits[(value >> shift) & 0x0FU];
+    }
+
+    buf[8] = '\0';
+    Camera_CLI_WriteText(huart, buf);
 }
 
 static void Camera_CLI_WriteLine(UART_HandleTypeDef *huart, const char *text) // 发送一行文本，并自动在末尾追加标准串口换行 "\r\n"
@@ -756,6 +772,58 @@ static void Camera_CLI_PrintSdTakeoverFields(
         huart,
         "last_sdio_full_gpio_operation_ms",
         status->last_sdio_full_gpio_operation_ms);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "real_hal_sd_init_enabled",
+        status->real_hal_sd_init_enabled);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_clock_enabled",
+        status->sdio_clock_enabled);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_hal_init_attempt_count",
+        status->sdio_hal_init_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_hal_init_success_count",
+        status->sdio_hal_init_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_hal_init_error_count",
+        status->sdio_hal_init_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_hal_deinit_attempt_count",
+        status->sdio_hal_deinit_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_hal_deinit_success_count",
+        status->sdio_hal_deinit_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sdio_hal_deinit_error_count",
+        status->sdio_hal_deinit_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_hal_sd_init_status",
+        status->last_hal_sd_init_status);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_hal_sd_deinit_status",
+        status->last_hal_sd_deinit_status);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_hal_sd_error",
+        status->last_hal_sd_error);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_sdio_hal_init_operation_ms",
+        status->last_sdio_hal_init_operation_ms);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_sdio_hal_deinit_operation_ms",
+        status->last_sdio_hal_deinit_operation_ms);
 }
 
 /* 输出完整 SD 卡软件状态，不访问 SDIO 或 FATFS。 */
@@ -792,7 +860,7 @@ static void Camera_CLI_PrintSdTakeoverStatus(UART_HandleTypeDef *huart)
     Camera_CLI_PrintSdTakeoverFields(huart, &status);
 }
 
-/* 处理 SD 命令；接管命令只切换 SDIO GPIO，不初始化 SDIO 或 FATFS。 */
+/* 处理 SD 命令；Stage 11C-3 只验证 HAL SD 初始化，不接入 FATFS 或块读写。 */
 static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
                                              const char *arg,
                                              uint32_t arg_len)
@@ -807,13 +875,32 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
 
     if (Camera_CLI_TokenEquals(arg, arg_len, "INIT") != 0U)
     {
+        CameraSdStorageStatus_t status;
+
         result = Camera_SDStorage_RequestInit();
+        Camera_SDStorage_GetStatus(&status);
 
         if (result == CAMERA_SD_ERR_NEED_TAKEOVER)
         {
             Camera_CLI_WriteLine(
                 huart,
                 "SD INIT: deferred, need SDIO takeover because PC8/PC9/PC11 conflict with DCMI.");
+        }
+        else if (result == CAMERA_SD_OK)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD INIT: HAL_SD_Init OK, FATFS is not mounted.");
+        }
+        else if (result == CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED)
+        {
+            Camera_CLI_WriteText(
+                huart,
+                "SD INIT: HAL_SD_Init failed, status=");
+            Camera_CLI_WriteU32(huart, status.last_hal_sd_init_status);
+            Camera_CLI_WriteText(huart, ", error=0x");
+            Camera_CLI_WriteHexU32(huart, status.last_hal_sd_error);
+            Camera_CLI_WriteText(huart, ".\r\n");
         }
         else
         {
@@ -845,7 +932,7 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
         {
             Camera_CLI_WriteLine(
                 huart,
-                "SD TAKEOVER ENTER: full SDIO GPIO switched to AF12, SD init is not implemented yet.");
+                "SD TAKEOVER ENTER: full SDIO GPIO switched to AF12, run SD INIT next.");
         }
         else if (result == CAMERA_SD_ERR_CONFLICT_PIN_RELEASE_FAILED)
         {
@@ -877,7 +964,26 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
 
     if (Camera_CLI_TokenEquals(arg, arg_len, "TAKEOVER EXIT") != 0U)
     {
+        CameraSdStorageStatus_t before_status;
+        CameraSdStorageStatus_t after_status;
+
+        Camera_SDStorage_GetStatus(&before_status);
         result = Camera_SDStorage_RequestTakeoverExit();
+        Camera_SDStorage_GetStatus(&after_status);
+
+        if (after_status.sdio_hal_deinit_attempt_count !=
+            before_status.sdio_hal_deinit_attempt_count)
+        {
+            Camera_CLI_WriteText(
+                huart,
+                "SD TAKEOVER EXIT: HAL_SD_DeInit status=");
+            Camera_CLI_WriteU32(
+                huart,
+                after_status.last_hal_sd_deinit_status);
+            Camera_CLI_WriteText(huart, ", error=0x");
+            Camera_CLI_WriteHexU32(huart, after_status.last_hal_sd_error);
+            Camera_CLI_WriteText(huart, ".\r\n");
+        }
 
         if (result == CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED)
         {

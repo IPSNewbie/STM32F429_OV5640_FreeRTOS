@@ -9,9 +9,11 @@
  * Stage 11C-1 在既有冲突引脚切换成功后，将 PC8～PC12 和 PD2 配置为 SDIO AF12，
  * 并在 EXIT 时先将六个引脚退回 GPIO 输入态，再恢复 PC8、PC9、PC11 的 DCMI AF13。
  * PC8、PC9、PC11 同时被 DCMI 和 SDIO 使用，后续必须先停止 DCMI 和相关 DMA，
- * 再进入 SDIO 接管流程；本文件仍只验证复用切换，不初始化 SDIO 或 FATFS。
+ * 再进入 SDIO 接管流程。Stage 11C-3 只在完整 AF12 状态下验证 HAL_SD_Init，
+ * 不接入 FATFS，不执行块读写，也不启用 SDIO 中断或 DMA。
  */
 static CameraSdStorageStatus_t s_camera_sd_status;
+static SD_HandleTypeDef hsd_snapshot;
 
 #define CAMERA_SD_CONFLICT_PIN_MASK \
     (GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_11)
@@ -57,6 +59,33 @@ static CameraSdStorageStatus_t s_camera_sd_status;
 #define CAMERA_SD_FULL_GPIOD_PULLUP (1UL << (2U * 2U))
 #define CAMERA_SD_FULL_GPIOD_AFRL_MASK (0xFUL << 8U)
 #define CAMERA_SD_FULL_GPIOD_AFRL_AF12 (12UL << 8U)
+
+static void Camera_SDStorage_PrepareSdHandle(void)
+{
+    hsd_snapshot.Instance = SDIO;
+    hsd_snapshot.Init.ClockEdge = SDIO_CLOCK_EDGE_RISING;
+    hsd_snapshot.Init.ClockBypass = SDIO_CLOCK_BYPASS_DISABLE;
+    hsd_snapshot.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
+    /* 本轮只验证 1-bit 初始化，不切换 4-bit，也不调用 HAL_SD_ConfigWideBusOperation。 */
+    hsd_snapshot.Init.BusWide = SDIO_BUS_WIDE_1B;
+    hsd_snapshot.Init.HardwareFlowControl =
+        SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
+    /* ClockDiv=118U 用于保守的 SDIO 初始化低速阶段。 */
+    hsd_snapshot.Init.ClockDiv = 118U;
+    /* Stage 11C-3 只验证 HAL_SD_Init 调用路径，不接 FATFS，不执行块读写。 */
+}
+
+static void Camera_SDStorage_EnableSdioClock(void)
+{
+    __HAL_RCC_SDIO_CLK_ENABLE();
+    s_camera_sd_status.sdio_clock_enabled = 1U;
+}
+
+static void Camera_SDStorage_DisableSdioClock(void)
+{
+    __HAL_RCC_SDIO_CLK_DISABLE();
+    s_camera_sd_status.sdio_clock_enabled = 0U;
+}
 
 static uint32_t Camera_SDStorage_ReleaseConflictPins(void)
 {
@@ -366,6 +395,19 @@ void Camera_SDStorage_InitState(void)
     s_camera_sd_status.sdio_full_gpio_af12_selected = 0U;
     s_camera_sd_status.last_sdio_full_gpio_error_code = CAMERA_SD_OK;
     s_camera_sd_status.last_sdio_full_gpio_operation_ms = 0U;
+    s_camera_sd_status.real_hal_sd_init_enabled = 1U;
+    s_camera_sd_status.sdio_clock_enabled = 0U;
+    s_camera_sd_status.sdio_hal_init_attempt_count = 0U;
+    s_camera_sd_status.sdio_hal_init_success_count = 0U;
+    s_camera_sd_status.sdio_hal_init_error_count = 0U;
+    s_camera_sd_status.sdio_hal_deinit_attempt_count = 0U;
+    s_camera_sd_status.sdio_hal_deinit_success_count = 0U;
+    s_camera_sd_status.sdio_hal_deinit_error_count = 0U;
+    s_camera_sd_status.last_hal_sd_init_status = (uint32_t)HAL_OK;
+    s_camera_sd_status.last_hal_sd_deinit_status = (uint32_t)HAL_OK;
+    s_camera_sd_status.last_hal_sd_error = HAL_SD_ERROR_NONE;
+    s_camera_sd_status.last_sdio_hal_init_operation_ms = 0U;
+    s_camera_sd_status.last_sdio_hal_deinit_operation_ms = 0U;
 }
 
 void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status)
@@ -380,16 +422,54 @@ void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status)
 
 uint32_t Camera_SDStorage_RequestInit(void)
 {
-    /* 只记录受控请求，不把“等待接管”统计为 SD 卡硬件初始化失败。 */
-    ++s_camera_sd_status.init_attempt_count;
-    s_camera_sd_status.last_error_code = CAMERA_SD_ERR_NEED_TAKEOVER;
-    s_camera_sd_status.is_initialized = 0U;
-    s_camera_sd_status.takeover_required = 1U;
-    s_camera_sd_status.sdio_ready = 0U;
-    s_camera_sd_status.fatfs_ready = 0U;
-    s_camera_sd_status.last_operation_ms = HAL_GetTick();
+    uint32_t start_ms = HAL_GetTick();
+    uint32_t hal_start_ms;
+    HAL_StatusTypeDef hal_status;
 
-    return CAMERA_SD_ERR_NEED_TAKEOVER;
+    ++s_camera_sd_status.init_attempt_count;
+
+    if (s_camera_sd_status.sdio_full_gpio_af12_selected != 1U)
+    {
+        /* 完整 SDIO GPIO 未接管时只返回 NEED_TAKEOVER，不调用 HAL_SD_Init。 */
+        s_camera_sd_status.last_error_code = CAMERA_SD_ERR_NEED_TAKEOVER;
+        s_camera_sd_status.is_initialized = 0U;
+        s_camera_sd_status.takeover_required = 1U;
+        s_camera_sd_status.sdio_ready = 0U;
+        s_camera_sd_status.fatfs_ready = 0U;
+        s_camera_sd_status.last_operation_ms = HAL_GetTick() - start_ms;
+        return CAMERA_SD_ERR_NEED_TAKEOVER;
+    }
+
+    Camera_SDStorage_PrepareSdHandle();
+    Camera_SDStorage_EnableSdioClock();
+    ++s_camera_sd_status.sdio_hal_init_attempt_count;
+
+    hal_start_ms = HAL_GetTick();
+    hal_status = HAL_SD_Init(&hsd_snapshot);
+    s_camera_sd_status.last_sdio_hal_init_operation_ms =
+        HAL_GetTick() - hal_start_ms;
+    s_camera_sd_status.last_hal_sd_init_status = (uint32_t)hal_status;
+    s_camera_sd_status.last_hal_sd_error = HAL_SD_GetError(&hsd_snapshot);
+    s_camera_sd_status.fatfs_ready = 0U;
+
+    if (hal_status == HAL_OK)
+    {
+        ++s_camera_sd_status.init_success_count;
+        ++s_camera_sd_status.sdio_hal_init_success_count;
+        s_camera_sd_status.is_initialized = 1U;
+        s_camera_sd_status.sdio_ready = 1U;
+        s_camera_sd_status.last_error_code = CAMERA_SD_OK;
+        s_camera_sd_status.last_operation_ms = HAL_GetTick() - start_ms;
+        return CAMERA_SD_OK;
+    }
+
+    ++s_camera_sd_status.init_error_count;
+    ++s_camera_sd_status.sdio_hal_init_error_count;
+    s_camera_sd_status.is_initialized = 0U;
+    s_camera_sd_status.sdio_ready = 0U;
+    s_camera_sd_status.last_error_code = CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED;
+    s_camera_sd_status.last_operation_ms = HAL_GetTick() - start_ms;
+    return CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED;
 }
 
 uint32_t Camera_SDStorage_RequestTakeoverEnter(void)
@@ -506,6 +586,38 @@ uint32_t Camera_SDStorage_RequestTakeoverExit(void)
 
     ++s_camera_sd_status.takeover_exit_attempt_count;
     s_camera_sd_status.conflict_pin_release_ready = 0U;
+
+    if ((s_camera_sd_status.is_initialized != 0U) ||
+        (s_camera_sd_status.sdio_clock_enabled != 0U))
+    {
+        uint32_t hal_start_ms = HAL_GetTick();
+        HAL_StatusTypeDef hal_status;
+
+        ++s_camera_sd_status.sdio_hal_deinit_attempt_count;
+        hal_status = HAL_SD_DeInit(&hsd_snapshot);
+        s_camera_sd_status.last_sdio_hal_deinit_operation_ms =
+            HAL_GetTick() - hal_start_ms;
+        s_camera_sd_status.last_hal_sd_deinit_status = (uint32_t)hal_status;
+        s_camera_sd_status.last_hal_sd_error = HAL_SD_GetError(&hsd_snapshot);
+
+        if (hal_status == HAL_OK)
+        {
+            ++s_camera_sd_status.sdio_hal_deinit_success_count;
+        }
+        else
+        {
+            ++s_camera_sd_status.sdio_hal_deinit_error_count;
+            s_camera_sd_status.last_error_code =
+                CAMERA_SD_ERR_SDIO_HAL_DEINIT_FAILED;
+        }
+
+        /* 即使 HAL_SD_DeInit 失败，也必须关时钟并继续恢复 GPIO。 */
+        Camera_SDStorage_DisableSdioClock();
+    }
+
+    s_camera_sd_status.is_initialized = 0U;
+    s_camera_sd_status.sdio_ready = 0U;
+    s_camera_sd_status.fatfs_ready = 0U;
 
     if (s_camera_sd_status.sdio_full_gpio_af12_selected != 0U)
     {
@@ -628,6 +740,12 @@ const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
 
         case CAMERA_SD_ERR_SDIO_FULL_GPIO_RESTORE_FAILED:
             return "SDIO_FULL_GPIO_RESTORE_FAILED";
+
+        case CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED:
+            return "SDIO_HAL_INIT_FAILED";
+
+        case CAMERA_SD_ERR_SDIO_HAL_DEINIT_FAILED:
+            return "SDIO_HAL_DEINIT_FAILED";
 
         default:
             return "UNKNOWN_ERROR";

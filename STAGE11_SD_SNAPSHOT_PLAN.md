@@ -4800,3 +4800,529 @@ Stage 11C-2 通过后，Stage 11C-3 可以进入 `HAL_SD_Init` 最小初始化�
 - 保持 `SNAPSHOT PREPARE -> SD TAKEOVER ENTER -> SD INIT` 的安全顺序，仅在完整 SDIO GPIO AF12 状态下执行初始化。
 - 不接入 FATFS，不写 SD 卡。
 - 初始化失败时不复位，必须记录明确错误码，并允许执行 `SD TAKEOVER EXIT` 和 `SNAPSHOT RESTORE` 完成恢复。
+
+## Stage 11C-3 HAL_SD_Init最小初始化验证
+
+### 1. 本轮目的
+
+- 保持 `SNAPSHOT PREPARE -> SD TAKEOVER ENTER -> SD INIT` 的安全顺序，仅在 PC8、PC9、PC10、PC11、PC12、PD2 已完整切换到 `GPIO_AF12_SDIO`，且 `sdio_full_gpio_af12_selected=1` 时执行 `HAL_SD_Init`。
+- 只观察 `HAL_SD_Init` 返回值和 `HAL_SD_GetError`，验证真实 HAL SD 最小初始化调用路径是否可控、可观察、可恢复。
+- 初始化成功时记录 `is_initialized=1`、`sdio_ready=1`、`fatfs_ready=0`。
+- 初始化失败时记录 HAL 返回状态和错误码，但不复位、不进入 FATAL、不卡死，并保留退出恢复路径。
+- `SD TAKEOVER EXIT` 在 SDIO 已初始化或时钟已打开时先执行 `HAL_SD_DeInit`，随后关闭 SDIO 外设时钟，再退出完整 AF12 并恢复 PC8、PC9、PC11 的 DCMI AF13。
+- 后续板测需要验证 `SNAPSHOT RESTORE` 后 basic、pc_dump、repeat 和运行保护状态均可恢复正常。本轮 Codex 不执行硬件测试。
+
+### 2. 本轮不做
+
+- 不调用 `HAL_SD_ConfigWideBusOperation`，只使用 1-bit 总线模式。
+- 不调用 `HAL_SD_ReadBlocks` 或 `HAL_SD_WriteBlocks`，不读写任何 SD 卡块。
+- 不接入 FATFS，不调用 `f_mount`、`f_open`、`f_write`、`f_read`，不创建或写入文件。
+- 不使用 SDIO DMA，不启用 SDIO 中断，也不配置 `SDIO_IRQn`。
+- 不修改 DCMI、FreeRTOS、IWDG、UART DMA、二进制请求协议或 OV56RGB5 图像帧格式。
+
+### 3. HAL SD最小配置
+
+模块内部使用静态 `SD_HandleTypeDef hsd_snapshot`，配置如下：
+
+```text
+Instance=SDIO
+ClockEdge=SDIO_CLOCK_EDGE_RISING
+ClockBypass=SDIO_CLOCK_BYPASS_DISABLE
+ClockPowerSave=SDIO_CLOCK_POWER_SAVE_DISABLE
+BusWide=SDIO_BUS_WIDE_1B
+HardwareFlowControl=SDIO_HARDWARE_FLOW_CONTROL_DISABLE
+ClockDiv=118U
+```
+
+`ClockDiv=118U` 用于保守的 SDIO 初始化低速阶段。本轮不切换 4-bit，不做 FATFS 和块读写。`HAL_SD_Init` 前打开 SDIO 外设时钟；EXIT 中无论初始化成功还是失败，只要时钟打开过，都尝试 `HAL_SD_DeInit`、关闭时钟并继续恢复 GPIO。
+
+### 4. 新增状态字段
+
+- `real_hal_sd_init_enabled`
+- `sdio_clock_enabled`
+- `sdio_hal_init_attempt_count`
+- `sdio_hal_init_success_count`
+- `sdio_hal_init_error_count`
+- `sdio_hal_deinit_attempt_count`
+- `sdio_hal_deinit_success_count`
+- `sdio_hal_deinit_error_count`
+- `last_hal_sd_init_status`
+- `last_hal_sd_deinit_status`
+- `last_hal_sd_error`
+- `last_sdio_hal_init_operation_ms`
+- `last_sdio_hal_deinit_operation_ms`
+
+其中 `real_hal_sd_init_enabled` 固定为 1；被 `NEED_TAKEOVER` 阻止的 `SD INIT` 不增加真实 HAL 初始化调用次数；两个 HAL 操作耗时均使用出口 tick 减入口 tick，不记录系统绝对 tick。
+
+### 5. 预期命令行为
+
+- 未完成 `SNAPSHOT PREPARE / SD TAKEOVER ENTER` 时，`SD INIT` 不调用 HAL，仍返回 `NEED_TAKEOVER`。
+- 完整 SDIO GPIO AF12 已选择后，`SD INIT` 打开 SDIO 时钟并调用 `HAL_SD_Init`。
+- SD 卡初始化正常时输出 `SD INIT: HAL_SD_Init OK, FATFS is not mounted.`。
+- SD 卡未插入、不兼容或存在时钟、线序、硬件问题时，输出 `SD INIT: HAL_SD_Init failed, status=<status>, error=0x<error>.`，并记录 `SDIO_HAL_INIT_FAILED`。
+- `SD TAKEOVER EXIT` 若执行了反初始化，可输出 `HAL_SD_DeInit` 状态和错误码；即使反初始化失败，也必须关闭 SDIO 时钟并继续恢复 GPIO。
+- `SNAPSHOT RESTORE` 后应继续验证 basic、pc_dump、repeat 20/20 PASS，以及 IWDG、HOOK、UART RX DMA 状态正常。
+
+### 6. 风险说明
+
+- 本轮首次打开 SDIO 外设时钟并调用 `HAL_SD_Init`，风险高于此前只验证 GPIO AF12 切换的阶段。
+- `HAL_SD_Init` 可能因 SD 卡未插入、卡不兼容、时钟配置、线序或硬件问题失败；失败不一定立即代表软件实现错误，但必须能够输出状态、执行 EXIT 并恢复相机链路。
+- `HAL_SD_Init` 或 `HAL_SD_DeInit` 失败不得触发复位、FATAL 或死锁；GPIO 恢复路径不能被反初始化失败阻断。
+- 本轮不读取或写入 SD 卡，不会主动改动用户卡内文件。
+
+### 7. 后续Stage 11C-4建议
+
+- 如果 `HAL_SD_Init` 成功，下一步使用 `HAL_SD_GetCardInfo` 读取 SD 卡基础信息。
+- 继续不接 FATFS、不写卡，先验证卡类型、容量、块大小、错误码和退出恢复路径。
+
+### 8. Stage 11C-3板测结果
+
+#### 8.1 启动情况
+
+- 启动正常，`reset: iwdg=0`。
+- OV5640 ID 为 `0x5640`，Camera init OK。
+- 无 FATAL、无反复复位、无 IWDG 复位循环。
+
+#### 8.2 未PREPARE时的SD INIT保护
+
+未执行 `SNAPSHOT PREPARE` 时直接执行 `SD INIT`，输出：
+
+```text
+SD INIT: deferred, need SDIO takeover because PC8/PC9/PC11 conflict with DCMI.
+```
+
+此时 `SD STATUS` 为：
+
+```text
+is_initialized=0
+takeover_required=1
+sdio_ready=0
+fatfs_ready=0
+init_attempt_count=1
+init_success_count=0
+init_error_count=0
+last_error_code=3
+last_error_text=NEED_TAKEOVER
+takeover_state_text=IDLE
+sdio_full_gpio_af12_selected=0
+real_hal_sd_init_enabled=1
+sdio_clock_enabled=0
+sdio_hal_init_attempt_count=0
+sdio_hal_init_success_count=0
+sdio_hal_init_error_count=0
+last_hal_sd_init_status=0
+last_hal_sd_error=0
+```
+
+该结果说明未执行 `SNAPSHOT PREPARE` 和 `SD TAKEOVER ENTER` 时，`SD INIT` 被 `NEED_TAKEOVER` 正确阻止；没有调用 `HAL_SD_Init`，没有打开 SDIO 时钟，也没有初始化 SDIO 或 FATFS。
+
+#### 8.3 SNAPSHOT PREPARE
+
+命令输出：
+
+```text
+SNAPSHOT PREPARE: DCMI stop OK, snapshot software guard active.
+```
+
+`SNAPSHOT STATUS` 为：
+
+```text
+camera_control_state=2
+camera_control_state_text=CAMERA_PAUSED
+prepare_attempt_count=1
+prepare_success_count=1
+real_dcmi_stop_enabled=1
+dcmi_stop_attempt_count=1
+dcmi_stop_success_count=1
+dcmi_stop_error_count=0
+last_dcmi_stop_hal_status=0
+software_guard_active=1
+dump_block_required=1
+last_error_code=0
+last_error_text=OK
+```
+
+`HAL_DCMI_Stop` 调用成功，snapshot guard 已开启；此时图像 DUMP 和 binary 请求应被阻止。
+
+#### 8.4 完整SDIO GPIO AF12接管
+
+`SD TAKEOVER ENTER` 输出：
+
+```text
+SD TAKEOVER ENTER: full SDIO GPIO switched to AF12, run SD INIT next.
+```
+
+`SD TAKEOVER STATUS` 为：
+
+```text
+takeover_state=1
+takeover_state_text=ENTER_DEFERRED
+takeover_enter_attempt_count=1
+takeover_precheck_attempt_count=1
+takeover_precheck_success_count=1
+takeover_precheck_fail_count=0
+snapshot_pause_confirmed=1
+conflict_pin_release_ready=1
+conflict_pin_release_attempt_count=1
+conflict_pin_release_success_count=1
+conflict_pin_release_error_count=0
+conflict_pins_released=0
+sdio_af12_switch_attempt_count=1
+sdio_af12_switch_success_count=1
+sdio_af12_switch_error_count=0
+sdio_af12_selected=1
+sdio_full_gpio_switch_attempt_count=1
+sdio_full_gpio_switch_success_count=1
+sdio_full_gpio_switch_error_count=0
+sdio_full_gpio_af12_selected=1
+real_hal_sd_init_enabled=1
+sdio_clock_enabled=0
+```
+
+PC8、PC9、PC11 已先释放并切换到 SDIO AF12，随后 PC8、PC9、PC10、PC11、PC12、PD2 已完整切换到 SDIO AF12。此时尚未调用 `HAL_SD_Init`，因此 `sdio_clock_enabled=0` 是正常结果。
+
+#### 8.5 HAL_SD_Init最小初始化
+
+在完整 SDIO GPIO AF12 状态下执行 `SD INIT`，输出：
+
+```text
+SD INIT: HAL_SD_Init OK, FATFS is not mounted.
+```
+
+`SD STATUS` 为：
+
+```text
+is_initialized=1
+takeover_required=1
+sdio_ready=1
+fatfs_ready=0
+init_attempt_count=2
+init_success_count=1
+init_error_count=0
+last_error_code=0
+last_error_text=OK
+last_operation_ms=4
+takeover_state_text=ENTER_DEFERRED
+sdio_af12_selected=1
+sdio_full_gpio_af12_selected=1
+real_hal_sd_init_enabled=1
+sdio_clock_enabled=1
+sdio_hal_init_attempt_count=1
+sdio_hal_init_success_count=1
+sdio_hal_init_error_count=0
+sdio_hal_deinit_attempt_count=0
+sdio_hal_deinit_success_count=0
+sdio_hal_deinit_error_count=0
+last_hal_sd_init_status=0
+last_hal_sd_deinit_status=0
+last_hal_sd_error=0
+last_sdio_hal_init_operation_ms=4
+last_sdio_hal_deinit_operation_ms=0
+```
+
+`HAL_SD_Init` 返回 `HAL_OK`，`HAL_SD_GetError` 返回 0，最小初始化耗时约 4 ms。初始化后 `is_initialized=1`、`sdio_ready=1`、`fatfs_ready=0`，符合本阶段只初始化 SDIO、不挂载 FATFS 的设计。
+
+`init_attempt_count=2` 是正确结果：第一次 `SD INIT` 在未 PREPARE、未接管时被 `NEED_TAKEOVER` 阻止，第二次才真正调用 `HAL_SD_Init`；`sdio_hal_init_attempt_count=1` 才是实际 HAL 初始化调用次数。本轮没有调用 `HAL_SD_ConfigWideBusOperation`，没有读写 SD 卡块，没有接入 FATFS，也没有写文件。
+
+#### 8.6 guard状态下的DUMP和binary保护
+
+文本 `DUMP` 输出：
+
+```text
+DUMP blocked: snapshot software guard active.
+```
+
+此时 `SNAPSHOT STATUS` 中：
+
+```text
+software_guard_active=1
+dump_block_required=1
+dump_block_count=1
+binary_block_count=0
+```
+
+guard 状态下执行 binary basic，响应长度为 0 B，PC 端接收超时，测试结果为 FAIL。该 FAIL 是预期现象；随后 `binary_block_count` 增加。`HAL_SD_Init` 成功后 snapshot guard 仍然有效，文本 DUMP 和 binary 图像请求均被阻止，没有输出 OV56RGB5 图像帧。
+
+#### 8.7 SD TAKEOVER EXIT与HAL_SD_DeInit
+
+命令输出：
+
+```text
+SD TAKEOVER EXIT: HAL_SD_DeInit status=0, error=0x00000000.
+SD TAKEOVER EXIT: full SDIO GPIO restored, conflict pins restored to DCMI AF13.
+```
+
+退出后的 `SD TAKEOVER STATUS / SD STATUS` 关键字段为：
+
+```text
+takeover_state=3
+takeover_state_text=EXIT_DEFERRED
+takeover_exit_attempt_count=1
+conflict_pin_restore_attempt_count=1
+conflict_pin_restore_success_count=1
+conflict_pin_restore_error_count=0
+conflict_pins_released=0
+sdio_af12_selected=0
+sdio_full_gpio_restore_attempt_count=1
+sdio_full_gpio_restore_success_count=1
+sdio_full_gpio_restore_error_count=0
+sdio_full_gpio_af12_selected=0
+real_hal_sd_init_enabled=1
+sdio_clock_enabled=0
+sdio_hal_init_attempt_count=1
+sdio_hal_init_success_count=1
+sdio_hal_init_error_count=0
+sdio_hal_deinit_attempt_count=1
+sdio_hal_deinit_success_count=1
+sdio_hal_deinit_error_count=0
+last_hal_sd_init_status=0
+last_hal_sd_deinit_status=0
+last_hal_sd_error=0
+last_sdio_hal_init_operation_ms=4
+last_sdio_hal_deinit_operation_ms=0
+is_initialized=0
+sdio_ready=0
+fatfs_ready=0
+```
+
+`HAL_SD_DeInit` 返回 `HAL_OK`，SDIO 时钟已关闭。完整 SDIO GPIO 已退出 AF12，PC8、PC9、PC11 已恢复为 DCMI AF13。EXIT 后 `is_initialized=0`、`sdio_ready=0` 是正确结果，因为已经完成反初始化。`sdio_af12_restore_attempt_count=0` 也是合理结果：当前走完整六引脚退出路径，不调用旧的三冲突引脚退出函数。
+
+#### 8.8 SNAPSHOT RESTORE
+
+命令输出：
+
+```text
+SNAPSHOT RESTORE: deferred, camera restore and DCMI restart are not implemented yet.
+```
+
+`SNAPSHOT STATUS` 为：
+
+```text
+camera_control_state=3
+camera_control_state_text=RESTORE_DEFERRED
+prepare_attempt_count=1
+restore_attempt_count=1
+prepare_success_count=1
+restore_success_count=0
+control_error_count=0
+last_error_code=3
+last_error_text=CAMERA_RESTORE_NOT_IMPLEMENTED
+dcmi_stop_attempt_count=1
+dcmi_stop_success_count=1
+dcmi_stop_error_count=0
+software_guard_active=0
+dump_block_required=0
+dump_block_count=1
+binary_block_count=1
+```
+
+`SNAPSHOT RESTORE` 清除了 snapshot guard，RESTORE 后允许恢复图像导出。
+
+#### 8.9 RESTORE后图像功能回归
+
+- guard 状态下 basic 响应长度为 0 B，测试 FAIL，属于预期现象。
+- RESTORE 后 basic 响应长度为 38426 B，`frame_id=1`，CRC 一致，测试 PASS。
+- RESTORE 后 pc_dump 测试 PASS，`frame_id=2`，图像质量无阈值警告。
+- pc_dump 图像：`captures/014_sd_c3_hal_sd_init_20260805_193525.png`。
+- pc_dump 报告：`captures/014_sd_c3_hal_sd_init_20260805_193525_report.txt`。
+- RESTORE 后 repeat 共请求 20 次，成功 20 次、失败 0 次，成功率 100.00%，测试 PASS。
+- repeat 平均耗时 3462.97 ms，最短 3438.53 ms，最长 3467.90 ms。
+- repeat 的 `frame_id` 从 3 到 22 连续递增。
+
+#### 8.10 最终SD STATUS
+
+```text
+is_initialized=0
+takeover_required=1
+sdio_ready=0
+fatfs_ready=0
+init_attempt_count=2
+init_success_count=1
+init_error_count=0
+last_error_code=0
+last_error_text=OK
+last_operation_ms=4
+takeover_state_text=EXIT_DEFERRED
+sdio_af12_selected=0
+sdio_full_gpio_af12_selected=0
+real_hal_sd_init_enabled=1
+sdio_clock_enabled=0
+sdio_hal_init_attempt_count=1
+sdio_hal_init_success_count=1
+sdio_hal_init_error_count=0
+sdio_hal_deinit_attempt_count=1
+sdio_hal_deinit_success_count=1
+sdio_hal_deinit_error_count=0
+last_hal_sd_init_status=0
+last_hal_sd_deinit_status=0
+last_hal_sd_error=0
+last_sdio_hal_init_operation_ms=4
+last_sdio_hal_deinit_operation_ms=0
+```
+
+#### 8.11 最终SD TAKEOVER STATUS
+
+```text
+takeover_state=3
+takeover_state_text=EXIT_DEFERRED
+takeover_enter_attempt_count=1
+takeover_exit_attempt_count=1
+takeover_error_count=0
+last_takeover_error_code=6
+last_takeover_error_text=TAKEOVER_NOT_IMPLEMENTED
+takeover_precheck_attempt_count=1
+takeover_precheck_success_count=1
+takeover_precheck_fail_count=0
+snapshot_pause_confirmed=0
+conflict_pin_release_ready=0
+conflict_pin_release_attempt_count=1
+conflict_pin_release_success_count=1
+conflict_pin_release_error_count=0
+conflict_pin_restore_attempt_count=1
+conflict_pin_restore_success_count=1
+conflict_pin_restore_error_count=0
+conflict_pins_released=0
+sdio_af12_switch_attempt_count=1
+sdio_af12_switch_success_count=1
+sdio_af12_switch_error_count=0
+sdio_af12_selected=0
+sdio_full_gpio_switch_attempt_count=1
+sdio_full_gpio_switch_success_count=1
+sdio_full_gpio_switch_error_count=0
+sdio_full_gpio_restore_attempt_count=1
+sdio_full_gpio_restore_success_count=1
+sdio_full_gpio_restore_error_count=0
+sdio_full_gpio_af12_selected=0
+real_hal_sd_init_enabled=1
+sdio_clock_enabled=0
+sdio_hal_init_attempt_count=1
+sdio_hal_init_success_count=1
+sdio_hal_init_error_count=0
+sdio_hal_deinit_attempt_count=1
+sdio_hal_deinit_success_count=1
+sdio_hal_deinit_error_count=0
+last_hal_sd_init_status=0
+last_hal_sd_deinit_status=0
+last_hal_sd_error=0
+```
+
+`last_takeover_error_text=TAKEOVER_NOT_IMPLEMENTED` 仍是预期结果，因为当前只完成 HAL SD 最小初始化，还未接入 FATFS，也未实现真正的拍照保存流程。
+
+#### 8.12 最终SNAPSHOT STATUS
+
+```text
+camera_control_state=3
+camera_control_state_text=RESTORE_DEFERRED
+prepare_attempt_count=1
+restore_attempt_count=1
+prepare_success_count=1
+restore_success_count=0
+control_error_count=0
+last_error_code=3
+last_error_text=CAMERA_RESTORE_NOT_IMPLEMENTED
+dcmi_stop_attempt_count=1
+dcmi_stop_success_count=1
+dcmi_stop_error_count=0
+software_guard_active=0
+dump_block_required=0
+dump_block_count=1
+binary_block_count=1
+```
+
+#### 8.13 最终STATUS关键字段
+
+`RTOS`：
+
+```text
+dump_request_count=24
+dump_success_count=22
+dump_error_count=2
+binary_request_count=22
+binary_request_success_count=21
+binary_request_error_count=0
+binary_request_crc_error_count=0
+binary_request_version_error_count=0
+binary_request_type_error_count=0
+binary_request_length_error_count=0
+binary_request_eof_error_count=0
+binary_request_timeout_count=0
+last_binary_request_seq=20
+last_binary_error_code=0
+last_error_code=8
+```
+
+`dump_error_count=2` 是预期结果，对应 guard 状态下文本 DUMP 和 binary 请求各被阻止一次。`binary_request_error_count=0` 是正确结果，因为 binary 请求帧格式正确，只是被 snapshot guard 拦截，不属于协议错误。`last_error_code=8` 对应 snapshot guard active 类错误，属于预期行为。
+
+`HEALTH`：
+
+```text
+camera_service_stack_min_free_bytes=6944
+monitor_stack_min_free_bytes=1864
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+`HOOK`：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+`HEARTBEAT`：
+
+```text
+camera_service_heartbeat_age_ms=72
+monitor_heartbeat_age_ms=254
+```
+
+`IWDG`：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=248
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_test_mode=0
+```
+
+`UART RX DMA`：
+
+```text
+uart_dma_event_count=51
+uart_dma_rx_bytes=590
+stream_buffer_write_bytes=590
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+### 9. Stage 11C-3板测结论
+
+Stage 11C-3 验证通过。本轮在完整 SDIO GPIO AF12 状态下首次调用 `HAL_SD_Init`，返回 `HAL_OK`，`HAL_SD_GetError` 返回 0，耗时约 4 ms；初始化后 `is_initialized=1`、`sdio_ready=1`、`fatfs_ready=0`。`SD TAKEOVER EXIT` 中 `HAL_SD_DeInit` 返回 `HAL_OK`，并成功关闭 SDIO 时钟、退出完整 SDIO GPIO AF12，同时恢复 PC8、PC9、PC11 为 DCMI AF13。
+
+`SNAPSHOT RESTORE` 后 guard 清除，basic、pc_dump、repeat 20/20 均 PASS，说明最小 `HAL_SD_Init / HAL_SD_DeInit` 流程没有破坏图像链路。最终 STATUS 显示 IWDG 未跳过喂狗，Hook 未触发，UART RX DMA 无错误、无溢出、无恢复、无重同步。
+
+### 10. 严谨说明
+
+本轮虽然 `HAL_SD_Init` 已成功，但仍未调用 `HAL_SD_ConfigWideBusOperation`，未读取或写入 SD 卡块，未接入 FATFS，未挂载文件系统，也未写入 SD 卡。因此，本轮通过只能说明 SDIO 1-bit 最小 HAL 初始化和反初始化路径可用，不能说明 FATFS 文件写入或 SD 卡拍照保存已经完成。
+
+### 11. 后续Stage 11C-4建议
+
+Stage 11C-4 建议在 `HAL_SD_Init` 成功后调用 `HAL_SD_GetCardInfo` 读取 SD 卡基础信息。下一步仍不接 FATFS、不写卡，只记录：
+
+- `CardType`
+- `CardVersion`
+- `Class`
+- `RelCardAdd`
+- `BlockNbr`
+- `BlockSize`
+- `LogBlockNbr`
+- `LogBlockSize`
+- `CardSpeed`
+- `CardSpeedClass`
+- `CardCommandClass`
+- `HAL_SD_GetState`
+- `HAL_SD_GetError`
