@@ -149,6 +149,63 @@ typedef struct
     uint32_t atk_official_clock_div;                /* ATK 官方路径固定 ClockDiv=1。 */
     uint32_t atk_official_bus_width_after_init;     /* HAL_SD_Init 成功后的总线宽度。 */
     uint32_t atk_official_bus_width_after_widebus;  /* ConfigWideBus 成功后的总线宽度。 */
+    uint32_t atk_1bit_supported;                    /* 是否支持 ATK 官方 1-bit polling read 诊断。 */
+    uint32_t atk_1bit_init_attempt_count;           /* SD ATK1BINIT 调用次数。 */
+    uint32_t atk_1bit_init_success_count;           /* ATK 1-bit 初始化成功次数。 */
+    uint32_t atk_1bit_init_error_count;             /* ATK 1-bit 初始化失败次数。 */
+    uint32_t atk_1bit_gpio_config_attempt_count;    /* ATK 1-bit GPIO 配置尝试次数。 */
+    uint32_t atk_1bit_gpio_config_success_count;    /* ATK 1-bit GPIO 配置成功次数。 */
+    uint32_t atk_1bit_hal_init_status;              /* ATK 1-bit HAL_SD_Init 返回值。 */
+    uint32_t atk_1bit_hal_error;                    /* ATK 1-bit HAL_SD_Init 错误码。 */
+    uint32_t atk_1bit_cardinfo_status;              /* ATK 1-bit GetCardInfo 返回值。 */
+    uint32_t atk_1bit_cardinfo_error;               /* ATK 1-bit GetCardInfo 错误码。 */
+    uint32_t atk_1bit_wait_transfer_attempt_count;  /* ATK 1-bit init 等待 TRANSFER 次数。 */
+    uint32_t atk_1bit_wait_transfer_success_count;  /* ATK 1-bit init 等待成功次数。 */
+    uint32_t atk_1bit_wait_transfer_error_count;    /* ATK 1-bit init 等待失败次数。 */
+    uint32_t atk_1bit_last_card_state;              /* ATK 1-bit init 最近卡状态。 */
+    uint32_t atk_1bit_last_operation_ms;            /* 最近一次 ATK 1-bit init 耗时。 */
+    uint32_t atk_1bit_init_ready;                   /* ATK 1-bit init、CardInfo 和等待是否成功。 */
+    uint32_t atk_1bit_clock_div;                    /* ATK 1-bit 路径固定 ClockDiv=1。 */
+    uint32_t atk_1bit_bus_width;                    /* ATK 1-bit 路径固定总线宽度 1。 */
+    uint32_t atk_1bit_read_attempt_count;           /* ATK 1-bit 实际读块次数。 */
+    uint32_t atk_1bit_read_success_count;           /* ATK 1-bit 读块成功次数。 */
+    uint32_t atk_1bit_read_error_count;             /* ATK 1-bit 读块失败次数。 */
+    uint32_t atk_1bit_last_read_status;             /* 最近一次 ATK 1-bit ReadBlocks 返回值。 */
+    uint32_t atk_1bit_last_read_error;              /* 最近一次 ATK 1-bit HAL SD 错误码。 */
+    uint32_t atk_1bit_last_read_operation_ms;       /* 最近一次 ATK 1-bit read 总耗时。 */
+    uint32_t atk_1bit_last_read_addr;               /* 最近一次 ATK 1-bit 逻辑块地址。 */
+    uint32_t atk_1bit_last_read_count;              /* 最近一次 ATK 1-bit 块数，固定为 1。 */
+    uint32_t atk_1bit_last_read_size;               /* 最近一次成功读取的字节数。 */
+    uint32_t atk_1bit_read_pre_card_state;          /* ReadBlocks 前卡状态。 */
+    uint32_t atk_1bit_read_post_card_state;         /* ReadBlocks 返回后卡状态。 */
+    uint32_t atk_1bit_read_wait_card_state;         /* 读后等待结束时卡状态。 */
+    uint32_t atk_1bit_read_wait_operation_ms;       /* 读后等待耗时。 */
+    uint32_t atk_1bit_read_wait_timeout_ms;         /* 读后等待配置超时。 */
+    uint32_t atk_1bit_read_error_is_data_crc_fail;  /* 最近错误是否含 DATA_CRC_FAIL。 */
+    uint32_t atk_1bit_read_error_is_cmd_crc_fail;   /* 最近错误是否含 CMD_CRC_FAIL。 */
+    uint32_t atk_1bit_read_error_is_cmd_rsp_timeout; /* 最近错误是否含 CMD_RSP_TIMEOUT。 */
+    uint32_t atk_1bit_read_error_is_data_timeout;   /* 最近错误是否含 DATA_TIMEOUT。 */
+    uint32_t atk_1bit_read_error_is_rx_overrun;     /* 最近错误是否含 RX_OVERRUN。 */
+    uint32_t atk_1bit_read_error_is_tx_underrun;    /* 最近错误是否含 TX_UNDERRUN。 */
+    uint32_t atk_1bit_buffer_inspected;             /* 是否已统计完整 ATK 1-bit buffer。 */
+    uint32_t atk_1bit_buffer_len;                   /* ATK 1-bit buffer 统计长度。 */
+    uint32_t atk_1bit_prefill_pattern;              /* ATK 1-bit buffer 预填值。 */
+    uint32_t atk_1bit_buffer_sum512;                /* 完整 512B 逐字节和。 */
+    uint32_t atk_1bit_buffer_xor512;                /* 完整 512B 逐字节异或。 */
+    uint32_t atk_1bit_buffer_nonzero_count512;      /* 完整 512B 非零字节数。 */
+    uint32_t atk_1bit_buffer_zero_count512;         /* 完整 512B 零字节数。 */
+    uint32_t atk_1bit_buffer_ff_count512;           /* 完整 512B 0xFF 字节数。 */
+    uint32_t atk_1bit_buffer_prefill_count512;      /* 完整 512B 仍为预填值的字节数。 */
+    uint32_t atk_1bit_buffer_changed_count512;      /* 完整 512B 已变化字节数。 */
+    uint32_t atk_1bit_buffer_changed;               /* buffer 是否至少有一个字节变化。 */
+    uint32_t atk_1bit_buffer_all_prefill;           /* buffer 是否仍全部为预填值。 */
+    uint32_t atk_1bit_buffer_all_zero;              /* buffer 是否全部为零。 */
+    uint32_t atk_1bit_buffer_all_ff;                /* buffer 是否全部为 0xFF。 */
+    uint32_t atk_1bit_buffer_first_changed_index;   /* 第一个非预填字节索引。 */
+    uint32_t atk_1bit_buffer_last_changed_index;    /* 最后一个非预填字节索引。 */
+    uint8_t atk_1bit_buffer_first16[16];            /* ATK 1-bit buffer 前 16 字节。 */
+    uint8_t atk_1bit_buffer_first32[32];            /* ATK 1-bit buffer 前 32 字节。 */
+    uint8_t atk_1bit_buffer_tail16[16];             /* ATK 1-bit buffer 尾 16 字节。 */
     uint32_t block_read_test_enabled;                /* 是否允许执行 Stage 11C-5 只读单块验证。 */
     uint32_t block_read_attempt_count;               /* 实际调用 HAL_SD_ReadBlocks 的次数。 */
     uint32_t block_read_success_count;               /* 单块读取成功次数。 */
@@ -202,6 +259,12 @@ uint32_t Camera_SDStorage_RequestInit(void);
 
 /* 独立执行 ATK 官方 GPIO、ClockDiv=1、1-bit init、CardInfo 和 4-bit 配置诊断。 */
 uint32_t Camera_SDStorage_AtkOfficialInit(void);
+
+/* 独立执行 ATK 官方 ClockDiv=1、1-bit init、CardInfo 和 TRANSFER 等待。 */
+uint32_t Camera_SDStorage_AtkOfficial1BitInit(void);
+
+/* 在 ATK 1-bit init ready 后关闭中断执行一次 polling 单块读取与读后等待。 */
+uint32_t Camera_SDStorage_AtkOfficial1BitReadBlock(uint32_t block_addr);
 
 /* 只读方式读取一个 512 字节逻辑块；CLI 默认请求块 0，也可指定地址。 */
 uint32_t Camera_SDStorage_RequestBlockReadTest(uint32_t block_addr);

@@ -305,6 +305,9 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart) // 输出当前 CLI 
     Camera_CLI_WriteLine(huart, "SD LINESTATE - show read-only SDIO GPIO register and pin state"); // 只读输出 SDIO 六根信号线状态
     Camera_CLI_WriteLine(huart, "SD ATKINIT - run independent ATK official SDIO init and 4-bit diagnostic");
     Camera_CLI_WriteLine(huart, "SD ATKSTATUS - show ATK official init diagnostic status");
+    Camera_CLI_WriteLine(huart, "SD ATK1BINIT - initialize independent ATK official 1-bit polling path");
+    Camera_CLI_WriteLine(huart, "SD ATK1BREAD [block] - read one block on ATK 1-bit polling path, default 0");
+    Camera_CLI_WriteLine(huart, "SD ATK1BSTATUS - show ATK official 1-bit polling diagnostic status");
     Camera_CLI_WriteLine(huart, "SD INIT - request SD card init, currently deferred until SDIO takeover"); // 请求初始化，本阶段延后到 SDIO 接管完成后
     Camera_CLI_WriteLine(huart, "SD TAKEOVER STATUS - show SDIO takeover status"); // 查询 SDIO 接管软件状态
     Camera_CLI_WriteLine(huart, "SD TAKEOVER ENTER - request SDIO takeover, currently deferred"); // 请求进入接管模式，本阶段只记录请求
@@ -905,6 +908,91 @@ static void Camera_CLI_PrintSdAtkFields(
         status->atk_official_bus_width_after_widebus);
 }
 
+static void Camera_CLI_PrintSdAtk1BitByteField(
+    UART_HandleTypeDef *huart,
+    const char *name,
+    const uint8_t *data,
+    uint32_t length)
+{
+    uint32_t index;
+
+    Camera_CLI_WriteText(huart, "  ");
+    Camera_CLI_WriteText(huart, name);
+    Camera_CLI_WriteText(huart, "=");
+    for (index = 0U; index < length; ++index)
+    {
+        if (index != 0U)
+        {
+            Camera_CLI_WriteText(huart, " ");
+        }
+        Camera_CLI_WriteHexByte(huart, data[index]);
+    }
+    Camera_CLI_WriteText(huart, "\r\n");
+}
+
+static void Camera_CLI_PrintSdAtk1BitFields(
+    UART_HandleTypeDef *huart,
+    const CameraSdStorageStatus_t *status)
+{
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_supported", status->atk_1bit_supported);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_init_attempt_count", status->atk_1bit_init_attempt_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_init_success_count", status->atk_1bit_init_success_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_init_error_count", status->atk_1bit_init_error_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_gpio_config_attempt_count", status->atk_1bit_gpio_config_attempt_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_gpio_config_success_count", status->atk_1bit_gpio_config_success_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_hal_init_status", status->atk_1bit_hal_init_status);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_hal_error", status->atk_1bit_hal_error);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_cardinfo_status", status->atk_1bit_cardinfo_status);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_cardinfo_error", status->atk_1bit_cardinfo_error);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_wait_transfer_attempt_count", status->atk_1bit_wait_transfer_attempt_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_wait_transfer_success_count", status->atk_1bit_wait_transfer_success_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_wait_transfer_error_count", status->atk_1bit_wait_transfer_error_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_last_card_state", status->atk_1bit_last_card_state);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_last_operation_ms", status->atk_1bit_last_operation_ms);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_init_ready", status->atk_1bit_init_ready);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_clock_div", status->atk_1bit_clock_div);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_bus_width", status->atk_1bit_bus_width);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_attempt_count", status->atk_1bit_read_attempt_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_success_count", status->atk_1bit_read_success_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_error_count", status->atk_1bit_read_error_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_last_read_status", status->atk_1bit_last_read_status);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_last_read_error", status->atk_1bit_last_read_error);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_last_read_operation_ms", status->atk_1bit_last_read_operation_ms);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_last_read_addr", status->atk_1bit_last_read_addr);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_last_read_count", status->atk_1bit_last_read_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_last_read_size", status->atk_1bit_last_read_size);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_pre_card_state", status->atk_1bit_read_pre_card_state);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_post_card_state", status->atk_1bit_read_post_card_state);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_wait_card_state", status->atk_1bit_read_wait_card_state);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_wait_operation_ms", status->atk_1bit_read_wait_operation_ms);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_wait_timeout_ms", status->atk_1bit_read_wait_timeout_ms);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_error_is_data_crc_fail", status->atk_1bit_read_error_is_data_crc_fail);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_error_is_cmd_crc_fail", status->atk_1bit_read_error_is_cmd_crc_fail);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_error_is_cmd_rsp_timeout", status->atk_1bit_read_error_is_cmd_rsp_timeout);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_error_is_data_timeout", status->atk_1bit_read_error_is_data_timeout);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_error_is_rx_overrun", status->atk_1bit_read_error_is_rx_overrun);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_error_is_tx_underrun", status->atk_1bit_read_error_is_tx_underrun);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_inspected", status->atk_1bit_buffer_inspected);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_len", status->atk_1bit_buffer_len);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_prefill_pattern", status->atk_1bit_prefill_pattern);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_sum512", status->atk_1bit_buffer_sum512);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_xor512", status->atk_1bit_buffer_xor512);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_nonzero_count512", status->atk_1bit_buffer_nonzero_count512);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_zero_count512", status->atk_1bit_buffer_zero_count512);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_ff_count512", status->atk_1bit_buffer_ff_count512);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_prefill_count512", status->atk_1bit_buffer_prefill_count512);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_changed_count512", status->atk_1bit_buffer_changed_count512);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_changed", status->atk_1bit_buffer_changed);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_all_prefill", status->atk_1bit_buffer_all_prefill);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_all_zero", status->atk_1bit_buffer_all_zero);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_all_ff", status->atk_1bit_buffer_all_ff);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_first_changed_index", status->atk_1bit_buffer_first_changed_index);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_buffer_last_changed_index", status->atk_1bit_buffer_last_changed_index);
+    Camera_CLI_PrintSdAtk1BitByteField(huart, "atk_1bit_buffer_first16", status->atk_1bit_buffer_first16, 16U);
+    Camera_CLI_PrintSdAtk1BitByteField(huart, "atk_1bit_buffer_first32", status->atk_1bit_buffer_first32, 32U);
+    Camera_CLI_PrintSdAtk1BitByteField(huart, "atk_1bit_buffer_tail16", status->atk_1bit_buffer_tail16, 16U);
+}
+
 /* 输出 SDIO 接管状态字段，供 SD STATUS 和 SD TAKEOVER STATUS 复用。 */
 static void Camera_CLI_PrintSdTakeoverFields(
     UART_HandleTypeDef *huart,
@@ -1226,6 +1314,18 @@ static void Camera_CLI_PrintSdStatus(UART_HandleTypeDef *huart)
         huart,
         "atk_official_clock_div",
         status.atk_official_clock_div);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_supported", status.atk_1bit_supported);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_init_ready", status.atk_1bit_init_ready);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_init_success_count", status.atk_1bit_init_success_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_init_error_count", status.atk_1bit_init_error_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_hal_init_status", status.atk_1bit_hal_init_status);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_hal_error", status.atk_1bit_hal_error);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_success_count", status.atk_1bit_read_success_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_error_count", status.atk_1bit_read_error_count);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_last_read_error", status.atk_1bit_last_read_error);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_read_error_is_data_crc_fail", status.atk_1bit_read_error_is_data_crc_fail);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_clock_div", status.atk_1bit_clock_div);
+    Camera_CLI_WriteStatLine(huart, "atk_1bit_bus_width", status.atk_1bit_bus_width);
     Camera_CLI_PrintSdTakeoverFields(huart, &status);
 }
 
@@ -1236,6 +1336,15 @@ static void Camera_CLI_PrintSdAtkStatus(UART_HandleTypeDef *huart)
     Camera_SDStorage_GetStatus(&status);
     Camera_CLI_WriteLine(huart, "SD ATK:");
     Camera_CLI_PrintSdAtkFields(huart, &status);
+}
+
+static void Camera_CLI_PrintSdAtk1BitStatus(UART_HandleTypeDef *huart)
+{
+    CameraSdStorageStatus_t status;
+
+    Camera_SDStorage_GetStatus(&status);
+    Camera_CLI_WriteLine(huart, "SD ATK1B:");
+    Camera_CLI_PrintSdAtk1BitFields(huart, &status);
 }
 
 /* 单独输出 SDIO 接管状态，不执行任何硬件接管操作。 */
@@ -1295,6 +1404,12 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
     if (Camera_CLI_TokenEquals(arg, arg_len, "ATKSTATUS") != 0U)
     {
         Camera_CLI_PrintSdAtkStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "ATK1BSTATUS") != 0U)
+    {
+        Camera_CLI_PrintSdAtk1BitStatus(huart);
         return CAMERA_CLI_OK;
     }
 
@@ -1367,6 +1482,131 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
         }
 
         Camera_SDStorage_DebugPrintBusWidthStatus();
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "ATK1BINIT") != 0U)
+    {
+        CameraSdStorageStatus_t status;
+
+        result = Camera_SDStorage_AtkOfficial1BitInit();
+        Camera_SDStorage_GetStatus(&status);
+
+        if (result == CAMERA_SD_OK)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD ATK1BINIT: HAL_SD_Init OK, CardInfo OK, 1-bit card TRANSFER ready.");
+        }
+        else if (result == CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD ATK1BINIT: blocked, snapshot is not paused.");
+        }
+        else if (result == CAMERA_SD_ERR_NEED_TAKEOVER)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD ATK1BINIT: blocked, run SD TAKEOVER ENTER first.");
+        }
+        else if (result == CAMERA_SD_ERR_SDIO_FULL_GPIO_SWITCH_FAILED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD ATK1BINIT: ATK official GPIO configuration failed.");
+        }
+        else if (result == CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED)
+        {
+            Camera_CLI_WriteText(
+                huart,
+                "SD ATK1BINIT: HAL_SD_Init failed, status=");
+            Camera_CLI_WriteU32(huart, status.atk_1bit_hal_init_status);
+            Camera_CLI_WriteText(huart, ", error=0x");
+            Camera_CLI_WriteHexU32(huart, status.atk_1bit_hal_error);
+            Camera_CLI_WriteText(huart, ".\r\n");
+        }
+        else if (result == CAMERA_SD_ERR_CARD_INFO_FAILED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD ATK1BINIT: CardInfo failed after HAL_SD_Init.");
+        }
+        else if (result == CAMERA_SD_ERR_BLOCK_READ_NOT_READY)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD ATK1BINIT: card did not enter HAL_SD_CARD_TRANSFER.");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SD ATK1BINIT: ");
+            Camera_CLI_WriteLine(
+                huart,
+                Camera_SDStorage_ErrorToString(result));
+        }
+
+        Camera_CLI_PrintSdAtk1BitStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if ((arg_len >= 9U) &&
+        (Camera_CLI_TokenEquals(arg, 9U, "ATK1BREAD") != 0U) &&
+        ((arg_len == 9U) || (Camera_CLI_IsSpace(arg[9]) != 0U)))
+    {
+        uint32_t block_addr = 0U;
+        CameraSdStorageStatus_t status;
+
+        if (arg_len > 9U)
+        {
+            const char *block_arg = Camera_CLI_TrimLeft(&arg[9]);
+            uint32_t block_arg_len = Camera_CLI_TrimmedLength(block_arg);
+
+            if (Camera_CLI_ParseU32(
+                    block_arg,
+                    block_arg_len,
+                    &block_addr) == 0U)
+            {
+                Camera_CLI_WriteLine(
+                    huart,
+                    "SD ATK1BREAD: invalid block address.");
+                return CAMERA_CLI_OK;
+            }
+        }
+
+        result = Camera_SDStorage_AtkOfficial1BitReadBlock(block_addr);
+        Camera_SDStorage_GetStatus(&status);
+        if (result == CAMERA_SD_OK)
+        {
+            Camera_CLI_WriteText(huart, "SD ATK1BREAD: block read OK, block=");
+            Camera_CLI_WriteU32(huart, block_addr);
+            Camera_CLI_WriteText(huart, ", size=512.\r\n");
+        }
+        else if (result == CAMERA_SD_ERR_BLOCK_READ_NOT_READY)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD ATK1BREAD: not ready or card did not return to transfer state.");
+        }
+        else if (result == CAMERA_SD_ERR_BLOCK_READ_FAILED)
+        {
+            Camera_CLI_WriteText(huart, "SD ATK1BREAD: block read failed, block=");
+            Camera_CLI_WriteU32(huart, block_addr);
+            Camera_CLI_WriteText(huart, ", status=");
+            Camera_CLI_WriteU32(huart, status.atk_1bit_last_read_status);
+            Camera_CLI_WriteText(huart, ", error=0x");
+            Camera_CLI_WriteHexU32(huart, status.atk_1bit_last_read_error);
+            Camera_CLI_WriteText(huart, ".\r\n");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SD ATK1BREAD: ");
+            Camera_CLI_WriteLine(
+                huart,
+                Camera_SDStorage_ErrorToString(result));
+        }
+
+        Camera_CLI_PrintSdAtk1BitStatus(huart);
         return CAMERA_CLI_OK;
     }
 

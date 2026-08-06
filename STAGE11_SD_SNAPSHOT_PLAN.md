@@ -7143,3 +7143,41 @@ ATK 诊断路径严格按以下顺序执行：
 
 Stage 11C-5L 结论：
 在当前 OV5640 + DCMI + FreeRTOS + SD takeover 环境下，ATK 官方参数路径中，1-bit HAL_SD_Init 与 HAL_SD_GetCardInfo 可以成功；但 HAL_SD_ConfigWideBusOperation(SDIO_BUS_WIDE_4B) 失败，错误码为 6，ATK official init_ready 未置位。说明当前集成环境下的关键阻塞点不是 SDIO 初始化本身，而是从 1-bit 切换到 4-bit 的宽总线配置阶段。takeover exit 和 snapshot restore 后图像链路可恢复，basic 与 repeat 20/20 验证通过。
+
+## Stage 11C-5M ATK 官方 1-bit polling read 诊断
+
+### 1. Stage 11C-5L 结论
+
+- ATK 官方参数下，1-bit `HAL_SD_Init` 成功。
+- `HAL_SD_GetCardInfo` 成功。
+- `HAL_SD_ConfigWideBusOperation(SDIO_BUS_WIDE_4B)` 失败，宽总线切换尚不能成立。
+- 因此 Stage 11C-5M 跳过 4-bit 配置，只验证 ATK 官方 1-bit polling read 路径。
+
+### 2. 本轮 ATK1B 路径
+
+1. 在 `SNAPSHOT PREPARE` 和 `SD TAKEOVER ENTER` 完成后，复用 ATK 官方 GPIO 配置：`GPIO_SPEED_FREQ_HIGH`、`GPIO_PULLUP`、`GPIO_AF12_SDIO`。
+2. 固定 `ClockDiv=1U` 和 `SDIO_BUS_WIDE_1B`，依次执行 `HAL_SD_Init`、`HAL_SD_GetCardInfo` 并等待 `HAL_SD_CARD_TRANSFER`。
+3. 初始化路径不调用 `HAL_SD_ConfigWideBusOperation`，也不执行读写。
+4. `SD ATK1BREAD [block]` 使用 4 字节对齐的静态 512B buffer，读前预填 `0xA5`，每次固定读取 1 block。
+5. 保存原始 PRIMASK 后关闭全局中断，以 `HAL_SD_ReadBlocks` polling 方式读取，并在相同临界区内等待卡重新进入 `HAL_SD_CARD_TRANSFER`，最后按原 PRIMASK 恢复中断状态。
+6. 无论读取成功或失败，都统计完整 512B buffer 的 sum、xor、分类计数、变化范围及 first16/first32/tail16；失败时 `atk_1bit_last_read_size` 仍为 0。
+7. `SD ATK1BSTATUS` 输出独立的初始化、读取、HAL 错误、卡状态、等待和 buffer 诊断字段；`SD STATUS` 只追加 ATK1B 摘要。
+8. `SD TAKEOVER EXIT` 对 ATK1B 路径执行 `HAL_SD_DeInit`、关闭 SDIO 时钟并清除 `atk_1bit_init_ready`，随后继续现有 GPIO restore；不清除主路径和 5L 诊断缓存。
+
+### 3. 本轮边界
+
+- 只读 1 block，不写卡。
+- 不接入 FATFS，不调用 `f_mount`、`f_open`、`f_write` 或 `f_read`。
+- 不使用 SDIO DMA，不启用 SDIO IRQ。
+- 不修改现有 `SD INIT`、`SD READTEST` 或 `SD ATKINIT` 4-bit 诊断路径。
+- 不触碰摄像头 PWDN、CAMOFF、CAMON，也不恢复动态 ClockDiv CLI。
+
+### 4. 结果判断
+
+- 若 `ATK1BREAD` 稳定 PASS，说明当前失败主要来自现有 READTEST 主路径与官方 polling read 流程的差异。
+- 若仍有 `DATA_CRC_FAIL` 但明显比主路径稳定，说明全局中断屏蔽、读后等待或 `ClockDiv=1U` 带来改善。
+- 若仍随机出现 `DATA_CRC_FAIL`，说明即使对齐官方 polling read 流程，takeover 环境中的 SDIO 数据线状态恢复仍不稳定。
+- 若 `ATK1BINIT` 失败，说明此前观察到的 ATK 官方 1-bit 初始化成功尚不稳定，应先收敛初始化稳定性。
+
+Stage 11C-5M 结论：
+ATK 官方 1-bit 初始化路径在当前工程 takeover 环境下可以成立，HAL_SD_Init、CardInfo、TRANSFER 等待均成功。但 ATK 官方 1-bit polling read 路径仍不能稳定读块。block 0 连续出现 DATA_CRC_FAIL，block 2048 出现一次 PASS 后再次 DATA_CRC_FAIL。失败时 512B buffer 被完整改写，说明 SDIO 数据确实进入内存，但数据阶段 CRC 校验仍不稳定。读后等待可将 CardState 恢复到 TRANSFER，但不能消除 DATA_CRC_FAIL。当前问题继续收敛为：相机初始化后的 DCMI/SDIO 共享线 takeover 环境与官方 SDIO 独立例程之间仍存在关键差异。
