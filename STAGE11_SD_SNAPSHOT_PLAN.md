@@ -7181,3 +7181,33 @@ Stage 11C-5L 结论：
 
 Stage 11C-5M 结论：
 ATK 官方 1-bit 初始化路径在当前工程 takeover 环境下可以成立，HAL_SD_Init、CardInfo、TRANSFER 等待均成功。但 ATK 官方 1-bit polling read 路径仍不能稳定读块。block 0 连续出现 DATA_CRC_FAIL，block 2048 出现一次 PASS 后再次 DATA_CRC_FAIL。失败时 512B buffer 被完整改写，说明 SDIO 数据确实进入内存，但数据阶段 CRC 校验仍不稳定。读后等待可将 CardState 恢复到 TRANSFER，但不能消除 DATA_CRC_FAIL。当前问题继续收敛为：相机初始化后的 DCMI/SDIO 共享线 takeover 环境与官方 SDIO 独立例程之间仍存在关键差异。
+
+## Stage 11C-5N ATK1B 连续读块统计
+
+### 1. Stage 11C-5M 板测结论
+
+- `SD ATK1BINIT` 成功，1-bit `HAL_SD_Init`、CardInfo 和 TRANSFER 等待均成立，`ClockDiv=1`、BusWidth=1。
+- block 0 两次读取均为 `DATA_CRC_FAIL`，且失败时 512B buffer 被完整改写。
+- block 2048 第一次读取 PASS、buffer 全 0，第二次读取为 `DATA_CRC_FAIL`，说明数据阶段是随机不稳定，而非固定地址必错。
+- 失败后的读后等待可以使 CardState 返回 `HAL_SD_CARD_TRANSFER`，但 CRC 错误已经发生。
+- TAKEOVER_EXIT / SNAPSHOT_RESTORE 后图像链路恢复正常，basic PASS、repeat 20/20 PASS 且 frame_id 连续。
+
+### 2. 本轮范围
+
+Stage 11C-5N 不修改任何固件代码，只新增 `tools/uart_sd_atk1b_repeat_test.py` 自动测试脚本。脚本不执行图像 binary request；图像恢复继续由既有 `tools/uart_image_request_basic.py` 和 `tools/uart_image_request_repeat.py` 单独验证。
+
+### 3. 连续读块测试内容
+
+1. 自动执行 takeover 前 `SD INIT` 阻止检查、`SNAPSHOT PREPARE`、`SD TAKEOVER ENTER` 和 `SD ATK1BINIT`。
+2. 对 block 0 连续执行 20 次 `SD ATK1BREAD 0`，每次读后执行 `SD ATK1BSTATUS`。
+3. 对 block 2048 连续执行 20 次 `SD ATK1BREAD 2048`，每次读后执行 `SD ATK1BSTATUS`。
+4. 逐次分类 `PASS`、`DATA_CRC_FAIL`、`OTHER_FAIL`、`NOT_READY`，并记录 HAL 错误位、CardState、read/wait 耗时和完整 buffer 指纹。
+5. 输出 CSV、完整串口 log 和 summary；summary 汇总每个 block 的成功率以及 sum512、first32、tail16、changed/zero/ff count 的唯一值。
+6. 无论初始化成功、失败或脚本中途异常，都尽量执行 DUMP guard、`SD TAKEOVER EXIT`、`SNAPSHOT RESTORE` 和 `STATUS`，并保存已经收集的结果。
+
+### 4. 结果判断
+
+- 如果 ATK1B 连续 20 次仍随机出现 `DATA_CRC_FAIL`，说明即使对齐官方 polling read，当前相机初始化加 takeover 环境仍会破坏 SDIO 数据阶段稳定性。
+- 如果 ATK1B 成功率明显高于当前 READTEST 主路径，说明官方 GPIO HIGH、`ClockDiv=1`、IRQOFF 和读后等待具有改善价值。
+- 如果某个 block 稳定 PASS、另一个 block 不稳定，应继续检查地址、卡内容、读后状态和数据线恢复差异。
+- 如果 `ATK1BINIT` 本身不稳定，应先回到初始化稳定性诊断，再比较连续读块结果。
