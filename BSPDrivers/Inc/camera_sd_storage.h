@@ -128,6 +128,27 @@ typedef struct
     uint32_t card_block_size;                       /* 最近一次成功读取的 BlockSize。 */
     uint32_t card_log_block_nbr;                    /* 最近一次成功读取的 LogBlockNbr。 */
     uint32_t card_log_block_size;                   /* 最近一次成功读取的 LogBlockSize。 */
+    uint32_t atk_official_init_supported;           /* 是否支持 ATK 官方初始化诊断路径。 */
+    uint32_t atk_official_init_attempt_count;       /* SD ATKINIT 调用次数。 */
+    uint32_t atk_official_init_success_count;       /* ATK 官方初始化全流程成功次数。 */
+    uint32_t atk_official_init_error_count;         /* ATK 官方初始化失败次数。 */
+    uint32_t atk_official_gpio_config_attempt_count; /* ATK 官方 GPIO 配置尝试次数。 */
+    uint32_t atk_official_gpio_config_success_count; /* ATK 官方 GPIO 配置成功次数。 */
+    uint32_t atk_official_hal_init_status;          /* ATK 路径最近一次 HAL_SD_Init 返回值。 */
+    uint32_t atk_official_hal_error;                /* ATK 路径最近一次 HAL SD 错误码。 */
+    uint32_t atk_official_cardinfo_status;          /* ATK 路径最近一次 GetCardInfo 返回值。 */
+    uint32_t atk_official_cardinfo_error;           /* ATK 路径 GetCardInfo 后的 HAL 错误码。 */
+    uint32_t atk_official_widebus_status;           /* ATK 路径最近一次 4-bit 配置返回值。 */
+    uint32_t atk_official_widebus_error;            /* ATK 路径 4-bit 配置后的 HAL 错误码。 */
+    uint32_t atk_official_wait_transfer_attempt_count; /* ATK 路径等待 TRANSFER 次数。 */
+    uint32_t atk_official_wait_transfer_success_count; /* ATK 路径等待 TRANSFER 成功次数。 */
+    uint32_t atk_official_wait_transfer_error_count; /* ATK 路径等待 TRANSFER 超时次数。 */
+    uint32_t atk_official_last_card_state;          /* ATK 路径最近一次卡状态。 */
+    uint32_t atk_official_last_operation_ms;        /* 最近一次 SD ATKINIT 总耗时。 */
+    uint32_t atk_official_init_ready;               /* ATK init、CardInfo、4-bit 和等待是否全部成功。 */
+    uint32_t atk_official_clock_div;                /* ATK 官方路径固定 ClockDiv=1。 */
+    uint32_t atk_official_bus_width_after_init;     /* HAL_SD_Init 成功后的总线宽度。 */
+    uint32_t atk_official_bus_width_after_widebus;  /* ConfigWideBus 成功后的总线宽度。 */
     uint32_t block_read_test_enabled;                /* 是否允许执行 Stage 11C-5 只读单块验证。 */
     uint32_t block_read_attempt_count;               /* 实际调用 HAL_SD_ReadBlocks 的次数。 */
     uint32_t block_read_success_count;               /* 单块读取成功次数。 */
@@ -178,6 +199,9 @@ void Camera_SDStorage_PrintLineState(void);
 
 /* 完整 SDIO GPIO 已接管时执行最小 HAL_SD_Init，否则返回 NEED_TAKEOVER。 */
 uint32_t Camera_SDStorage_RequestInit(void);
+
+/* 独立执行 ATK 官方 GPIO、ClockDiv=1、1-bit init、CardInfo 和 4-bit 配置诊断。 */
+uint32_t Camera_SDStorage_AtkOfficialInit(void);
 
 /* 只读方式读取一个 512 字节逻辑块；CLI 默认请求块 0，也可指定地址。 */
 uint32_t Camera_SDStorage_RequestBlockReadTest(uint32_t block_addr);

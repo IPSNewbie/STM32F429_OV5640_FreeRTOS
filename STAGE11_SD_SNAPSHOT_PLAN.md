@@ -7089,3 +7089,57 @@ python tools/uart_sd_line_after_init_auto_test.py --port COM4 --baud 115200 --re
 ### 5. 禁止继续盲调
 
 下一阶段不再盲目修改 ClockDiv、PWDN、BusWidth、IRQOFF。所有修改必须来自官方例程差异对照。
+
+## Stage 11C-5L ATK 官方 SDIO init + 4-bit 配置诊断
+
+### 1. 本轮目标
+
+本轮只移植正点原子官方 SDIO 初始化流程，不读取数据块、不写卡。新增独立的 `SD ATKINIT` 与 `SD ATKSTATUS` 诊断命令；ATK 路径不替换、也不修改当前 `SD INIT` 和 `SD READTEST` 主路径。
+
+`SD ATKINIT` 必须在 `SNAPSHOT PREPARE` 和 `SD TAKEOVER ENTER` 均已完成后执行。未完成完整 SDIO GPIO 接管时返回 `NEED_TAKEOVER`；snapshot 未暂停时返回 `SNAPSHOT_NOT_PAUSED`。
+
+### 2. ATK 官方初始化流程
+
+ATK 诊断路径严格按以下顺序执行：
+
+1. 重新配置 PC8、PC9、PC10、PC11、PC12、PD2。
+2. GPIO 使用 `GPIO_MODE_AF_PP`、`GPIO_PULLUP`、`GPIO_SPEED_FREQ_HIGH` 和 `GPIO_AF12_SDIO`。
+3. 使能 SDIO 时钟。
+4. 使用 `ClockDiv=1U`、1-bit、上升沿、关闭 bypass、关闭 clock power save、关闭 hardware flow control 配置 `hsd_snapshot`。
+5. 调用 `HAL_SD_Init`。
+6. 初始化成功后调用 `HAL_SD_GetCardInfo`。
+7. CardInfo 成功后调用 `HAL_SD_ConfigWideBusOperation(&hsd_snapshot, SDIO_BUS_WIDE_4B)`。
+8. 4-bit 配置成功后轮询 `HAL_SD_GetCardState`，等待进入 `HAL_SD_CARD_TRANSFER`。
+9. 全部成功后设置 `atk_official_init_ready=1`。
+
+`SD TAKEOVER EXIT` 会识别 ATK 诊断路径，必要时调用 `HAL_SD_DeInit`，关闭 SDIO 时钟并清除 `atk_official_init_ready`，随后继续执行既有 SDIO GPIO 退出和 DCMI AF13 恢复流程。ATK 清理不覆盖当前 SD INIT/READTEST 的缓存结果。
+
+### 3. 诊断状态与输出
+
+`SD ATKSTATUS` 以 `SD ATK:` 为标题，输出 ATK 支持标志、初始化/GPIO/等待计数、HAL init、CardInfo、WideBus 状态与错误、最近卡状态、总耗时、ready、固定 ClockDiv，以及 init 后和 WideBus 后的总线宽度。
+
+`SD STATUS` 同时追加 ATK 摘要，包括 supported、ready、成功/失败计数、HAL init 状态与错误、WideBus 状态与错误、最近卡状态和 ClockDiv。
+
+### 4. 本轮边界
+
+- 不接入 FATFS，不调用 `f_mount`、`f_open`、`f_write` 或 `f_read`。
+- 不调用 `HAL_SD_ReadBlocks`、`HAL_SD_WriteBlocks` 或其 DMA 版本。
+- 不启用 SDIO DMA 或 SDIO IRQ。
+- 不修改当前 READTEST 的读前等待、polling 单块读取或错误处理，不恢复读后 WaitCardTransfer。
+- 不恢复动态 `SD CLOCKDIV` CLI 或 IRQOFF。
+- 不触碰摄像头 PWDN、CAMOFF 或 CAMON。
+- 不修改 DCMI/DMA、协议、FreeRTOS、Python 工具或 CMake 配置。
+
+### 5. 结果判断
+
+- 若 `SD ATKINIT` 全部 PASS，说明官方 init + 4-bit 流程在 takeover 集成环境中可以成立；下一阶段再独立移植官方 polling read。
+- 若 `HAL_SD_Init` 失败，优先比较 GPIO speed、ClockDiv 和 takeover 后线状态。
+- 若 `HAL_SD_GetCardInfo` 成功但 WideBus 失败，说明 ACMD6 / bus width 配置是当前集成环境的关键差异。
+- 若 WideBus 成功但等待 TRANSFER 失败，说明卡状态收敛逻辑需要继续对齐官方等待与超时流程。
+
+本轮 Codex 只执行静态检查和固件构建，不执行硬件测试，不提交 Git commit。
+
+
+
+Stage 11C-5L 结论：
+在当前 OV5640 + DCMI + FreeRTOS + SD takeover 环境下，ATK 官方参数路径中，1-bit HAL_SD_Init 与 HAL_SD_GetCardInfo 可以成功；但 HAL_SD_ConfigWideBusOperation(SDIO_BUS_WIDE_4B) 失败，错误码为 6，ATK official init_ready 未置位。说明当前集成环境下的关键阻塞点不是 SDIO 初始化本身，而是从 1-bit 切换到 4-bit 的宽总线配置阶段。takeover exit 和 snapshot restore 后图像链路可恢复，basic 与 repeat 20/20 验证通过。
