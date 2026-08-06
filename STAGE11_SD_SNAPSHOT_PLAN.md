@@ -6366,3 +6366,222 @@ Stage 11C-5A 的失败诊断和系统可恢复性验证完成，但只读块功�
 - 依次测试更低读时钟，例如 `ClockDiv=118`、178、238、255。
 - 每个档位重新执行 `SD INIT + CardInfo + SD READTEST 0/2048`，记录 DATA CRC 错误是否消失。
 - 如果降低时钟后仍失败，再检查显式 1-bit bus 配置、硬件线序和上拉条件。
+
+## Stage 11C-5B 初版：对照正点原子 polling 读块流程诊断
+
+> 本小节记录初版设计。板测发现将 GPIO speed 改为 HIGH 后 `HAL_SD_Init` 退化失败；当前实现已由后续“Stage 11C-5B 修正版”取代。
+
+### 1. 正点原子参考流程的关键差异
+
+- SDIO GPIO 使用 `GPIO_MODE_AF_PP`、`GPIO_PULLUP`、`GPIO_SPEED_FREQ_HIGH` 和 `GPIO_AF12_SDIO`。
+- polling 读写过程通过 `sys_intx_disable()` / `sys_intx_enable()` 避免中断打断 SDIO 数据传输。
+- `HAL_SD_ReadBlocks` 返回后继续等待卡重新进入传输完成状态。
+- 参考 `sd_init` 在初始化后还会调用 `HAL_SD_ConfigWideBusOperation(..., SDIO_BUS_WIDE_4B)`；本轮继续保持 1-bit，不进入 4-bit 配置。
+
+### 2. 初版目的与实现边界
+
+- 将 PC8、PC9、PC10、PC11、PC12、PD2 切换到 SDIO AF12 时的 GPIO speed 改为 `GPIO_SPEED_FREQ_HIGH`，保持 AF push-pull、上拉和 AF12 不变。
+- 增加 `NORMAL` 和 `IRQOFF` 两种 polling 单块读取诊断模式，默认 block 为 0、默认模式为 `NORMAL`。
+- `IRQOFF` 模式仅在单次 `HAL_SD_ReadBlocks` 调用期间保存 PRIMASK、关闭全局中断并立即恢复；读前和读后等待、状态采集、延时及 CLI 输出均在中断开启状态执行。
+- `HAL_SD_ReadBlocks` 返回后新增 1000 ms 的 `HAL_SD_CARD_TRANSFER` 等待，每 1 ms 轮询一次，并记录成功或超时结果。
+- 保留 C5A 的 `uint32_t[128]` 对齐缓冲、读前等待、错误 bit 诊断和可选 block 地址。
+- 支持 `SD READTEST`、`SD READTEST 0`、`SD READTEST 2048`，以及显式指定 `NORMAL` 或 `IRQOFF` 的 block 0/2048 组合。
+- 每条命令仍只读 1 个 512 B block，不执行任何写卡操作。
+
+新增状态字段如下：
+
+- `sdio_gpio_speed_high_enabled`（初版字段，修正版已移除）
+- `block_read_irqoff_supported`
+- `last_block_read_mode`
+- `block_read_irqoff_attempt_count`
+- `block_read_irqoff_success_count`
+- `block_read_irqoff_error_count`
+- `block_read_post_wait_transfer_attempt_count`
+- `block_read_post_wait_transfer_success_count`
+- `block_read_post_wait_transfer_error_count`
+- `last_block_read_post_wait_card_state`
+- `last_block_read_post_wait_operation_ms`
+- `last_block_read_post_wait_timeout_ms`
+
+`SD READINFO`、`SD STATUS` 和 `SD TAKEOVER STATUS` 均输出这些字段；`SD READINFO` 仍只读取软件缓存，不调用 `HAL_SD_ReadBlocks`、`HAL_SD_Init` 或 `HAL_SD_GetCardInfo`。
+
+### 3. 命令和参数行为
+
+- `SD READTEST`：block 0，`NORMAL`。
+- `SD READTEST 0`：block 0，`NORMAL`。
+- `SD READTEST 2048`：block 2048，`NORMAL`。
+- `SD READTEST 0 NORMAL` / `SD READTEST 2048 NORMAL`：显式普通 polling 模式。
+- `SD READTEST 0 IRQOFF` / `SD READTEST 2048 IRQOFF`：仅在 HAL 读块调用期间关闭全局中断。
+- block 地址不是纯十进制时返回 `invalid block address`；模式不是 `NORMAL` 或 `IRQOFF` 时返回 `invalid read mode`；地址越界时返回 `block address out of range`。这些非法参数路径不读卡、不增加普通读块或 IRQOFF 统计。
+- 成功和失败输出均包含实际 block 地址与 `NORMAL` / `IRQOFF` 模式。
+
+### 4. 本轮不做
+
+- 不调用 `HAL_SD_ConfigWideBusOperation` 或 `HAL_SD_WriteBlocks`。
+- 不接 FATFS，不挂载文件系统，不创建或写入文件。
+- 不使用 SDIO DMA，不配置 `SDIO_IRQn`，不启用 SDIO 中断。
+- 不修改 DCMI、DCMI DMA、FreeRTOS、IWDG、UART DMA、二进制协议或图像帧格式。
+
+### 5. IRQOFF诊断风险
+
+`IRQOFF` 会在阻塞式 `HAL_SD_ReadBlocks` 执行期间关闭全局中断。该 HAL polling 路径的超时判断依赖系统 tick；全局中断关闭期间 tick 可能无法推进。如果底层调用无法因硬件状态或错误标志自行返回，板卡可能卡在调用中并需要人工复位。因此 `IRQOFF` 只作为对照正点原子流程的短期诊断手段，不作为最终长期方案，也不得扩大到读前/读后等待、串口输出、EXIT 或其他系统路径。
+
+### 6. 后续板测计划
+
+1. 执行 `SNAPSHOT PREPARE`、`SD TAKEOVER ENTER`、`SD INIT`，确认 HAL 初始化和 CardInfo 正常。
+2. 依次测试 `SD READTEST 0 NORMAL` 和 `SD READTEST 0 IRQOFF`，每次用 `SD READINFO` 保存诊断状态。
+3. 如果 block 0 仍失败，再测试 `SD READTEST 2048 NORMAL` 和 `SD READTEST 2048 IRQOFF`。
+4. 无论成功或失败，都必须执行 `SD TAKEOVER EXIT`、`SNAPSHOT RESTORE`、basic、pc_dump、repeat 20/20，并检查 IWDG、Hook 和 UART RX DMA。
+
+分支判断：
+
+- `NORMAL` 成功：说明 GPIO speed 或当前读块流程修正有效。
+- `NORMAL` 失败但 `IRQOFF` 成功：说明 polling 读块可能受到中断打断影响。
+- `NORMAL` 和 `IRQOFF` 均失败：进入 C5C，继续诊断 SDIO `ClockDiv`、4-bit 配置、硬件上拉或线序；不得直接进入 FATFS。
+
+## Stage 11C-5B 修正版：恢复 SDIO GPIO speed 为 VERY_HIGH
+
+### 1. 初版C5B板测失败现象
+
+初版 C5B 将 SDIO GPIO speed 从 `GPIO_SPEED_FREQ_VERY_HIGH` 改为 `GPIO_SPEED_FREQ_HIGH`，同时加入 NORMAL/IRQOFF 模式和读后 WaitCardTransfer。板卡启动、未 INIT 保护、`SNAPSHOT PREPARE` 和 `SD TAKEOVER ENTER` 均正常：
+
+- 启动显示 `reset: iwdg=0`、OV5640 OK、Camera init OK。
+- 未 INIT 时 `SD READINFO` 正常，`SD READTEST` 正确返回 not ready。
+- 未 PREPARE 时 `SD INIT` 正确返回 `NEED_TAKEOVER`。
+- PREPARE 后 DCMI stop OK，`software_guard_active=1`。
+- TAKEOVER ENTER 后完整 SDIO GPIO 切换到 AF12，`sdio_af12_selected=1`、`sdio_full_gpio_af12_selected=1`。
+
+但是进入接管后的实际 `SD INIT` 失败：
+
+```text
+SD INIT: HAL_SD_Init failed, status=1, error=0x00000004.
+```
+
+对应状态：
+
+```text
+is_initialized=0
+sdio_ready=0
+fatfs_ready=0
+init_attempt_count=2
+init_success_count=0
+init_error_count=1
+last_error_code=18
+last_error_text=SDIO_HAL_INIT_FAILED
+sdio_clock_enabled=1
+sdio_hal_init_attempt_count=1
+sdio_hal_init_success_count=0
+sdio_hal_init_error_count=1
+last_hal_sd_init_status=1
+last_hal_sd_error=4
+card_info_read_attempt_count=0
+card_info_read_success_count=0
+```
+
+由于 HAL 初始化未成功，`SD READTEST 0 NORMAL`、`0 IRQOFF`、`2048 NORMAL`、`2048 IRQOFF` 均只返回 not ready，没有实际调用 `HAL_SD_ReadBlocks`：`block_read_attempt_count=0`、`block_read_success_count=0`、`block_read_error_count=0`、`block_read_irqoff_attempt_count=0`。
+
+该轮没有进入读块对照阶段。结合 C5A 在 VERY_HIGH 配置下 `HAL_SD_Init` 和 CardInfo 均成功的结果，HIGH speed 是本轮相对于可初始化基线的关键退化项，当前工程不能直接沿用参考代码的 `GPIO_SPEED_FREQ_HIGH` 配置。
+
+### 2. 修正策略
+
+- PC8、PC9、PC10、PC11、PC12、PD2 切换到 SDIO AF12 时全部恢复为 `GPIO_SPEED_FREQ_VERY_HIGH`。
+- 保持 `GPIO_PULLUP`、`GPIO_MODE_AF_PP` 和 `GPIO_AF12_SDIO` 不变。
+- PC8、PC9、PC11 恢复 DCMI AF13 的 VERY_HIGH 配置和退出 SDIO 流程保持原样。
+- 移除不再准确的 `sdio_gpio_speed_high_enabled`，改为 `sdio_gpio_speed_very_high_enabled=1`，CLI 和文档字段与实际 GPIO 配置一致。
+- 保留 NORMAL/IRQOFF 读块模式、PRIMASK 保存与恢复、读后 WaitCardTransfer，以及 C5A 的对齐缓冲、读前等待、错误 bit 和可选 block 地址诊断。
+- EXIT 后继续保留 CardInfo、读块结果、最近错误、IRQOFF 和 wait transfer 统计缓存。
+- 继续只读单个 512 B block，不写卡、不接 FATFS、不使用 SDIO DMA 或 SDIO 中断。
+
+### 3. 后续板测计划
+
+1. 验证启动、未 INIT 保护、`SNAPSHOT PREPARE` 和 `SD TAKEOVER ENTER`。
+2. 执行 `SD INIT`，首先确认 `HAL_SD_Init` 和 CardInfo 是否恢复 OK。
+3. 初始化成功后依次执行 `SD READTEST 0 NORMAL`、`SD READTEST 0 IRQOFF`、`SD READTEST 2048 NORMAL`、`SD READTEST 2048 IRQOFF`，每次使用 `SD READINFO` 保存缓存。
+4. 无论成功或失败，都执行 guard DUMP/binary 检查、`SD TAKEOVER EXIT`、`SNAPSHOT RESTORE`、basic、pc_dump、repeat 20/20 和最终运行保护检查。
+
+### 4. 后续分支判断
+
+- 恢复 VERY_HIGH 后 `HAL_SD_Init` 重新成功：说明初版 HIGH speed 是初始化退化原因，再继续比较 NORMAL 和 IRQOFF 读块结果。
+- NORMAL 失败但 IRQOFF 成功：说明 polling 读块可能受到中断打断影响。
+- NORMAL 和 IRQOFF 均失败且仍为 `HAL_SD_ERROR_DATA_CRC_FAIL`：进入 C5C 的 `ClockDiv` 诊断，不直接进入 FATFS。
+- 恢复 VERY_HIGH 后 `HAL_SD_Init` 仍失败：先回退 C5B 相关代码，恢复到 C5A 可初始化状态，再继续定位。
+
+## Stage 11C-5R 回退 C5B，恢复 C5A 初始化基线
+
+### 1. C5B修正版板测失败现象
+
+C5B 修正版已将 SDIO GPIO speed 恢复为 VERY_HIGH，并保留 NORMAL/IRQOFF 与读后 WaitCardTransfer。启动、前置保护和接管流程均正常：
+
+- 启动显示 `reset: iwdg=0`，OV5640 和 Camera 初始化正常。
+- 未 INIT 时 `SD READINFO` 正常，`sdio_gpio_speed_very_high_enabled=1`，`SD READTEST` 正确返回 not ready，`block_read_attempt_count=0`。
+- 未 PREPARE 时 `SD INIT` 正确返回 `NEED_TAKEOVER`。
+- `SNAPSHOT PREPARE` 中 DCMI stop OK，`software_guard_active=1`。
+- `SD TAKEOVER ENTER` 成功，`sdio_af12_selected=1`、`sdio_full_gpio_af12_selected=1`，两级 GPIO switch success 均为 1。
+
+但接管后的实际 `SD INIT` 仍失败：
+
+```text
+SD INIT: HAL_SD_Init failed, status=1, error=0x00000004.
+```
+
+关键状态：
+
+```text
+is_initialized=0
+sdio_ready=0
+fatfs_ready=0
+init_attempt_count=2
+init_success_count=0
+init_error_count=1
+last_error_code=18
+last_error_text=SDIO_HAL_INIT_FAILED
+sdio_clock_enabled=1
+sdio_hal_init_attempt_count=1
+sdio_hal_init_success_count=0
+sdio_hal_init_error_count=1
+last_hal_sd_init_status=1
+last_hal_sd_error=4
+card_info_read_attempt_count=0
+card_info_read_success_count=0
+```
+
+后续所有 NORMAL/IRQOFF、block 0/2048 组合均只返回 not ready，没有实际调用 `HAL_SD_ReadBlocks`：`block_read_attempt_count=0`、`block_read_success_count=0`、`block_read_error_count=0`、`block_read_irqoff_attempt_count=0`。因此 C5B 修正版没有进入读块诊断阶段。
+
+尽管初始化失败，`SD TAKEOVER EXIT`、`HAL_SD_DeInit`、SDIO GPIO 恢复、`SNAPSHOT RESTORE` 均正常，IWDG 未跳过喂狗，Hook 未触发，UART RX DMA 无错误。
+
+### 2. 阶段判断与优先级
+
+C5B 已从 C5A 的“HAL 初始化和 CardInfo 成功、ReadBlocks DATA CRC 失败”退化为 `HAL_SD_Init` 失败，不适合继续扩展读块诊断。当前优先级是先恢复 C5A 已验证的 `HAL_SD_Init OK + HAL_SD_GetCardInfo OK` 基线，再讨论 `HAL_SD_ReadBlocks`。
+
+C5A 的已知边界保持不变：HAL 初始化和 CardInfo 成功；block 0 和 block 2048 的 polling 单块读取均为 `HAL_SD_ERROR_DATA_CRC_FAIL`；EXIT/RESTORE 及图像链路恢复正常。本轮目标不是宣称读块成功，而是消除 C5B 引入的初始化退化变量。
+
+### 3. 本轮回退内容
+
+- 移除 `NORMAL` / `IRQOFF` 模式宏、命令参数、状态字段和统计字段。
+- 移除 `__get_PRIMASK`、`__disable_irq`、`__enable_irq` 读块诊断路径。
+- 移除 `Camera_SDStorage_WaitCardTransferAfterRead` 及全部 post-wait 状态字段和 CLI 输出。
+- 移除仅用于 C5B 区分 GPIO speed 的 `sdio_gpio_speed_very_high_enabled` 字段。
+- `SD READTEST` 恢复 C5A 命令形式：无参数默认 block 0，也支持纯十进制 block 地址，例如 0 和 2048；不再接受 NORMAL/IRQOFF 参数。
+- 保留静态 `uint32_t[128]` 作为 512 B、4 字节对齐的 polling 读缓冲。
+- 保留读前 `Camera_SDStorage_WaitCardTransfer`、读前/读后 card state 和 DATA CRC 等错误 bit 诊断。
+- 每次仍只调用一次 `HAL_SD_ReadBlocks`，固定只读 1 个 block。
+- SDIO AF12 继续使用 `GPIO_MODE_AF_PP`、`GPIO_PULLUP`、`GPIO_SPEED_FREQ_VERY_HIGH`、`GPIO_AF12_SDIO`。
+- EXIT 继续先将完整 SDIO GPIO 退回输入态，再恢复 PC8、PC9、PC11 的 DCMI AF13；不清空 C5A 的 CardInfo 和读块缓存。
+- 不写卡、不接 FATFS、不使用 SDIO DMA 或中断、不调用宽总线配置。
+
+本轮 3 个代码文件已恢复到 C5A 提交基线内容，不保留 C5B 源码增量；C5B/C5R 历史仅保留在本文档中。
+
+### 4. 后续板测计划
+
+1. 验证启动以及未 INIT 时 `SD READINFO` / `SD READTEST` 的缓存和 not-ready 保护。
+2. 未 PREPARE 时执行 `SD INIT`，确认仍返回 `NEED_TAKEOVER`。
+3. 执行 `SNAPSHOT PREPARE` 和 `SD TAKEOVER ENTER`。
+4. 再执行 `SD INIT`，重点确认 `HAL_SD_Init` 和 CardInfo 是否恢复 OK。
+5. 初始化成功后执行 `SD CARDINFO`、`SD READTEST 0`、`SD READINFO`、`SD READTEST 2048`、`SD READINFO`。
+6. 最后验证 guard DUMP/binary、`SD TAKEOVER EXIT`、`SNAPSHOT RESTORE`、basic、pc_dump、repeat 20/20，以及 IWDG、Hook、UART RX DMA。
+
+### 5. 后续分支判断
+
+- C5R 后 `HAL_SD_Init` 恢复 OK：说明 C5B 新增变量导致初始化退化，后续以 C5A/C5R 为基线重新规划读块诊断。
+- C5R 后 `HAL_SD_Init` 仍失败：继续逐项比对实际烧录固件、构建产物和 C5A 提交点，必要时直接以 C5A 提交重新构建验证。
+- 在 HAL 初始化基线重新确认前，不进入 FATFS、不写卡，也不继续叠加读块实验变量。
