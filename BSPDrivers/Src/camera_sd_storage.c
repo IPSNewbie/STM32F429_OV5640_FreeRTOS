@@ -19,6 +19,10 @@ static SD_HandleTypeDef hsd_snapshot;
 /* 使用 uint32_t 数组保证 4 字节对齐，仅用于 HAL SD polling 只读块验证，不写卡。 */
 static uint32_t s_sd_read_test_words[128];
 
+#define CAMERA_SD_READ_BUFFER_LEN 512U
+#define CAMERA_SD_READ_PREFILL_PATTERN 0xA5U
+#define CAMERA_SD_READ_NO_CHANGED_INDEX 0xFFFFFFFFU
+
 /* C5G 只读保存 HAL_SD_ReadBlocks 前后的 SDIO 寄存器，不清除任何状态标志。 */
 typedef struct
 {
@@ -46,6 +50,25 @@ typedef struct
     uint32_t last_hal_state_before_read;
     uint32_t last_hal_state_after_read;
     uint32_t last_hal_error_after_read;
+    uint32_t last_block_read_buffer_inspected;
+    uint32_t last_block_read_buffer_len;
+    uint32_t last_block_read_prefill_pattern;
+    uint32_t last_block_read_buffer_sum512;
+    uint32_t last_block_read_buffer_xor512;
+    uint32_t last_block_read_buffer_nonzero_count512;
+    uint32_t last_block_read_buffer_zero_count512;
+    uint32_t last_block_read_buffer_ff_count512;
+    uint32_t last_block_read_buffer_prefill_count512;
+    uint32_t last_block_read_buffer_changed_count512;
+    uint32_t last_block_read_buffer_changed;
+    uint32_t last_block_read_buffer_all_prefill;
+    uint32_t last_block_read_buffer_all_zero;
+    uint32_t last_block_read_buffer_all_ff;
+    uint32_t last_block_read_buffer_first_changed_index;
+    uint32_t last_block_read_buffer_last_changed_index;
+    uint8_t last_block_read_buffer_first16[16];
+    uint8_t last_block_read_buffer_first32[32];
+    uint8_t last_block_read_buffer_tail16[16];
 } Camera_SDReadRegDiag_t;
 
 static Camera_SDReadRegDiag_t s_read_reg_diag;
@@ -101,6 +124,101 @@ static uint32_t Camera_SDStorage_IsStaFlagSet(
     uint32_t flag)
 {
     return ((sta & flag) != 0U) ? 1U : 0U;
+}
+
+static void Camera_SDStorage_AnalyzeReadBuffer(
+    const uint8_t *buffer,
+    uint32_t length)
+{
+    uint32_t index;
+    uint32_t sum = 0U;
+    uint32_t xor_value = 0U;
+    uint32_t nonzero_count = 0U;
+    uint32_t zero_count = 0U;
+    uint32_t ff_count = 0U;
+    uint32_t prefill_count = 0U;
+    uint32_t changed_count = 0U;
+    uint32_t first_changed_index = CAMERA_SD_READ_NO_CHANGED_INDEX;
+    uint32_t last_changed_index = CAMERA_SD_READ_NO_CHANGED_INDEX;
+
+    if ((buffer == NULL) || (length != CAMERA_SD_READ_BUFFER_LEN))
+    {
+        s_read_reg_diag.last_block_read_buffer_inspected = 0U;
+        s_read_reg_diag.last_block_read_buffer_len = 0U;
+        return;
+    }
+
+    for (index = 0U; index < length; ++index)
+    {
+        uint32_t value = buffer[index];
+
+        sum += value;
+        xor_value ^= value;
+        if (value != 0U)
+        {
+            ++nonzero_count;
+        }
+        else
+        {
+            ++zero_count;
+        }
+
+        if (value == 0xFFU)
+        {
+            ++ff_count;
+        }
+
+        if (value == CAMERA_SD_READ_PREFILL_PATTERN)
+        {
+            ++prefill_count;
+        }
+        else
+        {
+            if (changed_count == 0U)
+            {
+                first_changed_index = index;
+            }
+            last_changed_index = index;
+            ++changed_count;
+        }
+    }
+
+    s_read_reg_diag.last_block_read_buffer_inspected = 1U;
+    s_read_reg_diag.last_block_read_buffer_len = length;
+    s_read_reg_diag.last_block_read_prefill_pattern =
+        CAMERA_SD_READ_PREFILL_PATTERN;
+    s_read_reg_diag.last_block_read_buffer_sum512 = sum;
+    s_read_reg_diag.last_block_read_buffer_xor512 = xor_value;
+    s_read_reg_diag.last_block_read_buffer_nonzero_count512 = nonzero_count;
+    s_read_reg_diag.last_block_read_buffer_zero_count512 = zero_count;
+    s_read_reg_diag.last_block_read_buffer_ff_count512 = ff_count;
+    s_read_reg_diag.last_block_read_buffer_prefill_count512 = prefill_count;
+    s_read_reg_diag.last_block_read_buffer_changed_count512 = changed_count;
+    s_read_reg_diag.last_block_read_buffer_changed =
+        (changed_count > 0U) ? 1U : 0U;
+    s_read_reg_diag.last_block_read_buffer_all_prefill =
+        (prefill_count == length) ? 1U : 0U;
+    s_read_reg_diag.last_block_read_buffer_all_zero =
+        (zero_count == length) ? 1U : 0U;
+    s_read_reg_diag.last_block_read_buffer_all_ff =
+        (ff_count == length) ? 1U : 0U;
+    s_read_reg_diag.last_block_read_buffer_first_changed_index =
+        first_changed_index;
+    s_read_reg_diag.last_block_read_buffer_last_changed_index =
+        last_changed_index;
+    memcpy(
+        s_read_reg_diag.last_block_read_buffer_first16,
+        buffer,
+        sizeof(s_read_reg_diag.last_block_read_buffer_first16));
+    memcpy(
+        s_read_reg_diag.last_block_read_buffer_first32,
+        buffer,
+        sizeof(s_read_reg_diag.last_block_read_buffer_first32));
+    memcpy(
+        s_read_reg_diag.last_block_read_buffer_tail16,
+        &buffer[length -
+                sizeof(s_read_reg_diag.last_block_read_buffer_tail16)],
+        sizeof(s_read_reg_diag.last_block_read_buffer_tail16));
 }
 
 #define CAMERA_SD_CONFLICT_PIN_MASK \
@@ -393,7 +511,10 @@ static uint32_t Camera_SDStorage_ReadBlockTest(uint32_t block_addr)
         (uint32_t)hsd_snapshot.State;
     s_camera_sd_status.last_block_read_pre_card_state =
         (uint32_t)HAL_SD_GetCardState(&hsd_snapshot);
-    memset(read_buffer, 0, sizeof(s_sd_read_test_words));
+    memset(
+        read_buffer,
+        CAMERA_SD_READ_PREFILL_PATTERN,
+        sizeof(s_sd_read_test_words));
     ++s_camera_sd_status.block_read_attempt_count;
     s_camera_sd_status.last_block_read_addr = block_addr;
     s_camera_sd_status.last_block_read_count = 1U;
@@ -410,6 +531,9 @@ static uint32_t Camera_SDStorage_ReadBlockTest(uint32_t block_addr)
         (uint32_t)hsd_snapshot.State;
     s_read_reg_diag.last_hal_error_after_read =
         HAL_SD_GetError(&hsd_snapshot);
+    Camera_SDStorage_AnalyzeReadBuffer(
+        (const uint8_t *)read_buffer,
+        CAMERA_SD_READ_BUFFER_LEN);
     s_camera_sd_status.last_block_read_operation_ms =
         HAL_GetTick() - start_ms;
     s_camera_sd_status.last_block_read_status = (uint32_t)hal_status;
@@ -946,6 +1070,23 @@ void Camera_SDStorage_DebugPrintBusWidthStatus(void)
     LOG_RAW("  last_wait_timeout_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_wait_timeout_ms);
 }
 
+static void Camera_SDStorage_PrintReadBufferBytes(
+    const char *field_name,
+    const uint8_t *buffer,
+    uint32_t length)
+{
+    uint32_t index;
+
+    LOG_RAW("  %s=", field_name);
+    for (index = 0U; index < length; ++index)
+    {
+        LOG_RAW(
+            (index == 0U) ? "%02lX" : " %02lX",
+            (unsigned long)buffer[index]);
+    }
+    LOG_RAW("\r\n");
+}
+
 void Camera_SDStorage_DebugPrintReadRegDiag(void)
 {
     const Camera_SDSdioRegSnapshot_t *before_wait =
@@ -1006,6 +1147,34 @@ void Camera_SDStorage_DebugPrintReadRegDiag(void)
     LOG_RAW("  read_after_sta_rxact=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_RXACT));
     LOG_RAW("  read_after_sta_rxdavl=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_RXDAVL));
     LOG_RAW("  read_after_sta_txunderr=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_TXUNDERR));
+    LOG_RAW("  last_block_read_buffer_inspected=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_inspected);
+    LOG_RAW("  last_block_read_buffer_len=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_len);
+    LOG_RAW("  last_block_read_prefill_pattern=0x%02lX\r\n", (unsigned long)s_read_reg_diag.last_block_read_prefill_pattern);
+    LOG_RAW("  last_block_read_buffer_sum512=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_sum512);
+    LOG_RAW("  last_block_read_buffer_xor512=0x%02lX\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_xor512);
+    LOG_RAW("  last_block_read_buffer_nonzero_count512=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_nonzero_count512);
+    LOG_RAW("  last_block_read_buffer_zero_count512=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_zero_count512);
+    LOG_RAW("  last_block_read_buffer_ff_count512=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_ff_count512);
+    LOG_RAW("  last_block_read_buffer_prefill_count512=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_prefill_count512);
+    LOG_RAW("  last_block_read_buffer_changed_count512=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_changed_count512);
+    LOG_RAW("  last_block_read_buffer_changed=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_changed);
+    LOG_RAW("  last_block_read_buffer_all_prefill=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_all_prefill);
+    LOG_RAW("  last_block_read_buffer_all_zero=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_all_zero);
+    LOG_RAW("  last_block_read_buffer_all_ff=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_all_ff);
+    LOG_RAW("  last_block_read_buffer_first_changed_index=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_first_changed_index);
+    LOG_RAW("  last_block_read_buffer_last_changed_index=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_last_changed_index);
+    Camera_SDStorage_PrintReadBufferBytes(
+        "last_block_read_buffer_first16",
+        s_read_reg_diag.last_block_read_buffer_first16,
+        sizeof(s_read_reg_diag.last_block_read_buffer_first16));
+    Camera_SDStorage_PrintReadBufferBytes(
+        "last_block_read_buffer_first32",
+        s_read_reg_diag.last_block_read_buffer_first32,
+        sizeof(s_read_reg_diag.last_block_read_buffer_first32));
+    Camera_SDStorage_PrintReadBufferBytes(
+        "last_block_read_buffer_tail16",
+        s_read_reg_diag.last_block_read_buffer_tail16,
+        sizeof(s_read_reg_diag.last_block_read_buffer_tail16));
 }
 
 void Camera_SDStorage_PrintLineState(void)

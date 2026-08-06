@@ -6928,3 +6928,51 @@ python tools/uart_sd_line_after_init_auto_test.py --port COM4 --baud 115200 --re
 - `read_after_read_fifocnt` 异常：说明 FIFO 可能有残留或未正常读出。
 - `read_after_sta_dataend` 或 `read_after_sta_dbckend` 与预期不符：说明数据块结束阶段异常。
 - `read_hal_error_after_read` 应与底层 STA 快照交叉核对；本轮只收集证据，不据此自动清标志或改变返回逻辑。
+
+## Stage 11C-5H 失败读块 buffer 内容统计
+
+### 1. 当前现象
+
+- `SD INIT` 与 CardInfo 均成功。
+- `SD READTEST 0` 和 `SD READTEST 2048` 均返回 `HAL_SD_ERROR_DATA_CRC_FAIL`，失败时 `last_block_read_size=0`。
+- C5G 观察到 `HAL_SD_ReadBlocks` 返回后的 `SDIO->STA` 已被 HAL 清零，`read_after_read_sta=0x00000000`，因此无法直接还原失败瞬间的 STA flag。
+- C5G 同时记录到 DCTRL=`0x93`、DLEN=512、DCOUNT=0、FIFOCNT=0，说明数据通道按 512 字节配置并结束过，但仍不能判断 512 字节读缓冲区是否被写入。
+
+### 2. 本轮目的
+
+- 在调用 `HAL_SD_ReadBlocks` 前将 512 字节对齐读缓冲区预填为固定模式 `0xA5`。
+- `HAL_SD_ReadBlocks` 返回后，无论成功还是失败，均立即统计完整 512 字节缓冲区。
+- 记录缓冲区总和、异或值、零值/非零值/`0xFF`/预填值/变化字节计数、变化范围以及 first16、first32、tail16。
+- 通过预填模式是否被改变，判断 CRC 失败时数据是否进入内存，以及属于完全未写入、部分写入还是大面积写入。
+- 新增的 `buffer_len=512` 仅表示实际检查了 512 字节内存；失败时原有 `last_block_read_size` 继续保持 0，不改变其语义。
+
+### 3. 本轮保持不变
+
+- 不修改 SD INIT、`HAL_SD_ReadBlocks` 调用参数、单次 1 block 读取或原有成功/失败返回逻辑。
+- 保持 4 字节对齐 `uint32_t[128]` 缓冲区和读前 `WaitCardTransfer`。
+- ClockDiv 继续固定为 `118U`，不改变 BUSWIDTH，不新增 `HAL_SD_ConfigWideBusOperation` 调用。
+- 不恢复 IRQOFF 或读后 `WaitCardTransfer`。
+- 不写卡、不接 FATFS、不使用 SDIO DMA 或 SDIO IRQ。
+- 不触碰摄像头 PWDN、CAMOFF、CAMON、takeover 或 restore 流程。
+- 不新增 CLI 命令，仅扩展现有 `SD READINFO`。
+
+### 4. 结果判断
+
+- `last_block_read_buffer_all_prefill=1` 且 `last_block_read_buffer_changed_count512=0`：说明失败时 buffer 未被写入，重点检查 SDIO 接收路径、FIFO 和 HAL polling 读流程。
+- `last_block_read_buffer_changed_count512` 大于 0 但明显小于 512：说明只收到部分数据，重点检查数据阶段中断、超时、CRC 或信号线稳定性。
+- `last_block_read_buffer_changed_count512` 接近 512：说明数据基本进入 buffer，但 CRC 校验失败，重点检查数据线完整性、SDIO 采样、CRC 校验或总线质量。
+- `last_block_read_buffer_all_zero=1`：说明 buffer 被写成全 0，需要结合 first32 和 tail16 判断是有效卡内容还是异常填充。
+- `last_block_read_buffer_all_ff=1`：说明 buffer 被写成全 `0xFF`，可能对应空闲线或异常数据模式。
+- 没有变化时，first/last changed index 均为 `0xFFFFFFFF`；有变化时分别表示第一个和最后一个非 `0xA5` 字节位置。
+
+### 5. 板测流程
+
+1. 执行：
+
+   ```text
+   python tools/uart_sd_line_after_init_auto_test.py --port COM4 --baud 115200 --repeat 0
+   ```
+
+2. 查看 `SD READINFO` 中新增的 buffer inspected、长度、预填模式、各类计数、变化范围和 first16/first32/tail16 字段。
+3. 完成 TAKEOVER EXIT、SNAPSHOT RESTORE 和 basic 图像恢复验证。
+4. 再执行 repeat 20，验证恢复链路稳定性。
