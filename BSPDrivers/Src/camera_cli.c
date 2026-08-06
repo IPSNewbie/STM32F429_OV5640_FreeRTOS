@@ -162,6 +162,17 @@ static void Camera_CLI_WriteHexU32(UART_HandleTypeDef *huart, uint32_t value)
     Camera_CLI_WriteText(huart, buf);
 }
 
+static void Camera_CLI_WriteHexByte(UART_HandleTypeDef *huart, uint8_t value)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    char buf[3];
+
+    buf[0] = digits[(value >> 4U) & 0x0FU];
+    buf[1] = digits[value & 0x0FU];
+    buf[2] = '\0';
+    Camera_CLI_WriteText(huart, buf);
+}
+
 static void Camera_CLI_WriteLine(UART_HandleTypeDef *huart, const char *text) // 发送一行文本，并自动在末尾追加标准串口换行 "\r\n"
 {
     Camera_CLI_WriteText(huart, text);   // 先发送调用者提供的正文内容
@@ -212,6 +223,40 @@ static uint8_t Camera_CLI_ParseU8(const char *text, // 指向待解析的数字�
     return 1U;                // 返回 1 表示解析成功
 }
 
+static uint8_t Camera_CLI_ParseU32(const char *text,
+                                   uint32_t len,
+                                   uint32_t *value)
+{
+    uint32_t parsed = 0U;
+    uint32_t index;
+
+    if ((text == NULL) || (value == NULL) || (len == 0U))
+    {
+        return 0U;
+    }
+
+    for (index = 0U; index < len; ++index)
+    {
+        uint32_t digit;
+
+        if ((text[index] < '0') || (text[index] > '9'))
+        {
+            return 0U;
+        }
+
+        digit = (uint32_t)(text[index] - '0');
+        if (parsed > ((0xFFFFFFFFU - digit) / 10U))
+        {
+            return 0U;
+        }
+
+        parsed = (parsed * 10U) + digit;
+    }
+
+    *value = parsed;
+    return 1U;
+}
+
 void Camera_CLI_ResetDefault(void) // 将运行时 CLI 配置恢复为项目定义的默认值
 {
     s_camera_cli_config.process_mode = CAMERA_PROCESS_MODE_BYPASS;          // 默认使用 BYPASS，保证上电后输出原始彩色图像
@@ -254,6 +299,8 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart) // 输出当前 CLI 
     Camera_CLI_WriteLine(huart, "DUMP");         // DUMP：触发一次图像采集并发送 OV56RGB5 二进制帧
     Camera_CLI_WriteLine(huart, "SD STATUS - show SD storage status"); // 查询 SD 卡模块的软件状态
     Camera_CLI_WriteLine(huart, "SD CARDINFO - show cached SD card information"); // 只输出最近一次缓存的卡信息
+    Camera_CLI_WriteLine(huart, "SD READTEST [block] - read one block in polling mode, default 0"); // 可选十进制逻辑块地址
+    Camera_CLI_WriteLine(huart, "SD READINFO - show cached read block test result"); // 只输出最近一次块读取缓存
     Camera_CLI_WriteLine(huart, "SD INIT - request SD card init, currently deferred until SDIO takeover"); // 请求初始化，本阶段延后到 SDIO 接管完成后
     Camera_CLI_WriteLine(huart, "SD TAKEOVER STATUS - show SDIO takeover status"); // 查询 SDIO 接管软件状态
     Camera_CLI_WriteLine(huart, "SD TAKEOVER ENTER - request SDIO takeover, currently deferred"); // 请求进入接管模式，本阶段只记录请求
@@ -635,6 +682,135 @@ static void Camera_CLI_PrintSdCardInfoFields(
         status->card_log_block_size);
 }
 
+/* 输出只读块测试缓存；该函数不会重新读取 SD 卡。 */
+static void Camera_CLI_PrintSdBlockReadFields(
+    UART_HandleTypeDef *huart,
+    const CameraSdStorageStatus_t *status)
+{
+    uint32_t index;
+
+    Camera_CLI_WriteStatLine(
+        huart,
+        "block_read_test_enabled",
+        status->block_read_test_enabled);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "block_read_attempt_count",
+        status->block_read_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "block_read_success_count",
+        status->block_read_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "block_read_error_count",
+        status->block_read_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_status",
+        status->last_block_read_status);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_error",
+        status->last_block_read_error);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_operation_ms",
+        status->last_block_read_operation_ms);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_addr",
+        status->last_block_read_addr);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_count",
+        status->last_block_read_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_size",
+        status->last_block_read_size);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_sum",
+        status->last_block_read_sum);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_xor",
+        status->last_block_read_xor);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_nonzero_count",
+        status->last_block_read_nonzero_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "block_read_wait_transfer_attempt_count",
+        status->block_read_wait_transfer_attempt_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "block_read_wait_transfer_success_count",
+        status->block_read_wait_transfer_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "block_read_wait_transfer_error_count",
+        status->block_read_wait_transfer_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_pre_card_state",
+        status->last_block_read_pre_card_state);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_post_card_state",
+        status->last_block_read_post_card_state);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_wait_card_state",
+        status->last_block_read_wait_card_state);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_wait_operation_ms",
+        status->last_block_read_wait_operation_ms);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_wait_timeout_ms",
+        status->last_block_read_wait_timeout_ms);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_error_is_data_crc_fail",
+        status->last_block_read_error_is_data_crc_fail);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_error_is_cmd_crc_fail",
+        status->last_block_read_error_is_cmd_crc_fail);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_error_is_cmd_rsp_timeout",
+        status->last_block_read_error_is_cmd_rsp_timeout);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_error_is_data_timeout",
+        status->last_block_read_error_is_data_timeout);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_error_is_rx_overrun",
+        status->last_block_read_error_is_rx_overrun);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "last_block_read_error_is_tx_underrun",
+        status->last_block_read_error_is_tx_underrun);
+    Camera_CLI_WriteText(huart, "  last_block_read_first16=");
+    for (index = 0U; index < 16U; ++index)
+    {
+        if (index != 0U)
+        {
+            Camera_CLI_WriteText(huart, " ");
+        }
+        Camera_CLI_WriteHexByte(
+            huart,
+            status->last_block_read_first16[index]);
+    }
+    Camera_CLI_WriteText(huart, "\r\n");
+}
+
 /* 输出 SDIO 接管状态字段，供 SD STATUS 和 SD TAKEOVER STATUS 复用。 */
 static void Camera_CLI_PrintSdTakeoverFields(
     UART_HandleTypeDef *huart,
@@ -888,6 +1064,7 @@ static void Camera_CLI_PrintSdTakeoverFields(
         "last_sdio_hal_deinit_operation_ms",
         status->last_sdio_hal_deinit_operation_ms);
     Camera_CLI_PrintSdCardInfoFields(huart, status);
+    Camera_CLI_PrintSdBlockReadFields(huart, status);
 }
 
 /* 输出完整 SD 卡软件状态，不访问 SDIO 或 FATFS。 */
@@ -933,7 +1110,24 @@ static void Camera_CLI_PrintSdCardInfo(UART_HandleTypeDef *huart)
     Camera_CLI_PrintSdCardInfoFields(huart, &status);
 }
 
-/* 处理 SD 命令；Stage 11C-4 只读取 HAL 卡信息，不接入 FATFS 或块读写。 */
+static void Camera_CLI_PrintSdReadInfo(UART_HandleTypeDef *huart)
+{
+    CameraSdStorageStatus_t status;
+
+    Camera_SDStorage_GetStatus(&status);
+    Camera_CLI_WriteLine(huart, "SD READINFO:");
+    Camera_CLI_PrintSdBlockReadFields(huart, &status);
+}
+
+static void Camera_CLI_PrintSdReadTestStatus(
+    UART_HandleTypeDef *huart,
+    const CameraSdStorageStatus_t *status)
+{
+    Camera_CLI_WriteLine(huart, "SD READTEST:");
+    Camera_CLI_PrintSdBlockReadFields(huart, status);
+}
+
+/* 处理 SD 命令；Stage 11C-5 只增加轮询单块读取，不接入写卡或 FATFS。 */
 static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
                                              const char *arg,
                                              uint32_t arg_len)
@@ -949,6 +1143,110 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
     if (Camera_CLI_TokenEquals(arg, arg_len, "CARDINFO") != 0U)
     {
         Camera_CLI_PrintSdCardInfo(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "READINFO") != 0U)
+    {
+        Camera_CLI_PrintSdReadInfo(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if ((arg_len >= 8U) &&
+        (Camera_CLI_TokenEquals(arg, 8U, "READTEST") != 0U) &&
+        ((arg_len == 8U) || (Camera_CLI_IsSpace(arg[8]) != 0U)))
+    {
+        const char *block_arg;
+        uint32_t block_arg_len;
+        uint32_t block_addr = 0U;
+        CameraSdStorageStatus_t status;
+
+        if (arg_len > 8U)
+        {
+            block_arg = Camera_CLI_TrimLeft(&arg[8]);
+            block_arg_len = Camera_CLI_TrimmedLength(block_arg);
+            if (Camera_CLI_ParseU32(
+                    block_arg,
+                    block_arg_len,
+                    &block_addr) == 0U)
+            {
+                Camera_CLI_WriteLine(
+                    huart,
+                    "SD READTEST: invalid block address.");
+                return CAMERA_CLI_OK;
+            }
+        }
+
+        Camera_SDStorage_GetStatus(&status);
+        if ((status.card_log_block_nbr != 0U) &&
+            (block_addr >= status.card_log_block_nbr))
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD READTEST: block address out of range.");
+            return CAMERA_CLI_OK;
+        }
+
+        result = Camera_SDStorage_RequestBlockReadTest(block_addr);
+        Camera_SDStorage_GetStatus(&status);
+
+        if (result == CAMERA_SD_OK)
+        {
+            Camera_CLI_WriteText(
+                huart,
+                "SD READTEST: block read OK, block=");
+            Camera_CLI_WriteU32(huart, block_addr);
+            Camera_CLI_WriteText(huart, ", size=512.\r\n");
+        }
+        else if (result == CAMERA_SD_ERR_BLOCK_READ_NOT_READY)
+        {
+            if ((status.card_info_read_success_count > 0U) &&
+                (status.card_log_block_size != 512U) &&
+                (status.card_block_size != 512U))
+            {
+                Camera_CLI_WriteLine(
+                    huart,
+                    "SD READTEST: not ready, card block size is unsupported.");
+            }
+            else if ((status.is_initialized == 1U) &&
+                     (status.sdio_ready == 1U) &&
+                     (status.card_info_read_success_count > 0U) &&
+                     (status.block_read_wait_transfer_error_count > 0U) &&
+                     (status.last_block_read_wait_card_state !=
+                      (uint32_t)HAL_SD_CARD_TRANSFER))
+            {
+                Camera_CLI_WriteLine(
+                    huart,
+                    "SD READTEST: not ready, card did not enter transfer state.");
+            }
+            else
+            {
+                Camera_CLI_WriteLine(
+                    huart,
+                    "SD READTEST: not ready, run SNAPSHOT PREPARE, SD TAKEOVER ENTER and SD INIT first.");
+            }
+        }
+        else if (result == CAMERA_SD_ERR_BLOCK_READ_FAILED)
+        {
+            Camera_CLI_WriteText(
+                huart,
+                "SD READTEST: block read failed, block=");
+            Camera_CLI_WriteU32(huart, block_addr);
+            Camera_CLI_WriteText(huart, ", status=");
+            Camera_CLI_WriteU32(huart, status.last_block_read_status);
+            Camera_CLI_WriteText(huart, ", error=0x");
+            Camera_CLI_WriteHexU32(huart, status.last_block_read_error);
+            Camera_CLI_WriteText(huart, ".\r\n");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SD READTEST: ");
+            Camera_CLI_WriteLine(
+                huart,
+                Camera_SDStorage_ErrorToString(result));
+        }
+
+        Camera_CLI_PrintSdReadTestStatus(huart, &status);
         return CAMERA_CLI_OK;
     }
 

@@ -5946,3 +5946,423 @@ Stage 11C-4 验证通过。本轮在 `HAL_SD_Init` 成功后调用 `HAL_SD_GetCa
 ### 11. 后续Stage 11C-5建议
 
 Stage 11C-5 建议进行只读块验证，继续不写卡、不接 FATFS。可读取一个固定逻辑块到内部 512 字节缓冲区，例如 block 0 或靠后的安全只读块，只打印前 16 字节和 CRC32/简单校验，不修改 SD 卡内容。只读块验证成功后，再进入后续 FATFS mount；写卡放到更后面的独立阶段。
+
+## Stage 11C-5 只读块验证
+
+### 1. 本轮目的
+
+- 在 `HAL_SD_Init` 和 `HAL_SD_GetCardInfo` 成功后，通过 polling 方式调用 `HAL_SD_ReadBlocks` 只读读取逻辑块 0。
+- 每次只读取 1 个 512 B block，使用固定的 512 字节静态缓冲区，不使用动态内存。
+- 输出前 16 字节、逐字节 `sum`、逐字节 `xor`、非零字节数、HAL 状态和错误码。
+- 新增 `SD READTEST` 命令执行一次只读验证，新增 `SD READINFO` 命令查看最近一次缓存。
+- `SD TAKEOVER EXIT` 后保留 read block 缓存，便于在 SDIO 已反初始化且时钟关闭后继续查询。
+
+安全顺序保持为：`SNAPSHOT PREPARE` -> `SD TAKEOVER ENTER` -> `SD INIT` -> `HAL_SD_Init` -> `HAL_SD_GetCardInfo` -> `SD READTEST` -> `HAL_SD_ReadBlocks` -> `SD TAKEOVER EXIT` -> `HAL_SD_DeInit` -> 关闭 SDIO 时钟 -> 恢复 GPIO -> `SNAPSHOT RESTORE`。
+
+### 2. 本轮不做
+
+- 不调用 `HAL_SD_ConfigWideBusOperation`，继续保持 1-bit 和 `ClockDiv=118U`。
+- 不调用 `HAL_SD_WriteBlocks`，不修改 SD 卡内容。
+- 不接 FATFS，不挂载文件系统，不创建或写入文件。
+- 不使用 SDIO DMA，不配置 `SDIO_IRQn`，不启用 SDIO 中断。
+- 不修改 DCMI、DCMI DMA、FreeRTOS、IWDG、UART DMA、二进制请求协议或 `OV56RGB5` 图像帧格式。
+
+### 3. 新增状态字段
+
+- `block_read_test_enabled`
+- `block_read_attempt_count`
+- `block_read_success_count`
+- `block_read_error_count`
+- `last_block_read_status`
+- `last_block_read_error`
+- `last_block_read_operation_ms`
+- `last_block_read_addr`
+- `last_block_read_count`
+- `last_block_read_size`
+- `last_block_read_sum`
+- `last_block_read_xor`
+- `last_block_read_nonzero_count`
+- `last_block_read_first16`
+
+`block_read_attempt_count` 只统计实际调用 `HAL_SD_ReadBlocks` 的次数。未初始化、SDIO 未就绪、CardInfo 未成功、块大小不支持或地址越界时直接返回 `BLOCK_READ_NOT_READY`，不访问 SD 卡且不增加计数。操作耗时采用出口 tick 减入口 tick，不记录系统绝对 tick。
+
+### 4. 预期命令行为
+
+- 未 INIT 时，`SD READINFO` 只打印缓存，不调用 `HAL_SD_Init`、`HAL_SD_GetCardInfo` 或 `HAL_SD_ReadBlocks`；未读取过时各结果字段为 0。
+- 未 INIT 时，`SD READTEST` 返回 not ready，不触发 `HAL_SD_ReadBlocks`。
+- 完整 SDIO GPIO 已切换到 AF12 后，`SD INIT` 调用 `HAL_SD_Init` 和 `HAL_SD_GetCardInfo`。
+- CardInfo 成功且块大小为 512 B 时，`SD READTEST` 固定调用一次 `HAL_SD_ReadBlocks(..., 0U, 1U, 1000U)`。
+- 读取成功后缓存 512 B 统计值和前 16 字节；读取失败时记录 `BLOCK_READ_FAILED`，不复位、不 FATAL、不卡死。
+- `SD READINFO` 始终只打印最近一次缓存，不重复读卡。
+- `SD STATUS` 和 `SD TAKEOVER STATUS` 增加全部 read block 字段，同时保留原有字段和命令行为。
+- `SD TAKEOVER EXIT` 执行 `HAL_SD_DeInit`、关闭 SDIO 时钟并恢复 GPIO，但不清空 card info 或 read block 缓存。
+- `SNAPSHOT RESTORE` 后应验证 basic、pc_dump、repeat 20/20 和运行保护状态恢复正常。
+
+### 5. 风险说明
+
+- 本轮首次调用 `HAL_SD_ReadBlocks`，但严格只读 1 个 block，不调用任何写卡 API。
+- block 0 可能包含 MBR 或文件系统引导扇区；读取不会修改其内容。
+- 单块读取成功不等价于 FATFS 可用，也不代表已经实现图片保存。
+- 如果 `HAL_SD_ReadBlocks` 失败，必须保留 HAL 状态与错误码，并保证后续 EXIT/RESTORE 路径仍可执行。
+- 卡容量和块参数必须以成功缓存的 CardInfo 为依据；逻辑块大小不是 512 B 时禁止读取。
+
+### 6. 后续Stage 11C-6建议
+
+- 如果单次只读块验证成功，下一步执行多轮 `HAL_SD_Init + CardInfo + ReadBlock + HAL_SD_DeInit + RESTORE` 稳定性验证。
+- Stage 11C-6 继续只读、不写卡、不接 FATFS。
+- 多轮验证通过后，再考虑独立的 FATFS mount 阶段；挂载和写卡不并入本轮。
+
+## Stage 11C-5A 只读块失败诊断与修正
+
+### 1. Stage 11C-5首次板测现象
+
+- 系统启动正常，`reset: iwdg=0`，OV5640 和 Camera 初始化正常，无 FATAL、无复位循环。
+- 未 INIT 时，`SD READINFO` 只显示缓存，`SD READTEST` 返回 not ready，`block_read_attempt_count` 保持 0。
+- `SNAPSHOT PREPARE` 后 DCMI stop OK，相机进入 `CAMERA_PAUSED`，软件 guard 生效。
+- `SD TAKEOVER ENTER` 成功，`sdio_af12_selected=1`、`sdio_full_gpio_af12_selected=1`。
+- `SD INIT` 中 `HAL_SD_Init` 和 CardInfo 均成功；卡逻辑块数量为 61022208，块大小为 512 B，SDIO、初始化和时钟状态均为就绪。
+- `HAL_SD_ReadBlocks(block 0, count 1)` 返回失败：`status=1`、`error=0x00000002`；`block_read_attempt_count=1`、`block_read_success_count=0`、`block_read_error_count=1`、`last_block_read_size=0`，前 16 字节全为 `00`。读失败后 card state 从 4 变为 5。
+- 失败后的 `SD TAKEOVER EXIT`、`HAL_SD_DeInit`、SDIO 时钟关闭和 GPIO 恢复均成功。`SNAPSHOT RESTORE` 后 basic、pc_dump、repeat 20/20 均 PASS，frame_id 1～22 连续；IWDG、Hook 和 UART RX DMA 状态正常。
+
+因此 Stage 11C-5 的退出与图像恢复路径验证通过，但只读块功能尚未通过，需由 C5A 增强诊断后重新板测。
+
+### 2. 0x00000002错误码含义
+
+当前工程 `stm32f4xx_hal_sd.h` 将 `HAL_SD_ERROR_DATA_CRC_FAIL` 映射到 `SDMMC_ERROR_DATA_CRC_FAIL`，而 `stm32f4xx_ll_sdmmc.h` 明确定义 `SDMMC_ERROR_DATA_CRC_FAIL=0x00000002U`。因此本次 `0x00000002` 的实际错误宏为 `HAL_SD_ERROR_DATA_CRC_FAIL`。
+
+该结果表明当前失败更像数据阶段 CRC 校验失败，而不是命令阶段完全无响应。缓冲区对齐和读前 card state 等待用于排除软件访问条件并增强观测，但在重新板测前不能断言已消除数据 CRC 失败的根因。
+
+### 3. 本轮修正与诊断字段
+
+- 将读缓冲区改为静态 `uint32_t[128]`，总大小仍为 512 B，以保证 4 字节对齐；所有统计和前 16 字节均通过其 `uint8_t` 视图计算。
+- 每次读取前清零缓冲区，不使用 malloc、栈缓冲区或 DMA。
+- 在调用 `HAL_SD_ReadBlocks` 前，以 1000 ms 超时轮询等待 `HAL_SD_CARD_TRANSFER`，每次循环调用 `HAL_Delay(1U)`。
+- 新增等待次数、成功次数、超时次数、等待结束状态与等待耗时字段。
+- 新增读前和读后 card state，便于区分进入读操作前是否已处于传输态，以及失败后的状态变化。
+- 按本工程 HAL 宏对最近一次读错误执行 bit 判断，记录 DATA CRC、CMD CRC、命令响应超时、数据超时、RX overrun 和 TX underrun 标志。
+- `SD READTEST` 支持可选纯十进制 block 地址：无参数默认 block 0，同时支持 `SD READTEST 0` 和 `SD READTEST 2048`。
+- 参数非法或逻辑块地址越界时不读卡，也不增加 `block_read_attempt_count`。
+- 每次命令仍只调用一次 polling `HAL_SD_ReadBlocks`，且固定读取 1 个 block。
+- `SD READINFO`、`SD STATUS` 和 `SD TAKEOVER STATUS` 输出全部新增诊断字段；`SD READINFO` 仍只查看缓存。
+
+新增状态字段如下：
+
+- `block_read_wait_transfer_attempt_count`
+- `block_read_wait_transfer_success_count`
+- `block_read_wait_transfer_error_count`
+- `last_block_read_pre_card_state`
+- `last_block_read_post_card_state`
+- `last_block_read_wait_card_state`
+- `last_block_read_wait_operation_ms`
+- `last_block_read_wait_timeout_ms`
+- `last_block_read_error_is_data_crc_fail`
+- `last_block_read_error_is_cmd_crc_fail`
+- `last_block_read_error_is_cmd_rsp_timeout`
+- `last_block_read_error_is_data_timeout`
+- `last_block_read_error_is_rx_overrun`
+- `last_block_read_error_is_tx_underrun`
+
+### 4. 本轮仍不做
+
+- 不调用 `HAL_SD_ConfigWideBusOperation` 或 `HAL_SD_WriteBlocks`。
+- 不接 FATFS，不挂载文件系统，不创建或写入文件。
+- 不使用 SDIO DMA，不配置或启用 SDIO 中断。
+- 不修改 DCMI、DCMI DMA、FreeRTOS、IWDG、UART DMA、协议或图像帧格式。
+
+### 5. 后续板测计划
+
+1. 按既有安全顺序执行 `SNAPSHOT PREPARE`、`SD TAKEOVER ENTER` 和 `SD INIT`。
+2. 先执行 `SD READTEST 0` 并用 `SD READINFO` 检查等待状态、读前/读后状态和错误 bit。
+3. 如果 block 0 仍失败，再执行 `SD READTEST 2048` 并重新查询缓存。
+4. 无论读取成功或失败，都必须执行 `SD TAKEOVER EXIT` 和 `SNAPSHOT RESTORE`。
+5. RESTORE 后执行 basic、pc_dump、repeat 20/20，并检查 IWDG、Hook 和 UART RX DMA 状态。
+
+### 6. Stage 11C-5A板测启动与前置保护
+
+板卡启动正常，启动日志显示 `reset: iwdg=0`、`OV5640 ID = 0x5640`、`Camera init OK`；未出现 FATAL、反复复位或 IWDG 复位循环。
+
+未 INIT 时执行 `SD READINFO`，缓存保持初始值：
+
+```text
+block_read_test_enabled=1
+block_read_attempt_count=0
+block_read_success_count=0
+block_read_error_count=0
+last_block_read_status=0
+last_block_read_error=0
+last_block_read_operation_ms=0
+last_block_read_addr=0
+last_block_read_count=0
+last_block_read_size=0
+last_block_read_sum=0
+last_block_read_xor=0
+last_block_read_nonzero_count=0
+block_read_wait_transfer_attempt_count=0
+block_read_wait_transfer_success_count=0
+block_read_wait_transfer_error_count=0
+last_block_read_pre_card_state=0
+last_block_read_post_card_state=0
+last_block_read_wait_card_state=0
+last_block_read_wait_operation_ms=0
+last_block_read_wait_timeout_ms=0
+last_block_read_error_is_data_crc_fail=0
+last_block_read_first16=00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+此时执行 `SD READTEST` 返回：
+
+```text
+SD READTEST: not ready, run SNAPSHOT PREPARE, SD TAKEOVER ENTER and SD INIT first.
+```
+
+该命令被正确阻止，没有调用 `HAL_SD_ReadBlocks`，`block_read_attempt_count` 和 `block_read_wait_transfer_attempt_count` 均保持 0。
+
+未执行 PREPARE 时，`SD INIT` 返回：
+
+```text
+SD INIT: deferred, need SDIO takeover because PC8/PC9/PC11 conflict with DCMI.
+```
+
+状态为 `last_error_text=NEED_TAKEOVER`、`sdio_hal_init_attempt_count=0`、`card_info_read_attempt_count=0`、`block_read_attempt_count=0`、`sdio_clock_enabled=0`。这证明未完成 `SNAPSHOT PREPARE` 和 `SD TAKEOVER ENTER` 前，不调用 `HAL_SD_Init`、不读取 CardInfo、也不读块。
+
+### 7. PREPARE、SDIO接管与初始化结果
+
+`SNAPSHOT PREPARE` 输出 `SNAPSHOT PREPARE: DCMI stop OK, snapshot software guard active.`，对应状态如下：
+
+```text
+camera_control_state_text=CAMERA_PAUSED
+prepare_success_count=1
+dcmi_stop_success_count=1
+software_guard_active=1
+dump_block_required=1
+```
+
+`SD TAKEOVER ENTER` 输出 `SD TAKEOVER ENTER: full SDIO GPIO switched to AF12, run SD INIT next.`，状态为 `takeover_state_text=ENTER_DEFERRED`、`sdio_af12_selected=1`、`sdio_full_gpio_af12_selected=1`、`sdio_full_gpio_switch_success_count=1`、`sdio_full_gpio_switch_error_count=0`。
+
+随后 `SD INIT` 输出 `SD INIT: HAL_SD_Init OK, card info OK, FATFS is not mounted.`。初始化与卡信息如下：
+
+```text
+is_initialized=1
+sdio_ready=1
+fatfs_ready=0
+sdio_clock_enabled=1
+sdio_hal_init_attempt_count=1
+sdio_hal_init_success_count=1
+sdio_hal_init_error_count=0
+last_hal_sd_init_status=0
+last_hal_sd_error=0
+card_info_read_attempt_count=1
+card_info_read_success_count=1
+card_info_read_error_count=0
+last_hal_sd_state=1
+last_hal_sd_card_state=4
+card_type=1
+card_version=1
+card_class=1461
+card_rel_card_add=1
+card_block_nbr=61022208
+card_block_size=512
+card_log_block_nbr=61022208
+card_log_block_size=512
+```
+
+`HAL_SD_Init` 和 `HAL_SD_GetCardInfo` 均正常，SD 卡基础信息仍可读取；`fatfs_ready=0` 是本阶段未接 FATFS 的预期结果。
+
+### 8. SD READTEST 0结果
+
+命令输出：
+
+```text
+SD READTEST: block read failed, block=0, status=1, error=0x00000002.
+```
+
+诊断字段如下：
+
+```text
+block_read_attempt_count=1
+block_read_success_count=0
+block_read_error_count=1
+last_block_read_status=1
+last_block_read_error=2
+last_block_read_error_is_data_crc_fail=1
+last_block_read_addr=0
+last_block_read_count=1
+last_block_read_size=0
+last_block_read_operation_ms=6
+block_read_wait_transfer_attempt_count=1
+block_read_wait_transfer_success_count=1
+block_read_wait_transfer_error_count=0
+last_block_read_pre_card_state=4
+last_block_read_post_card_state=4
+last_block_read_wait_card_state=4
+last_block_read_wait_operation_ms=0
+last_block_read_wait_timeout_ms=1000
+last_block_read_error_is_cmd_crc_fail=0
+last_block_read_error_is_cmd_rsp_timeout=0
+last_block_read_error_is_data_timeout=0
+last_block_read_error_is_rx_overrun=0
+last_block_read_error_is_tx_underrun=0
+last_block_read_first16=00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+block 0 读取失败，`0x00000002` 已由当前工程头文件确认对应 `HAL_SD_ERROR_DATA_CRC_FAIL`。读前等待 `HAL_SD_CARD_TRANSFER` 成功，等待结束、读前和读后 card state 均为 4，且 4 字节对齐缓冲已经生效。因此，对齐缓冲和 TRANSFER 等待没有消除 DATA CRC 错误。
+
+### 9. SD READTEST 2048结果
+
+命令输出：
+
+```text
+SD READTEST: block read failed, block=2048, status=1, error=0x00000002.
+```
+
+诊断字段如下：
+
+```text
+block_read_attempt_count=2
+block_read_success_count=0
+block_read_error_count=2
+last_block_read_status=1
+last_block_read_error=2
+last_block_read_error_is_data_crc_fail=1
+last_block_read_addr=2048
+last_block_read_count=1
+last_block_read_size=0
+last_block_read_operation_ms=8
+block_read_wait_transfer_attempt_count=2
+block_read_wait_transfer_success_count=2
+block_read_wait_transfer_error_count=0
+last_block_read_pre_card_state=4
+last_block_read_post_card_state=4
+last_block_read_wait_card_state=4
+last_block_read_wait_operation_ms=0
+last_block_read_wait_timeout_ms=1000
+last_block_read_first16=00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+block 2048 与 block 0 的失败模式一致，均为 `HAL_SD_ERROR_DATA_CRC_FAIL`。这排除了 block 0 特殊区域作为直接原因，问题更可能位于 SDIO 数据阶段的 CRC、采样、时钟、线序、上拉或总线配置。
+
+### 10. Guard、EXIT与缓存保留结果
+
+guard 状态下文本 DUMP 输出 `DUMP blocked: snapshot software guard active.`；此时 `software_guard_active=1`、`dump_block_required=1`、`dump_block_count=1`。guard 状态下 binary basic 收到 0 B 并超时，测试结果 FAIL，这是软件保护阻止图像发送的预期现象；随后 `binary_block_count` 累计为 1。
+
+`SD TAKEOVER EXIT` 输出：
+
+```text
+SD TAKEOVER EXIT: HAL_SD_DeInit status=0, error=0x00000000.
+SD TAKEOVER EXIT: full SDIO GPIO restored, conflict pins restored to DCMI AF13.
+```
+
+退出状态如下：
+
+```text
+takeover_state_text=EXIT_DEFERRED
+is_initialized=0
+sdio_ready=0
+fatfs_ready=0
+sdio_clock_enabled=0
+sdio_hal_deinit_attempt_count=1
+sdio_hal_deinit_success_count=1
+sdio_hal_deinit_error_count=0
+last_hal_sd_deinit_status=0
+sdio_full_gpio_af12_selected=0
+sdio_af12_selected=0
+conflict_pins_released=0
+sdio_full_gpio_restore_success_count=1
+conflict_pin_restore_success_count=1
+```
+
+即使两次读块均失败，`HAL_SD_DeInit`、关闭 SDIO 时钟、完整 SDIO GPIO 退出 AF12，以及 PC8、PC9、PC11 恢复 DCMI AF13 均正常。
+
+EXIT 后 `SD READINFO` 仍保留 `block_read_attempt_count=2`、`block_read_success_count=0`、`block_read_error_count=2`、`last_block_read_status=1`、`last_block_read_error=2`、`last_block_read_error_is_data_crc_fail=1`、`last_block_read_addr=2048`、`last_block_read_count=1`、`last_block_read_size=0` 和全 00 的前 16 字节。`SD CARDINFO` 同样保留一次成功读取的卡信息以及 61022208 个 512 B 逻辑块。
+
+### 11. RESTORE与图像功能回归
+
+`SNAPSHOT RESTORE` 输出 `SNAPSHOT RESTORE: deferred, camera restore and DCMI restart are not implemented yet.`，状态为 `camera_control_state_text=RESTORE_DEFERRED`、`software_guard_active=0`、`dump_block_required=0`、`dump_block_count=1`、`binary_block_count=1`。
+
+RESTORE 后回归结果：
+
+- basic：响应 38426 B，`frame_id=1`，CRC 一致，PASS。
+- pc_dump：PASS，`frame_id=2`，图像质量无阈值警告；图像为 `captures/017_sd_c5a_readblock_fix_20260805_210047.png`，报告为 `captures/017_sd_c5a_readblock_fix_20260805_210047_report.txt`。
+- repeat：20/20 PASS，成功率 100.00%；平均 3464.62 ms，最短 3423.81 ms，最长 3469.41 ms；frame_id 3～22 连续。
+
+### 12. 最终STATUS关键字段
+
+`RTOS`：
+
+```text
+cli_unknown_count=0
+dump_request_count=24
+dump_success_count=22
+dump_error_count=2
+binary_request_count=22
+binary_request_success_count=21
+binary_request_error_count=0
+binary_request_crc_error_count=0
+binary_request_version_error_count=0
+binary_request_type_error_count=0
+binary_request_length_error_count=0
+binary_request_eof_error_count=0
+binary_request_timeout_count=0
+last_error_code=8
+```
+
+`dump_error_count=2` 对应 guard 状态下文本 DUMP 和 binary 请求各被阻止一次，是预期结果。`binary_request_error_count=0` 表示 binary 请求帧本身正确，只是被 snapshot guard 阻止，不属于协议错误。`last_error_code=8` 对应 snapshot guard active 类错误，也属于预期行为。
+
+`HEALTH`：
+
+```text
+camera_service_stack_min_free_bytes=6352
+monitor_stack_min_free_bytes=1864
+free_heap_bytes=22296
+min_ever_free_heap_bytes=22296
+```
+
+`HOOK`：
+
+```text
+hook_fault_code=0
+hook_fault_count=0
+assert_line=0
+```
+
+`IWDG`：
+
+```text
+iwdg_enabled=1
+iwdg_refresh_count=279
+iwdg_refresh_skip_count=0
+iwdg_last_skip_reason=0
+iwdg_test_mode=0
+```
+
+`UART RX DMA`：
+
+```text
+uart_dma_event_count=62
+uart_dma_rx_bytes=706
+stream_buffer_write_bytes=706
+stream_buffer_overflow_bytes=0
+uart_dma_error_count=0
+uart_dma_recovery_count=0
+stream_buffer_resync_count=0
+```
+
+最终 STATUS 显示 IWDG 未跳过喂狗，Hook 未触发，UART RX DMA 无错误、无溢出、无恢复、无重同步。
+
+### 13. Stage 11C-5A板测结论
+
+Stage 11C-5A 的失败诊断和系统可恢复性验证完成，但只读块功能仍未通过。当前已确认 `HAL_SD_Init` 和 `HAL_SD_GetCardInfo` 均成功，读块前 card state 已处于 `HAL_SD_CARD_TRANSFER`，读缓冲也已改为 4 字节对齐的 `uint32_t[128]`；然而读取 block 0 和 block 2048 均返回 `HAL_SD_ERROR_DATA_CRC_FAIL`。
+
+由此可以排除未初始化、CardInfo 失败、block 0 特殊区域、读缓冲未对齐，以及读前未进入 TRANSFER 状态作为直接原因。当前问题更可能与 SDIO 数据阶段采样、时钟参数、总线配置、上拉或硬件线序有关。尽管读块失败，EXIT/RESTORE 和图像链路恢复均正常，IWDG、Hook、UART RX DMA 也保持正常。
+
+严谨结论：C5A 不能记录为“只读块验证通过”，只能记录为“只读块失败诊断阶段完成，系统可恢复性通过”。
+
+### 14. 后续Stage 11C-5B建议
+
+下一步继续不进入 FATFS、不写卡，并优先进行 SDIO 时钟参数诊断：
+
+- 保持 1-bit 模式，不启用 SDIO DMA 或中断。
+- 支持通过 CLI 查询/设置 SDIO `ClockDiv`，或提供多个只读测试档位。
+- 依次测试更低读时钟，例如 `ClockDiv=118`、178、238、255。
+- 每个档位重新执行 `SD INIT + CardInfo + SD READTEST 0/2048`，记录 DATA CRC 错误是否消失。
+- 如果降低时钟后仍失败，再检查显式 1-bit bus 配置、硬件线序和上拉条件。

@@ -25,6 +25,8 @@
 #define CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED           18U
 #define CAMERA_SD_ERR_SDIO_HAL_DEINIT_FAILED         19U
 #define CAMERA_SD_ERR_CARD_INFO_FAILED                20U
+#define CAMERA_SD_ERR_BLOCK_READ_NOT_READY            21U
+#define CAMERA_SD_ERR_BLOCK_READ_FAILED               22U
 
 /* SDIO 接管状态。Stage 11B-2 只会进入请求延后状态，不会进入 ACTIVE。 */
 #define CAMERA_SD_TAKEOVER_STATE_IDLE             0U
@@ -117,6 +119,34 @@ typedef struct
     uint32_t card_block_size;                       /* 最近一次成功读取的 BlockSize。 */
     uint32_t card_log_block_nbr;                    /* 最近一次成功读取的 LogBlockNbr。 */
     uint32_t card_log_block_size;                   /* 最近一次成功读取的 LogBlockSize。 */
+    uint32_t block_read_test_enabled;                /* 是否允许执行 Stage 11C-5 只读单块验证。 */
+    uint32_t block_read_attempt_count;               /* 实际调用 HAL_SD_ReadBlocks 的次数。 */
+    uint32_t block_read_success_count;               /* 单块读取成功次数。 */
+    uint32_t block_read_error_count;                 /* 单块读取失败次数。 */
+    uint32_t last_block_read_status;                 /* 最近一次 HAL_SD_ReadBlocks 返回值。 */
+    uint32_t last_block_read_error;                  /* 最近一次块读取后的 HAL SD 错误码。 */
+    uint32_t last_block_read_operation_ms;           /* 最近一次块读取调用耗时。 */
+    uint32_t last_block_read_addr;                   /* 最近一次实际读取的逻辑块地址。 */
+    uint32_t last_block_read_count;                  /* 最近一次实际读取的块数，本阶段固定为 1。 */
+    uint32_t last_block_read_size;                   /* 最近一次成功读取的数据字节数。 */
+    uint32_t last_block_read_sum;                    /* 最近一次成功读取数据的逐字节和。 */
+    uint32_t last_block_read_xor;                    /* 最近一次成功读取数据的逐字节异或。 */
+    uint32_t last_block_read_nonzero_count;          /* 最近一次成功读取数据的非零字节数。 */
+    uint8_t last_block_read_first16[16];             /* 最近一次成功读取数据的前 16 字节。 */
+    uint32_t block_read_wait_transfer_attempt_count; /* 读块前等待 TRANSFER 状态的次数。 */
+    uint32_t block_read_wait_transfer_success_count; /* 等待 TRANSFER 状态成功次数。 */
+    uint32_t block_read_wait_transfer_error_count;   /* 等待 TRANSFER 状态超时次数。 */
+    uint32_t last_block_read_pre_card_state;         /* 最近一次读块调用前的 card state。 */
+    uint32_t last_block_read_post_card_state;        /* 最近一次读块调用后的 card state。 */
+    uint32_t last_block_read_wait_card_state;        /* 最近一次等待结束时的 card state。 */
+    uint32_t last_block_read_wait_operation_ms;      /* 最近一次等待 TRANSFER 的耗时。 */
+    uint32_t last_block_read_wait_timeout_ms;        /* 最近一次等待使用的超时时间。 */
+    uint32_t last_block_read_error_is_data_crc_fail; /* 最近读错误是否含 DATA_CRC_FAIL。 */
+    uint32_t last_block_read_error_is_cmd_crc_fail;  /* 最近读错误是否含 CMD_CRC_FAIL。 */
+    uint32_t last_block_read_error_is_cmd_rsp_timeout; /* 最近读错误是否含 CMD_RSP_TIMEOUT。 */
+    uint32_t last_block_read_error_is_data_timeout;  /* 最近读错误是否含 DATA_TIMEOUT。 */
+    uint32_t last_block_read_error_is_rx_overrun;    /* 最近读错误是否含 RX_OVERRUN。 */
+    uint32_t last_block_read_error_is_tx_underrun;   /* 最近读错误是否含 TX_UNDERRUN。 */
 } CameraSdStorageStatus_t;
 
 /* 初始化纯软件状态，不访问 SDIO、GPIO 或文件系统。 */
@@ -127,6 +157,9 @@ void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status);
 
 /* 完整 SDIO GPIO 已接管时执行最小 HAL_SD_Init，否则返回 NEED_TAKEOVER。 */
 uint32_t Camera_SDStorage_RequestInit(void);
+
+/* 只读方式读取一个 512 字节逻辑块；CLI 默认请求块 0，也可指定地址。 */
+uint32_t Camera_SDStorage_RequestBlockReadTest(uint32_t block_addr);
 
 /* 前置检查通过后释放冲突引脚，并将完整 SDIO GPIO 切换到 AF12。 */
 uint32_t Camera_SDStorage_RequestTakeoverEnter(void);
