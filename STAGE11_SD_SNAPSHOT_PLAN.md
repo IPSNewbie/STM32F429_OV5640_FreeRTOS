@@ -6674,3 +6674,91 @@ C5C 动态 ClockDiv 方案未推进只读块问题，并使初始化路径出现
 4. 对照正点原子 `sd_init` 的初始化顺序、低速初始化阶段和初始化完成后的总线配置流程。
 
 在新的只读诊断方案验证前，继续保持不写卡、不接 FATFS。
+
+## Stage 11C-5D 显式 1-bit / 4-bit bus 配置诊断
+
+### 1. 基线与阶段判断
+
+C5R 慢速自动测试已经确认固定 `ClockDiv=118U` 的初始化基线恢复：
+
+- `HAL_SD_Init` 成功，`HAL_SD_GetCardInfo` 成功，逻辑块大小为 512 B。
+- `SD READTEST 0` 与 `SD READTEST 2048` 均为 `DATA_CRC_FAIL`，错误码为 2。
+- DUMP guard、TAKEOVER EXIT、SNAPSHOT RESTORE 和 basic 图像恢复均 PASS。
+- IWDG 未跳过喂狗，HOOK 未触发，UART RX DMA 无错误或 StreamBuffer 溢出。
+
+C5C 动态 ClockDiv 诊断不作为有效代码保留，本阶段继续固定使用 `ClockDiv=118U`。当前问题集中在 `HAL_SD_ReadBlocks` 数据阶段，因此转向显式 bus width 配置对照。
+
+### 2. 本轮目的
+
+- 新增 `SD BUSWIDTH` 状态查询以及 `SD BUSWIDTH 1B`、`SD BUSWIDTH 4B` 命令。
+- 在 `HAL_SD_Init` 成功并等待卡进入 `HAL_SD_CARD_TRANSFER` 后，受控调用 `HAL_SD_ConfigWideBusOperation`。
+- 分别在显式 1-bit 和 4-bit 配置下执行 block 0、block 2048 单块只读测试，判断 `DATA_CRC_FAIL` 是否与总线宽度配置有关。
+- 记录请求宽度、生效宽度、HAL 状态/错误、配置前后 card state、等待状态与耗时。
+
+### 3. 本轮约束
+
+- 不写卡，不调用 `HAL_SD_WriteBlocks`，不接入或挂载 FATFS。
+- 不启用 SDIO DMA，不配置或启用 SDIO 中断。
+- 不修改图像链路、UART 协议或 OV56RGB5 图像帧格式。
+- 不恢复动态 ClockDiv、IRQOFF 或读后 `WaitCardTransfer`。
+- 保留 C5A/C5R 的 4 字节对齐 `uint32_t[128]` 缓冲、读前 `WaitCardTransfer`、错误 bit 诊断和每次只读 1 个 block。
+- 本轮唯一新增的 SD HAL API 为 `HAL_SD_ConfigWideBusOperation`，且只允许在 `camera_sd_storage.c` 的 `SD BUSWIDTH` 路径调用。
+
+### 4. 手动板测计划
+
+1. 执行 `SD INIT`，确认未接管时返回 `NEED_TAKEOVER`。
+2. 执行 `SNAPSHOT PREPARE`、`SD TAKEOVER ENTER`、`SD INIT` 和 `SD CARDINFO`。
+3. 执行 `SD BUSWIDTH`，确认初始化后的 active width 为 1。
+4. 执行 `SD BUSWIDTH 1B`。
+5. 依次执行 `SD READTEST 0`、`SD READINFO`、`SD READTEST 2048`、`SD READINFO`。
+6. 执行 `SD BUSWIDTH 4B`。
+7. 再次执行 `SD READTEST 0`、`SD READINFO`、`SD READTEST 2048`、`SD READINFO`。
+8. 执行文本 `DUMP`，确认 guard 阻止图像导出。
+9. 执行 `SD TAKEOVER EXIT`、`SNAPSHOT RESTORE`、`STATUS` 和 basic 图像恢复测试。
+
+本轮 Codex 不执行硬件测试。后续自动测试计划使用 `tools/uart_sd_buswidth_auto_test.py`，由脚本执行 bus width 对照、readtest、guard、exit、restore 以及 basic/repeat 回归；本轮不新增或修改该 Python 工具。
+
+### 5. 结果判断
+
+- 1B、4B 均为 `DATA_CRC_FAIL`：bus width 配置不是主要原因，下一步检查 SDIO 数据线、上拉和初始化顺序。
+- 1B 失败、4B 成功：后续固定使用 4-bit，并先完成进入 FATFS 前的只读稳定性验证。
+- 1B 成功、4B 失败：保留 1-bit，后续不启用 4-bit。
+- `HAL_SD_ConfigWideBusOperation` 本身失败：记录 HAL status、HAL error 和 card state，不继续该宽度下的 readtest。
+- bus width 配置导致卡状态异常，但 EXIT、RESTORE 和 basic 正常：说明安全退出与摄像头恢复机制仍有效。
+
+## Stage 11C-5D-2 最小侵入版 bus width 诊断
+
+### 1. C5D 初版回退原因
+
+C5D 初版在 SD 状态结构、INIT 成功/失败路径以及 EXIT 路径中加入 BUSWIDTH 状态后，尚未真正执行显式 1B/4B 配置，`HAL_SD_Init` 已从 C5R 的稳定成功基线退化为失败。因此初版未获得有效的 1B/4B 对照结果，相关代码已回退，不作为后续基线。
+
+### 2. C5D-2 最小侵入原则
+
+- 不修改 `CameraSdStorageStatus_t`，不扩展 `SD STATUS` 或 `SD TAKEOVER STATUS` 输出。
+- 不修改 SD INIT、TAKEOVER ENTER、TAKEOVER EXIT、HAL_SD_DeInit、READTEST 或 READINFO 路径。
+- `hsd_snapshot.Init.ClockDiv` 继续固定为 118U，`hsd_snapshot.Init.BusWide` 继续固定为 `SDIO_BUS_WIDE_1B`。
+- 不在初始化成功后自动配置 bus width。
+- 仅在 `camera_sd_storage.c` 内增加独立静态 debug 状态，并由 `SD BUSWIDTH` 命令单独查询。
+- 只有用户在 SD INIT 成功后执行 `SD BUSWIDTH 1B` 或 `SD BUSWIDTH 4B`，才调用一次 `HAL_SD_ConfigWideBusOperation`。
+- 继续保持只读：不写卡、不接 FATFS、不使用 SDIO DMA/IRQ，不恢复 CLOCKDIV、IRQOFF 或读后等待。
+
+### 3. 测试流程
+
+1. 执行 `SD INIT`，确认未接管时仍返回 `NEED_TAKEOVER`。
+2. 执行 `SNAPSHOT PREPARE`、`SD TAKEOVER ENTER`、`SD INIT`、`SD CARDINFO`。
+3. 执行 `SD BUSWIDTH`，保存独立 debug 初始状态。
+4. 执行 `SD BUSWIDTH 1B`。
+5. 执行 `SD READTEST 0`、`SD READINFO`、`SD READTEST 2048`、`SD READINFO`。
+6. 执行 `SD BUSWIDTH 4B`。
+7. 再次执行 `SD READTEST 0`、`SD READINFO`、`SD READTEST 2048`、`SD READINFO`。
+8. 执行文本 `DUMP`，确认 snapshot guard 生效。
+9. 执行 `SD TAKEOVER EXIT`、`SNAPSHOT RESTORE` 和 `STATUS`。
+10. 补充 basic 图像恢复验证；无论 bus width 诊断结果如何，EXIT、RESTORE、basic 都必须 PASS。
+
+### 4. 结果判断
+
+- SD INIT 仍 PASS：说明独立静态 debug 状态和 CLI 没有破坏 C5R 初始化主流程。
+- 1B、4B 均为 `DATA_CRC_FAIL`：bus width 不是主要原因，后续转向 SDIO 数据线、上拉和初始化顺序检查。
+- 1B 失败而 4B 成功：后续可转向 4-bit，并先完成进入 FATFS 前的只读稳定性验证。
+- `HAL_SD_ConfigWideBusOperation` 本身失败：记录 debug 状态中的 HAL status、HAL error、配置前后 card state 和等待状态，不把它误判为 READTEST 结果。
+- 任一诊断异常后 EXIT、RESTORE 或 basic 失败：必须先恢复 C5R 安全退出和图像恢复基线，不继续扩展 SD 功能。

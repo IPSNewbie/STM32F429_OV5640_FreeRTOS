@@ -1,5 +1,6 @@
 #include "camera_sd_storage.h"
 
+#include "bsp_log.h"
 #include "camera_snapshot_control.h"
 #include "stm32f4xx_hal.h"
 
@@ -17,6 +18,28 @@ static CameraSdStorageStatus_t s_camera_sd_status;
 static SD_HandleTypeDef hsd_snapshot;
 /* 使用 uint32_t 数组保证 4 字节对齐，仅用于 HAL SD polling 只读块验证，不写卡。 */
 static uint32_t s_sd_read_test_words[128];
+
+/* C5D-2 独立调试状态：不进入 CameraSdStorageStatus_t，也不参与 INIT/EXIT。 */
+typedef struct
+{
+    uint32_t supported;
+    uint32_t requested_width;
+    uint32_t active_width;
+    uint32_t attempt_count;
+    uint32_t success_count;
+    uint32_t error_count;
+    uint32_t last_result;
+    uint32_t last_hal_status;
+    uint32_t last_hal_error;
+    uint32_t last_pre_card_state;
+    uint32_t last_post_card_state;
+    uint32_t last_wait_card_state;
+    uint32_t last_operation_ms;
+    uint32_t last_wait_operation_ms;
+    uint32_t last_wait_timeout_ms;
+} Camera_SDBusWidthDebug_t;
+
+static Camera_SDBusWidthDebug_t s_bus_width_debug = {1U};
 
 #define CAMERA_SD_CONFLICT_PIN_MASK \
     (GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_11)
@@ -177,6 +200,39 @@ static uint32_t Camera_SDStorage_WaitCardTransfer(uint32_t timeout_ms)
         }
 
         HAL_Delay(1U);
+    }
+}
+
+/* 与 C5R 读前等待使用相同的 polling 方式，但只更新独立调试状态。 */
+static uint32_t Camera_SDStorage_DebugWaitCardTransfer(uint32_t timeout_ms)
+{
+    uint32_t start_ms = HAL_GetTick();
+    uint32_t elapsed_ms;
+    HAL_SD_CardStateTypeDef card_state = HAL_SD_GetCardState(&hsd_snapshot);
+
+    s_bus_width_debug.last_wait_timeout_ms = timeout_ms;
+    s_bus_width_debug.last_wait_operation_ms = 0U;
+    s_bus_width_debug.last_pre_card_state = (uint32_t)card_state;
+
+    for (;;)
+    {
+        s_bus_width_debug.last_wait_card_state = (uint32_t)card_state;
+        elapsed_ms = HAL_GetTick() - start_ms;
+
+        if (card_state == HAL_SD_CARD_TRANSFER)
+        {
+            s_bus_width_debug.last_wait_operation_ms = elapsed_ms;
+            return CAMERA_SD_OK;
+        }
+
+        if (elapsed_ms >= timeout_ms)
+        {
+            s_bus_width_debug.last_wait_operation_ms = elapsed_ms;
+            return CAMERA_SD_ERR_BUS_WIDTH_WAIT_TRANSFER_FAILED;
+        }
+
+        HAL_Delay(1U);
+        card_state = HAL_SD_GetCardState(&hsd_snapshot);
     }
 }
 
@@ -678,6 +734,89 @@ void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status)
     *status = s_camera_sd_status;
 }
 
+uint32_t Camera_SDStorage_DebugSetBusWidth(uint32_t bus_width)
+{
+    uint32_t wait_result;
+    uint32_t hal_bus_width;
+    uint32_t start_ms;
+    HAL_StatusTypeDef hal_status;
+
+    if ((bus_width != 1U) && (bus_width != 4U))
+    {
+        ++s_bus_width_debug.error_count;
+        s_bus_width_debug.last_result = CAMERA_SD_ERR_BUS_WIDTH_INVALID;
+        return CAMERA_SD_ERR_BUS_WIDTH_INVALID;
+    }
+
+    if ((s_camera_sd_status.is_initialized != 1U) ||
+        (s_camera_sd_status.sdio_ready != 1U))
+    {
+        ++s_bus_width_debug.error_count;
+        s_bus_width_debug.last_result = CAMERA_SD_ERR_BUS_WIDTH_NOT_READY;
+        return CAMERA_SD_ERR_BUS_WIDTH_NOT_READY;
+    }
+
+    s_bus_width_debug.requested_width = bus_width;
+    ++s_bus_width_debug.attempt_count;
+
+    wait_result = Camera_SDStorage_DebugWaitCardTransfer(1000U);
+    if (wait_result != CAMERA_SD_OK)
+    {
+        ++s_bus_width_debug.error_count;
+        s_bus_width_debug.last_result =
+            CAMERA_SD_ERR_BUS_WIDTH_WAIT_TRANSFER_FAILED;
+        return CAMERA_SD_ERR_BUS_WIDTH_WAIT_TRANSFER_FAILED;
+    }
+
+    s_bus_width_debug.last_pre_card_state =
+        (uint32_t)HAL_SD_GetCardState(&hsd_snapshot);
+    hal_bus_width = (bus_width == 1U)
+        ? SDIO_BUS_WIDE_1B
+        : SDIO_BUS_WIDE_4B;
+    start_ms = HAL_GetTick();
+    hal_status = HAL_SD_ConfigWideBusOperation(
+        &hsd_snapshot,
+        hal_bus_width);
+    s_bus_width_debug.last_operation_ms = HAL_GetTick() - start_ms;
+    s_bus_width_debug.last_hal_status = (uint32_t)hal_status;
+    s_bus_width_debug.last_hal_error = HAL_SD_GetError(&hsd_snapshot);
+    s_bus_width_debug.last_post_card_state =
+        (uint32_t)HAL_SD_GetCardState(&hsd_snapshot);
+
+    if (hal_status == HAL_OK)
+    {
+        s_bus_width_debug.active_width = bus_width;
+        ++s_bus_width_debug.success_count;
+        s_bus_width_debug.last_result = CAMERA_SD_OK;
+        return CAMERA_SD_OK;
+    }
+
+    ++s_bus_width_debug.error_count;
+    s_bus_width_debug.last_result = CAMERA_SD_ERR_BUS_WIDTH_CONFIG_FAILED;
+    return CAMERA_SD_ERR_BUS_WIDTH_CONFIG_FAILED;
+}
+
+void Camera_SDStorage_DebugPrintBusWidthStatus(void)
+{
+    /* LOG_RAW 使用项目现有 printf 风格串口输出，不依赖 CLI 私有函数。 */
+    LOG_RAW("SD BUSWIDTH:\r\n");
+    LOG_RAW("  supported=%lu\r\n", (unsigned long)s_bus_width_debug.supported);
+    LOG_RAW("  requested_width=%lu\r\n", (unsigned long)s_bus_width_debug.requested_width);
+    LOG_RAW("  active_width=%lu\r\n", (unsigned long)s_bus_width_debug.active_width);
+    LOG_RAW("  attempt_count=%lu\r\n", (unsigned long)s_bus_width_debug.attempt_count);
+    LOG_RAW("  success_count=%lu\r\n", (unsigned long)s_bus_width_debug.success_count);
+    LOG_RAW("  error_count=%lu\r\n", (unsigned long)s_bus_width_debug.error_count);
+    LOG_RAW("  last_result=%lu\r\n", (unsigned long)s_bus_width_debug.last_result);
+    LOG_RAW("  last_hal_status=%lu\r\n", (unsigned long)s_bus_width_debug.last_hal_status);
+    LOG_RAW("  last_hal_error=0x%08lX\r\n", (unsigned long)s_bus_width_debug.last_hal_error);
+    LOG_RAW("  last_pre_card_state=%lu\r\n", (unsigned long)s_bus_width_debug.last_pre_card_state);
+    LOG_RAW("  last_post_card_state=%lu\r\n", (unsigned long)s_bus_width_debug.last_post_card_state);
+    LOG_RAW("  last_wait_card_state=%lu\r\n", (unsigned long)s_bus_width_debug.last_wait_card_state);
+    LOG_RAW("  last_operation_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_operation_ms);
+    LOG_RAW("  last_wait_operation_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_wait_operation_ms);
+    LOG_RAW("  last_wait_timeout_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_wait_timeout_ms);
+}
+
 uint32_t Camera_SDStorage_RequestBlockReadTest(uint32_t block_addr)
 {
     return Camera_SDStorage_ReadBlockTest(block_addr);
@@ -1020,6 +1159,18 @@ const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
 
         case CAMERA_SD_ERR_BLOCK_READ_FAILED:
             return "BLOCK_READ_FAILED";
+
+        case CAMERA_SD_ERR_BUS_WIDTH_NOT_READY:
+            return "BUS_WIDTH_NOT_READY";
+
+        case CAMERA_SD_ERR_BUS_WIDTH_INVALID:
+            return "BUS_WIDTH_INVALID";
+
+        case CAMERA_SD_ERR_BUS_WIDTH_WAIT_TRANSFER_FAILED:
+            return "BUS_WIDTH_WAIT_TRANSFER_FAILED";
+
+        case CAMERA_SD_ERR_BUS_WIDTH_CONFIG_FAILED:
+            return "BUS_WIDTH_CONFIG_FAILED";
 
         default:
             return "UNKNOWN_ERROR";

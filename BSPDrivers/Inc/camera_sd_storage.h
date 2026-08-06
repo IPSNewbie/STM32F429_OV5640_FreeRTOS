@@ -27,6 +27,10 @@
 #define CAMERA_SD_ERR_CARD_INFO_FAILED                20U
 #define CAMERA_SD_ERR_BLOCK_READ_NOT_READY            21U
 #define CAMERA_SD_ERR_BLOCK_READ_FAILED               22U
+#define CAMERA_SD_ERR_BUS_WIDTH_NOT_READY              23U
+#define CAMERA_SD_ERR_BUS_WIDTH_INVALID                24U
+#define CAMERA_SD_ERR_BUS_WIDTH_WAIT_TRANSFER_FAILED   25U
+#define CAMERA_SD_ERR_BUS_WIDTH_CONFIG_FAILED          26U
 
 /* SDIO 接管状态。Stage 11B-2 只会进入请求延后状态，不会进入 ACTIVE。 */
 #define CAMERA_SD_TAKEOVER_STATE_IDLE             0U
@@ -154,6 +158,12 @@ void Camera_SDStorage_InitState(void);
 
 /* 将当前软件状态复制到调用者提供的结构体。 */
 void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status);
+
+/* 独立调试接口：仅在 SD INIT 成功后显式配置 1-bit 或 4-bit。 */
+uint32_t Camera_SDStorage_DebugSetBusWidth(uint32_t bus_width);
+
+/* 通过日志串口输出独立 bus width 调试状态。 */
+void Camera_SDStorage_DebugPrintBusWidthStatus(void);
 
 /* 完整 SDIO GPIO 已接管时执行最小 HAL_SD_Init，否则返回 NEED_TAKEOVER。 */
 uint32_t Camera_SDStorage_RequestInit(void);
