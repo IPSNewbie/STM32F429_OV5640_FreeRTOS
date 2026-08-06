@@ -333,8 +333,8 @@ static void Camera_SDStorage_PrepareSdHandle(void)
     hsd_snapshot.Init.BusWide = SDIO_BUS_WIDE_1B;
     hsd_snapshot.Init.HardwareFlowControl =
         SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
-    /* ClockDiv=118U 用于保守的 SDIO 初始化低速阶段。 */
-    hsd_snapshot.Init.ClockDiv = 118U;
+    /* 编译期固定分频用于 C5J 单固件、单参数的 SDIO 采样稳定性对照。 */
+    hsd_snapshot.Init.ClockDiv = CAMERA_SD_INIT_CLOCK_DIV;
     /* Stage 11C-4 读取 HAL 层卡信息，不接 FATFS，不执行块读写。 */
 }
 

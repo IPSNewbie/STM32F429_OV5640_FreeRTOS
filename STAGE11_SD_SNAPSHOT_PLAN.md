@@ -6976,3 +6976,116 @@ python tools/uart_sd_line_after_init_auto_test.py --port COM4 --baud 115200 --re
 2. 查看 `SD READINFO` 中新增的 buffer inspected、长度、预填模式、各类计数、变化范围和 first16/first32/tail16 字段。
 3. 完成 TAKEOVER EXIT、SNAPSHOT RESTORE 和 basic 图像恢复验证。
 4. 再执行 repeat 20，验证恢复链路稳定性。
+
+## Stage 11C-5J SDIO 数据采样稳定性验证
+
+### 1. 当前现象
+
+- `SD INIT` 与 CardInfo 均可成功。
+- `SD READTEST 0` 和 `SD READTEST 2048` 多数返回 `HAL_SD_ERROR_DATA_CRC_FAIL`，但 block 2048 偶尔出现读取 PASS。
+- C5H 已证明：返回 `DATA_CRC_FAIL` 时，512 字节 read buffer 仍被完整改写，`changed_count512=512`、first changed index=0、last changed index=511。
+- C5I 对同一 block 重复读取发现，多次失败得到的 buffer 指纹并不稳定；block 0 与 block 2048 的 sum512 和 first32 均出现 5 个不同结果，且 block 2048 曾出现一次 PASS。
+- 当前现象不是完全未收到数据，也不是固定内容读错，更倾向于 SDIO 数据采样、总线时序或信号质量不稳定。
+
+### 2. 本轮目的
+
+- 不恢复运行时动态 ClockDiv 查询或设置。
+- 使用编译期宏 `CAMERA_SD_INIT_CLOCK_DIV` 作为 `hsd_snapshot.Init.ClockDiv` 的唯一配置来源，默认仍为 `118U`。
+- 分别将宏固定为 `118U`、`178U`、`238U`、`255U`，每个值单独编译、烧录并断电重上电测试。
+- 比较各分频下 SD INIT、CardInfo、block 0/2048 的 READTEST PASS 率、失败 buffer 指纹稳定性以及图像恢复链路。
+- `SD STATUS` 与 `SD READINFO` 均输出 `sd_init_clock_div_configured`，用于确认当前烧录固件的编译期配置。
+
+### 3. 本轮保持不变
+
+- SD INIT 仅将 ClockDiv 的来源由硬编码 `118U` 改为编译期宏；ClockEdge、ClockBypass、ClockPowerSave、`SDIO_BUS_WIDE_1B` 和 HardwareFlowControl 均保持不变。
+- 不修改 SD READTEST 流程，继续保持读前 `WaitCardTransfer`、单次 1 block polling 读取、`0xA5` 预填、C5G 寄存器快照和 C5H success/fail buffer 统计。
+- 不改变 BusWidth，不新增 `HAL_SD_ConfigWideBusOperation` 调用。
+- 不恢复 IRQOFF 或读后 `WaitCardTransfer`。
+- 不写卡、不接 FATFS、不使用 SDIO DMA 或 SDIO IRQ。
+- 不触碰摄像头 PWDN、CAMOFF、CAMON、takeover 或 restore 流程。
+- 不通过 CMake 传宏，不新增 CLI、运行时变量或持久化配置。
+
+### 4. 测试矩阵
+
+| CAMERA_SD_INIT_CLOCK_DIV | SD_INIT | CardInfo | BLOCK_0 PASS/Total | BLOCK_2048 PASS/Total | BLOCK_0 指纹稳定性 | BLOCK_2048 指纹稳定性 | BASIC/Repeat | 结论 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 118U | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 178U | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 238U | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 255U | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+
+每个档位必须使用单独编译的固件，烧录后断电重上电，并使用相同测试脚本、SD 卡、接线和测试顺序；不得通过运行时命令切换分频。
+
+### 5. 结果判断
+
+- ClockDiv 增大后 READTEST PASS 率提高、同一 block 指纹更稳定：根因倾向 SDIO 采样时序或信号质量。
+- ClockDiv 增大后 SD INIT 失败：该分频与当前 SD 卡或初始化流程不兼容，不能进入 READTEST 结果比较。
+- ClockDiv 增大后仍随机出现 `DATA_CRC_FAIL` 且 buffer 指纹不稳定：继续检查 SDIO 数据线、外部上拉、电源完整性或 HAL polling 读取路径。
+- 无论分频结果如何，TAKEOVER EXIT、SNAPSHOT RESTORE、BASIC_IMAGE 和 repeat 都必须继续验证；任一恢复路径失败时，应先恢复图像链路稳定基线。
+
+## Stage 11C-5K 正点原子 SDIO 官方例程对照
+
+### 1. 结论修正
+
+正点原子官方 SDIO 例程已经在同一块阿波罗 F429 开发板验证正常，因此当前不能判断为板载 SDIO 硬件不可用。当前问题应收敛为本项目集成环境与官方 SDIO 例程之间的驱动流程差异、初始化差异、DMA/IRQ 差异、等待逻辑差异或 DCMI/SDIO 复用恢复差异。
+
+本轮用户提供的官方例程路径 `D:\MCU+FreeRTOS\STM32_HAL\ATK_SDIO_EXAMPLE` 实际不存在；在其下一级 `ISP_Project` 目录中找到并扫描了官方例程：`D:\MCU+FreeRTOS\STM32_HAL\ISP_Project\ATK_SDIO_EXAMPLE`。以下结论均来自该实际目录。
+
+### 2. 官方例程关键信息表
+
+| 项目 | 正点原子官方例程 | 当前工程 | 差异判断 |
+| --- | --- | --- | --- |
+| SDIO GPIO | PC8/PC9/PC10/PC11/PC12/PD2，推挽复用 AF12 | PC8/PC9/PC10/PC11/PC12/PD2 切 AF12 | 引脚、模式和复用号一致；当前工程在 takeover 中配置，官方在 `HAL_SD_MspInit` 中配置 |
+| SDIO GPIO speed | `GPIO_SPEED_FREQ_HIGH` | `GPIO_SPEED_FREQ_VERY_HIGH` | 存在速度等级差异，应优先按官方 HIGH 做单变量对照 |
+| SDIO GPIO pull | `GPIO_PULLUP` | `PULLUP` | 一致 |
+| SDIO ClockDiv | `SDIO_TRANSF_CLK_DIV=1`，注释给出的传输时钟为 16 MHz | `CAMERA_SD_INIT_CLOCK_DIV` 默认 `118U` | 重大差异；官方 HAL 初始化后使用快速传输时钟，当前主路径保持低速分频 |
+| BusWidth | 句柄先以 1-bit 初始化，随后切换为 4-bit | 当前诊断主路径固定 1-bit | 重大差异；官方稳定路径最终为 4-bit |
+| WideBus 配置 | `HAL_SD_ConfigWideBusOperation(..., SDIO_BUS_WIDE_4B)`，失败即返回错误 2 | 当前 BUSWIDTH 1B/4B 诊断失败 | 官方把 4-bit 配置作为初始化必经步骤；当前尚未复现该成功路径 |
+| DMA | SDIO 应用路径未配置 DMA，也未调用 Read/Write DMA API | 当前未使用 SDIO DMA | 一致；HAL 驱动虽提供 DMA API，但官方例程没有实际使用 |
+| SDIO IRQ | 未配置或启用 `SDIO_IRQn` | 当前未启用 SDIO IRQ | 一致；官方 SDIO 路径为 polling |
+| ReadBlocks 调用方式 | `HAL_SD_ReadBlocks` polling，一次可读 `cnt` 个 sector | `HAL_SD_ReadBlocks` polling，每次 1 block | API 模式一致；官方 wrapper 支持多块，当前诊断固定单块 |
+| Read 后等待 | 关闭全局中断后调用 ReadBlocks，并循环 `HAL_SD_GetCardState` 等待 `HAL_SD_CARD_TRANSFER`，带 `SD_TIMEOUT` 计数 | 当前主路径未启用读后 WaitCardTransfer | 重大流程差异；官方将读后 CardState 等待纳入完整读事务 |
+| FATFS diskio | 本例程未包含 `diskio.c`、`ff.c`、`ffconf.h`、`disk_read` 或 `disk_write`；仅提供标注供 fatfs/usb 调用的 `sd_read_disk`/`sd_write_disk` | 当前未接入 FATFS | 当前均未接入 FATFS；不能从本例程判断官方 diskio 对 DMA/IRQ 的额外依赖 |
+| 初始化顺序 | 配置 1-bit 句柄 -> `HAL_SD_Init`（内部调用 `HAL_SD_MspInit`）-> `HAL_SD_GetCardInfo` -> `HAL_SD_ConfigWideBusOperation(4B)` | SNAPSHOT PREPARE -> SD TAKEOVER ENTER -> SD INIT | 当前为解决 DCMI/SDIO 复用而增加 takeover；进入 HAL 后尚未完整对齐官方初始化后半段 |
+| 读写保护 | 同时提供读、写 wrapper；polling 读写前关闭全局中断，完成 CardState 等待后恢复中断 | 当前只读，不写卡 | 当前只读边界更严格；但缺少官方 wrapper 的完整临界区和读后等待 |
+
+官方例程的 `HAL_SD_MspInit` 只完成 SDIO 外设时钟、GPIO 端口时钟和六根 AF12/PULLUP/HIGH 引脚配置，没有 SDIO DMA、DMA2 stream、SDIO NVIC 或 `SDIO_IRQn` 配置。官方工程中的 DMA2 关键词来自 LCD DMA2D 等无关路径，不能据此判断 SDIO 使用 DMA。
+
+官方 `sd_read_disk` 和 `sd_write_disk` 的关键事务边界相同：`sys_intx_disable()` -> polling ReadBlocks/WriteBlocks -> 循环等待 CardState 为 TRANSFER -> `sys_intx_enable()`。当前工程只在读前等待 TRANSFER，ReadBlocks 返回后没有同等的 CardState 等待。官方与当前工程使用的 `stm32f4xx_hal_sd.c` 也并非逐字节相同，后续移植诊断分支时需要把 HAL 驱动版本差异作为受控变量记录，不能只复制上层 wrapper。
+
+### 3. 当前工程已知现象
+
+1. SD INIT 能成功。
+2. CardInfo 能成功。
+3. `HAL_SD_ReadBlocks` 多数返回 `DATA_CRC_FAIL`。
+4. C5H 证明 `DATA_CRC_FAIL` 后 512B buffer 已被完整改写。
+5. C5I 证明同一 block 多次读出的 buffer 指纹不一致。
+6. C5J 证明 `ClockDiv=178U` 有局部改善但不根治，`238U/255U` 初始化失败。
+7. 图像链路在 TAKEOVER_EXIT / SNAPSHOT_RESTORE 后可恢复，repeat 20/20 正常。
+8. 因此下一阶段不能继续盲调 ClockDiv / PWDN / IRQOFF，而应对照官方例程移植。
+
+### 4. 下一步优先级
+
+第一优先级：
+
+对齐官方 `HAL_SD_MspInit`，包括 GPIO、时钟、DMA、NVIC 配置。当前扫描到的官方实现没有 SDIO DMA/NVIC 配置，因此“对齐”首先意味着集中复现官方 GPIO/时钟路径，并明确保持 SDIO DMA/NVIC 未配置，而不是先行新增 DMA 或 IRQ。
+
+第二优先级：
+
+对齐官方 SD 初始化流程，包括 `HAL_SD_Init`、`HAL_SD_GetCardInfo`、`HAL_SD_ConfigWideBusOperation`、卡状态等待。
+
+第三优先级：
+
+对齐官方 ReadBlocks / WriteBlocks 的等待逻辑、超时逻辑、错误恢复逻辑。
+
+第四优先级：
+
+在当前工程中新增“ATK official SDIO path”诊断分支，先只做初始化、CardInfo、单块读测试，不直接接 FATFS 写文件。
+
+第五优先级：
+
+确认官方例程 diskio 层是否依赖 DMA/IRQ/读后等待，再决定是否接入 FATFS。当前扫描的官方例程不含 diskio/FATFS 源文件，需先取得同版本、同板卡的官方 FATFS 例程，不能从 HAL 驱动声明或 `sd_read_disk` 注释推断依赖。
+
+### 5. 禁止继续盲调
+
+下一阶段不再盲目修改 ClockDiv、PWDN、BusWidth、IRQOFF。所有修改必须来自官方例程差异对照。

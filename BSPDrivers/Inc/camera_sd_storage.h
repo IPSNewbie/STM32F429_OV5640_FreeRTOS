@@ -3,6 +3,11 @@
 
 #include <stdint.h>
 
+/* Stage 11C-5J 编译期 SDIO 初始化分频；手动改值后必须重新编译、烧录。 */
+#ifndef CAMERA_SD_INIT_CLOCK_DIV
+#define CAMERA_SD_INIT_CLOCK_DIV (118U)
+#endif
+
 /* SD 卡模块返回码。Stage 11C-4 允许受控初始化并读取 HAL 层卡信息。 */
 #define CAMERA_SD_OK                         0U
 #define CAMERA_SD_ERR_NOT_IMPLEMENTED        1U

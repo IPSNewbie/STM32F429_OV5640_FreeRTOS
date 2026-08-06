@@ -1081,6 +1081,10 @@ static void Camera_CLI_PrintSdStatus(UART_HandleTypeDef *huart)
     Camera_CLI_WriteStatLine(huart, "takeover_required", status.takeover_required);
     Camera_CLI_WriteStatLine(huart, "sdio_ready", status.sdio_ready);
     Camera_CLI_WriteStatLine(huart, "fatfs_ready", status.fatfs_ready);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sd_init_clock_div_configured",
+        CAMERA_SD_INIT_CLOCK_DIV);
     Camera_CLI_WriteStatLine(huart, "init_attempt_count", status.init_attempt_count);
     Camera_CLI_WriteStatLine(huart, "init_success_count", status.init_success_count);
     Camera_CLI_WriteStatLine(huart, "init_error_count", status.init_error_count);
@@ -1118,6 +1122,10 @@ static void Camera_CLI_PrintSdReadInfo(UART_HandleTypeDef *huart)
 
     Camera_SDStorage_GetStatus(&status);
     Camera_CLI_WriteLine(huart, "SD READINFO:");
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sd_init_clock_div_configured",
+        CAMERA_SD_INIT_CLOCK_DIV);
     Camera_CLI_PrintSdBlockReadFields(huart, &status);
     Camera_SDStorage_DebugPrintReadRegDiag();
 }
