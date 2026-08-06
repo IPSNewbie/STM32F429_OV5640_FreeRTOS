@@ -302,6 +302,7 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart) // 输出当前 CLI 
     Camera_CLI_WriteLine(huart, "SD READTEST [block] - read one block in polling mode, default 0"); // 可选十进制逻辑块地址
     Camera_CLI_WriteLine(huart, "SD READINFO - show cached read block test result"); // 只输出最近一次块读取缓存
     Camera_CLI_WriteLine(huart, "SD BUSWIDTH [1B|4B] - show or explicitly configure SDIO bus width"); // 独立调试命令，不扩展 SD STATUS
+    Camera_CLI_WriteLine(huart, "SD LINESTATE - show read-only SDIO GPIO register and pin state"); // 只读输出 SDIO 六根信号线状态
     Camera_CLI_WriteLine(huart, "SD INIT - request SD card init, currently deferred until SDIO takeover"); // 请求初始化，本阶段延后到 SDIO 接管完成后
     Camera_CLI_WriteLine(huart, "SD TAKEOVER STATUS - show SDIO takeover status"); // 查询 SDIO 接管软件状态
     Camera_CLI_WriteLine(huart, "SD TAKEOVER ENTER - request SDIO takeover, currently deferred"); // 请求进入接管模式，本阶段只记录请求
@@ -1150,6 +1151,12 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
     if (Camera_CLI_TokenEquals(arg, arg_len, "READINFO") != 0U)
     {
         Camera_CLI_PrintSdReadInfo(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "LINESTATE") != 0U)
+    {
+        Camera_SDStorage_PrintLineState();
         return CAMERA_CLI_OK;
     }
 

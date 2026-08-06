@@ -86,6 +86,63 @@ static Camera_SDBusWidthDebug_t s_bus_width_debug = {1U};
 #define CAMERA_SD_FULL_GPIOD_AFRL_MASK (0xFUL << 8U)
 #define CAMERA_SD_FULL_GPIOD_AFRL_AF12 (12UL << 8U)
 
+typedef struct
+{
+    GPIO_TypeDef *port;
+    uint32_t pin_number;
+    const char *name;
+} Camera_SDLineDef_t;
+
+static const Camera_SDLineDef_t s_camera_sd_lines[] =
+{
+    {GPIOC, 8U, "pc8_d0"},
+    {GPIOC, 9U, "pc9_d1"},
+    {GPIOC, 10U, "pc10_d2"},
+    {GPIOC, 11U, "pc11_d3"},
+    {GPIOC, 12U, "pc12_ck"},
+    {GPIOD, 2U, "pd2_cmd"}
+};
+
+static uint32_t Camera_SDStorage_GetPinMode(
+    GPIO_TypeDef *port,
+    uint32_t pin_number)
+{
+    return (port->MODER >> (pin_number * 2U)) & 0x3U;
+}
+
+static uint32_t Camera_SDStorage_GetPinPull(
+    GPIO_TypeDef *port,
+    uint32_t pin_number)
+{
+    return (port->PUPDR >> (pin_number * 2U)) & 0x3U;
+}
+
+static uint32_t Camera_SDStorage_GetPinSpeed(
+    GPIO_TypeDef *port,
+    uint32_t pin_number)
+{
+    return (port->OSPEEDR >> (pin_number * 2U)) & 0x3U;
+}
+
+static uint32_t Camera_SDStorage_GetPinAf(
+    GPIO_TypeDef *port,
+    uint32_t pin_number)
+{
+    if (pin_number < 8U)
+    {
+        return (port->AFR[0] >> (pin_number * 4U)) & 0xFU;
+    }
+
+    return (port->AFR[1] >> ((pin_number - 8U) * 4U)) & 0xFU;
+}
+
+static uint32_t Camera_SDStorage_GetPinIdr(
+    GPIO_TypeDef *port,
+    uint32_t pin_number)
+{
+    return (port->IDR >> pin_number) & 0x1U;
+}
+
 static void Camera_SDStorage_PrepareSdHandle(void)
 {
     hsd_snapshot.Instance = SDIO;
@@ -815,6 +872,70 @@ void Camera_SDStorage_DebugPrintBusWidthStatus(void)
     LOG_RAW("  last_operation_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_operation_ms);
     LOG_RAW("  last_wait_operation_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_wait_operation_ms);
     LOG_RAW("  last_wait_timeout_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_wait_timeout_ms);
+}
+
+void Camera_SDStorage_PrintLineState(void)
+{
+    uint32_t index;
+
+    LOG_RAW("SD LINESTATE:\r\n");
+    LOG_RAW("  linestate_readonly=1\r\n");
+    LOG_RAW("  linestate_hal_sd_api_call=0\r\n");
+    LOG_RAW("  is_initialized=%lu\r\n", (unsigned long)s_camera_sd_status.is_initialized);
+    LOG_RAW("  sdio_ready=%lu\r\n", (unsigned long)s_camera_sd_status.sdio_ready);
+    LOG_RAW("  sdio_full_gpio_af12_selected=%lu\r\n", (unsigned long)s_camera_sd_status.sdio_full_gpio_af12_selected);
+    LOG_RAW("  sdio_af12_selected=%lu\r\n", (unsigned long)s_camera_sd_status.sdio_af12_selected);
+    LOG_RAW("  conflict_pins_released=%lu\r\n", (unsigned long)s_camera_sd_status.conflict_pins_released);
+    LOG_RAW("  hal_sd_state=%lu\r\n", (unsigned long)s_camera_sd_status.last_hal_sd_state);
+    LOG_RAW("  hal_sd_card_state=%lu\r\n", (unsigned long)s_camera_sd_status.last_hal_sd_card_state);
+    LOG_RAW("  gpioc_moder=0x%08lX\r\n", (unsigned long)GPIOC->MODER);
+    LOG_RAW("  gpioc_pupdr=0x%08lX\r\n", (unsigned long)GPIOC->PUPDR);
+    LOG_RAW("  gpioc_ospeedr=0x%08lX\r\n", (unsigned long)GPIOC->OSPEEDR);
+    LOG_RAW("  gpioc_afr1=0x%08lX\r\n", (unsigned long)GPIOC->AFR[1]);
+    LOG_RAW("  gpioc_idr=0x%08lX\r\n", (unsigned long)GPIOC->IDR);
+    LOG_RAW("  gpiod_moder=0x%08lX\r\n", (unsigned long)GPIOD->MODER);
+    LOG_RAW("  gpiod_pupdr=0x%08lX\r\n", (unsigned long)GPIOD->PUPDR);
+    LOG_RAW("  gpiod_ospeedr=0x%08lX\r\n", (unsigned long)GPIOD->OSPEEDR);
+    LOG_RAW("  gpiod_afr0=0x%08lX\r\n", (unsigned long)GPIOD->AFR[0]);
+    LOG_RAW("  gpiod_idr=0x%08lX\r\n", (unsigned long)GPIOD->IDR);
+
+    for (index = 0U;
+         index < (sizeof(s_camera_sd_lines) / sizeof(s_camera_sd_lines[0]));
+         ++index)
+    {
+        const Camera_SDLineDef_t *line = &s_camera_sd_lines[index];
+
+        LOG_RAW(
+            "  %s_mode=%lu\r\n",
+            line->name,
+            (unsigned long)Camera_SDStorage_GetPinMode(
+                line->port,
+                line->pin_number));
+        LOG_RAW(
+            "  %s_pull=%lu\r\n",
+            line->name,
+            (unsigned long)Camera_SDStorage_GetPinPull(
+                line->port,
+                line->pin_number));
+        LOG_RAW(
+            "  %s_speed=%lu\r\n",
+            line->name,
+            (unsigned long)Camera_SDStorage_GetPinSpeed(
+                line->port,
+                line->pin_number));
+        LOG_RAW(
+            "  %s_af=%lu\r\n",
+            line->name,
+            (unsigned long)Camera_SDStorage_GetPinAf(
+                line->port,
+                line->pin_number));
+        LOG_RAW(
+            "  %s_idr=%lu\r\n",
+            line->name,
+            (unsigned long)Camera_SDStorage_GetPinIdr(
+                line->port,
+                line->pin_number));
+    }
 }
 
 uint32_t Camera_SDStorage_RequestBlockReadTest(uint32_t block_addr)

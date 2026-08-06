@@ -6762,3 +6762,77 @@ C5D 初版在 SD 状态结构、INIT 成功/失败路径以及 EXIT 路径中加
 - 1B 失败而 4B 成功：后续可转向 4-bit，并先完成进入 FATFS 前的只读稳定性验证。
 - `HAL_SD_ConfigWideBusOperation` 本身失败：记录 debug 状态中的 HAL status、HAL error、配置前后 card state 和等待状态，不把它误判为 READTEST 结果。
 - 任一诊断异常后 EXIT、RESTORE 或 basic 失败：必须先恢复 C5R 安全退出和图像恢复基线，不继续扩展 SD 功能。
+
+## Stage 11C-5E SDIO 数据路径 / 硬件线状态诊断
+
+### 1. 当前现象
+
+- C5R 固定 `ClockDiv=118U` 时，`HAL_SD_Init` 和 CardInfo 均成功。
+- `HAL_SD_ReadBlocks` 读取 block 0 与 block 2048 均返回 `HAL_SD_ERROR_DATA_CRC_FAIL`（`0x00000002`）。
+- C5D-2 最小侵入 BUSWIDTH 诊断没有破坏 SD INIT，但显式 1B、4B 的 `HAL_SD_ConfigWideBusOperation` 均失败，未形成有效的总线宽度读块对照。
+- 当前不再继续扫描 ClockDiv 或扩展 BUSWIDTH，诊断重点转向 SDIO GPIO 配置、输入电平和硬件数据路径。
+
+### 2. 本轮目的
+
+- 新增只读命令 `SD LINESTATE`。
+- 读取 PC8/PC9/PC10/PC11/PC12 和 PD2 的 MODER、PUPDR、OSPEEDR、AFR 与 IDR。
+- 分别输出 D0、D1、D2、D3、CK、CMD 的 mode、pull、speed、AF 和实时输入电平。
+- 核对接管后信号线是否实际进入 AF12、Pull-up、Very High 配置。
+- 在初始化前后及 READTEST 失败后采样，判断 D0～D3 和 CMD 空闲电平是否为高，是否存在异常低电平或复用配置变化。
+
+### 3. 本轮保持不变
+
+- 不修改 SD INIT、SD READTEST、TAKEOVER ENTER/EXIT、RESTORE 或 GPIO 切换逻辑。
+- ClockDiv 继续固定为 118U，初始化 BusWide 继续为 `SDIO_BUS_WIDE_1B`。
+- 不新增 `HAL_SD_ConfigWideBusOperation` 调用；仅保留 C5D-2 已有的独立诊断调用。
+- 不恢复 CLOCKDIV、IRQOFF 或读后 `WaitCardTransfer`。
+- 不写卡、不接 FATFS、不使用 SDIO DMA 或 SDIO IRQ。
+- LINESTATE 只读取状态，不修改 SD 计数器、takeover 状态或 snapshot 状态。
+
+### 4. 板测流程
+
+1. 执行 `SD INIT`，确认未接管时返回 `NEED_TAKEOVER`。
+2. 执行 `SNAPSHOT PREPARE` 和 `SD TAKEOVER ENTER`。
+3. 执行 `SD LINESTATE`，保存 HAL 初始化前的 GPIO 接管状态。
+4. 执行 `SD INIT`、`SD STATUS`、`SD CARDINFO` 和 `SD LINESTATE`。
+5. 执行 `SD READTEST 0`、`SD READINFO` 和 `SD LINESTATE`。
+6. 执行 `SD READTEST 2048`、`SD READINFO` 和 `SD LINESTATE`。
+7. 执行文本 `DUMP`，确认 snapshot guard 生效。
+8. 执行 `SD TAKEOVER EXIT` 和 `SD LINESTATE`，核对退出后的 GPIO 状态。
+9. 执行 `SNAPSHOT RESTORE`、`STATUS`、basic 和 repeat 图像恢复测试。
+
+### 5. 结果判断
+
+- PC8/D0 不是 AF12、Pull-up、Very High 或 IDR 异常：优先检查 D0 线、复用配置和上拉条件。
+- PC9、PC10、PC11 即 D1～D3 异常：优先检查 4-bit 相关数据线；1-bit 读块仍应重点关注 D0。
+- CMD 状态异常但 CardInfo 稳定成功：需要复核采样时点、外部上拉和命令线连接。
+- 全部数据线与 CMD 均为 AF12、Pull-up、Very High 且空闲高，但仍为 `DATA_CRC_FAIL`：下一步检查 SDIO 数据传输参数、卡兼容性、上拉强度或底层 SDIO 数据通路。
+- EXIT 后 PC8/PC9/PC11 恢复 DCMI AF13，而 PC10/PC12/PD2 退回输入态：说明 takeover 退出与 GPIO 恢复路径正常。
+
+## Stage 11C-5E-1 修正 SD LINESTATE 只读性
+
+### 1. C5E 初版板测现象
+
+- 在 `SD INIT` 前执行 LINESTATE 时，PC8、PC9、PC10、PC11、PC12、PD2 均已配置为 AF12、Pull-up、Very High，说明 takeover 的 GPIO 切换基本正确。
+- 该采样时点下 PC9/D1 与 PC11/D3 的 IDR 为 0，需要在后续数据路径诊断中继续关注。
+- 执行 `SD LINESTATE` 后，原本可用的 C5R 初始化基线退化为 `HAL_SD_Init failed`，HAL error 为 `0x00000004`，CardInfo 和 READTEST 未继续执行。
+- DUMP guard、TAKEOVER EXIT、SNAPSHOT RESTORE、系统状态和 basic 图像恢复仍正常。
+- 检查发现初版 `Camera_SDStorage_PrintLineState` 在 SD ready 时主动调用了 `HAL_SD_GetState` 和 `HAL_SD_GetCardState`；其中 `HAL_SD_GetCardState` 可能访问 SDIO 外设或发送状态命令，不符合 LINESTATE 的严格只读边界。
+
+### 2. C5E-1 修正内容
+
+- `SD LINESTATE` 禁止调用任何 `HAL_SD_*` API。
+- `hal_sd_state` 改为输出 `s_camera_sd_status.last_hal_sd_state` 缓存值。
+- `hal_sd_card_state` 改为输出 `s_camera_sd_status.last_hal_sd_card_state` 缓存值。
+- 新增 `linestate_readonly=1`，声明该命令只读取缓存和 GPIO 寄存器。
+- 新增 `linestate_hal_sd_api_call=0`，声明该命令不主动调用 HAL SD API。
+- 保留 GPIOC/GPIOD 的 MODER、PUPDR、OSPEEDR、AFR、IDR 原始值以及六根 SDIO 信号线的逐脚解析字段。
+- 不修改 SD INIT、READTEST、TAKEOVER ENTER/EXIT、RESTORE、DUMP guard 或 BUSWIDTH 诊断路径。
+
+### 3. 下一次板测
+
+继续使用与 C5E 初版相同的自动脚本和顺序，在 `SD TAKEOVER ENTER` 后、真实 `SD INIT` 前执行 `SD LINESTATE`：
+
+- 如果 `SD_INIT` 恢复 PASS，说明 C5E 初版失败与 LINESTATE 中非纯只读的 HAL SD 状态调用相关。
+- 如果 `SD_INIT` 仍 FAIL，需要继续检查 LINESTATE 是否存在其他副作用，或比较 C5E 新增静态数据、日志输出和固件布局对初始化基线的影响。
+- 无论初始化结果如何，都必须继续验证 DUMP guard、TAKEOVER EXIT、SNAPSHOT RESTORE、STATUS 和 basic/repeat 恢复路径。
