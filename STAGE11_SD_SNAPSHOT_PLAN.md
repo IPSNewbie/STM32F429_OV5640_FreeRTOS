@@ -6585,3 +6585,92 @@ C5A 的已知边界保持不变：HAL 初始化和 CardInfo 成功；block 0 和
 - C5R 后 `HAL_SD_Init` 恢复 OK：说明 C5B 新增变量导致初始化退化，后续以 C5A/C5R 为基线重新规划读块诊断。
 - C5R 后 `HAL_SD_Init` 仍失败：继续逐项比对实际烧录固件、构建产物和 C5A 提交点，必要时直接以 C5A 提交重新构建验证。
 - 在 HAL 初始化基线重新确认前，不进入 FATFS、不写卡，也不继续叠加读块实验变量。
+
+## Stage 11C-5C SDIO ClockDiv 诊断
+
+### 1. C5R 基线
+
+- `HAL_SD_Init` 成功，`HAL_SD_GetCardInfo` 成功，卡信息读取正常。
+- `SD READTEST 0` 与 `SD READTEST 2048` 均返回 `HAL_SD_ERROR_DATA_CRC_FAIL`。
+- `SD TAKEOVER EXIT`、`SNAPSHOT RESTORE` 以及 RESTORE 后的 basic、pc_dump、repeat 20/20 均正常。
+
+### 2. 本轮目的与状态设计
+
+- 新增 `SD CLOCKDIV` 命令，允许在 `SD INIT` 前查询或设置运行时 SDIO `ClockDiv`。
+- 默认值保持 C5R 基线的 118，允许范围为 0～255。
+- `sdio_clock_div_current` 表示下一次 `HAL_SD_Init` 将使用的值；只有 SD 未初始化且 SDIO 时钟关闭时才允许修改。
+- `sdio_clock_div_last_used` 只在真正调用 `HAL_SD_Init` 前更新；前置条件不满足时不更新，初始化失败时仍保留实际尝试值。
+- `SD TAKEOVER EXIT` 与 `SNAPSHOT RESTORE` 均不重置 current，只有重新上电或复位恢复默认值 118。
+- 计划使用 118、178、238、255 等档位判断读块 `DATA_CRC_FAIL` 是否与 SDIO 时钟有关。
+
+### 3. 本轮保持不变的边界
+
+- 保持 SDIO 1-bit 模式，不调用 `HAL_SD_ConfigWideBusOperation`。
+- 不启用 SDIO DMA，不启用 SDIO 中断，不配置 `SDIO_IRQn`。
+- 不写卡，不调用 `HAL_SD_WriteBlocks`，不接入或挂载 FATFS。
+- 保留 C5A 的 4 字节对齐 `uint32_t[128]` 读缓冲、读前 `WaitCardTransfer` 与错误 bit 诊断。
+- 每条 `SD READTEST` 命令仍只读取 1 个 512 B block。
+- 不恢复 C5B 的 IRQOFF 模式，也不恢复读后 `WaitCardTransfer`。
+- 不修改图像链路、UART DMA、二进制请求协议或 OV56RGB5 帧格式。
+
+### 4. 板测流程
+
+每个 ClockDiv 档位独立执行以下流程：
+
+1. 复位或重新烧录启动。
+2. 执行 `SD CLOCKDIV <value>`，再执行 `SD CLOCKDIV` 核对 current 和计数。
+3. 未接管前执行 `SD INIT`，确认返回 `NEED_TAKEOVER`，且 last_used 未更新。
+4. 执行 `SNAPSHOT PREPARE`。
+5. 执行 `SD TAKEOVER ENTER`。
+6. 执行 `SD INIT`，确认本次初始化使用的 last_used。
+7. 执行 `SD STATUS` 和 `SD CARDINFO`。
+8. 若初始化成功，依次执行 `SD READTEST 0`、`SD READINFO`、`SD READTEST 2048`、`SD READINFO`。
+9. 验证 guard 状态下文本 DUMP 被阻止。
+10. 执行 `SD TAKEOVER EXIT` 和 `SNAPSHOT RESTORE`。
+11. 执行 basic、pc_dump、repeat 20/20，验证图像链路恢复。
+
+本轮 Codex 只完成代码、文档、静态检查与构建，不执行上述硬件板测。
+
+### 5. 预期分支判断
+
+- 如果某个 ClockDiv 下读块成功，保留该档位作为进入 FATFS 前的候选分频，并先完成只读回归验证。
+- 如果所有档位下 `HAL_SD_Init` 均成功但读块仍为 `DATA_CRC_FAIL`，说明简单降速未解决问题。
+- 如果某个档位下 `HAL_SD_Init` 失败，记录为该档位初始化失败，不将其误判为读块失败。
+- 如果所有档位均失败，下一步再考虑 4-bit 对照、显式 bus 配置以及硬件上拉和线序检查。
+- 在只读块问题定位完成前，不直接进入 FATFS，不执行写卡。
+
+## Stage 11C-5C ClockDiv 诊断回退结论
+
+### 1. 板测结果
+
+C5C 动态 ClockDiv 方案未推进只读块问题，并使初始化路径出现不稳定和退化：
+
+- `ClockDiv=118`：`HAL_SD_Init failed, status=1, error=0x00000004`。
+- `ClockDiv=178`：`HAL_SD_Init failed, status=1, error=0x00000004`。
+- `ClockDiv=238`：`HAL_SD_Init failed, status=1, error=0x00000004`。
+- `ClockDiv=255` clean test：`HAL_SD_Init failed, status=1, error=0x00000004`。
+- CardInfo 未读取，`SD READTEST` 均因 not ready 而未真正执行。
+- `SD TAKEOVER EXIT` 和 `SNAPSHOT RESTORE` 正常。
+- RESTORE 后 basic、pc_dump、repeat 20/20 均 PASS。
+- IWDG、HOOK、UART RX DMA 状态正常。
+
+因此，本轮结果不能用于比较不同 ClockDiv 对 `DATA_CRC_FAIL` 的影响：各档位未能稳定越过 `HAL_SD_Init`，读块路径没有获得有效样本。
+
+### 2. 回退决定
+
+- C5C 动态 ClockDiv 方案不作为有效代码保留。
+- 删除 `SD CLOCKDIV` 查询与设置命令、动态配置状态字段、错误码和 Set/Get API。
+- `SD INIT` 恢复 C5R 固定 `hsd_snapshot.Init.ClockDiv = 118U` 的初始化路径。
+- 保留 C5A/C5R 的 `HAL_SD_Init`、`HAL_SD_GetCardInfo`、`SD READTEST`、`SD READINFO`、4 字节对齐 `uint32_t[128]` 读缓冲、读前 `WaitCardTransfer`、`DATA_CRC_FAIL` 错误 bit 诊断以及单 block 只读路径。
+- 不恢复 IRQOFF 或读后 `WaitCardTransfer`，不写卡、不接 FATFS、不启用 SDIO DMA 或 SDIO 中断。
+
+### 3. 后续方向
+
+后续不再继续简单扫描动态 ClockDiv，改为受控验证以下方向：
+
+1. 显式 1-bit / 4-bit bus 配置对照。
+2. 在独立阶段受控测试 `HAL_SD_ConfigWideBusOperation`，不得混入本次回退代码。
+3. 检查 SDIO CLK、CMD、D0～D3 引脚连接、复用配置和外部/内部上拉条件。
+4. 对照正点原子 `sd_init` 的初始化顺序、低速初始化阶段和初始化完成后的总线配置流程。
+
+在新的只读诊断方案验证前，继续保持不写卡、不接 FATFS。
