@@ -6836,3 +6836,95 @@ C5D 初版在 SD 状态结构、INIT 成功/失败路径以及 EXIT 路径中加
 - 如果 `SD_INIT` 恢复 PASS，说明 C5E 初版失败与 LINESTATE 中非纯只读的 HAL SD 状态调用相关。
 - 如果 `SD_INIT` 仍 FAIL，需要继续检查 LINESTATE 是否存在其他副作用，或比较 C5E 新增静态数据、日志输出和固件布局对初始化基线的影响。
 - 无论初始化结果如何，都必须继续验证 DUMP guard、TAKEOVER EXIT、SNAPSHOT RESTORE、STATUS 和 basic/repeat 恢复路径。
+
+## Stage 11C-5F-1 OV5640 PWDN 物理隔离诊断
+
+### 1. C5E-1 after-init 结果
+
+- `HAL_SD_Init` 与 CardInfo 成功，说明 C5E-1 的严格只读 LINESTATE 没有破坏初始化基线。
+- PC8、PC9、PC10、PC11、PC12、PD2 均为 AF12、Pull-up、Very High，GPIO 配置符合预期。
+- PC9/SDIO_D1 在初始化后、READTEST 0 后和 READTEST 2048 后的 IDR 均长期为 0；PC8/D0、PC10/D2、PC11/D3 和 PD2/CMD 为高。
+- block 0 与 block 2048 仍为 `HAL_SD_ERROR_DATA_CRC_FAIL`。
+- TAKEOVER EXIT、SNAPSHOT RESTORE 和 basic 图像恢复正常。
+
+### 2. 本轮假设与目的
+
+PC9 同时连接 SDIO_D1 和 OV5640 DVP 数据线。当前假设是 OV5640 在 DCMI 停止、GPIO 已切换为 SDIO AF12 后仍可能从摄像头侧驱动 PC9 为低。通过 PCF8574 P2 将高有效的 OV5640 PWDN 拉高，使摄像头进入硬件 power-down，再比较 PC9 电平、SD INIT 和 READTEST 结果，以隔离摄像头侧物理驱动影响。
+
+### 3. 本轮实现与安全边界
+
+- 新增 `SD CAMPOWER`，输出独立 PWDN 诊断状态和操作计数。
+- 新增 `SD CAMOFF`：仅在 snapshot 已暂停且 SDIO 完整接管后，通过现有 `PCF8574_WriteBit(PCF8574_OV_PWDN_IO, 1)` 拉高 PWDN，并等待 50 ms。
+- 新增 `SD CAMON`：通过同一接口将 PWDN 拉低为 0，并等待 50 ms，使 OV5640 退出 power-down。
+- CAMOFF 仅是显式诊断命令，不自动加入 TAKEOVER ENTER、SD INIT 或 READTEST。
+- TAKEOVER EXIT 前若诊断状态仍为 PWDN active，则先尝试 CAMON 作为安全恢复；即使 CAMON 失败，也继续执行 SDIO DeInit 和 GPIO restore。
+- 不修改 SNAPSHOT RESTORE；如果 PWDN power cycle 后图像无法恢复，需要在后续阶段评估是否必须重新初始化 OV5640 或重建 DCMI 采集链路。
+- 保持 LINESTATE 严格只读，不恢复 CLOCKDIV、IRQOFF、读后等待，不新增写卡、FATFS、SDIO DMA/IRQ 或第二处 ConfigWideBus 调用。
+
+### 4. 板测流程
+
+1. 执行 `SD INIT`，确认未接管时返回 `NEED_TAKEOVER`。
+2. 执行 `SNAPSHOT PREPARE` 和 `SD TAKEOVER ENTER`。
+3. 执行 `SD CAMOFF`、`SD CAMPOWER` 和 `SD LINESTATE`。
+4. 执行 `SD INIT`、`SD STATUS`、`SD CARDINFO` 和 `SD LINESTATE`。
+5. 执行 `SD READTEST 0`、`SD READINFO` 和 `SD LINESTATE`。
+6. 执行 `SD READTEST 2048`、`SD READINFO` 和 `SD LINESTATE`。
+7. 执行文本 `DUMP`，确认 snapshot guard 生效。
+8. 执行 `SD CAMON`、`SD TAKEOVER EXIT` 和 `SNAPSHOT RESTORE`。
+9. 执行 `STATUS`、basic 和 repeat 图像恢复测试。
+
+### 5. 结果判断
+
+- CAMOFF 后 PC9/D1 从低变高：PC9 低电平与摄像头侧驱动相关。
+- CAMOFF 后 READTEST 成功：`DATA_CRC_FAIL` 根因高度指向 OV5640 DVP 的物理干扰。
+- CAMOFF 后 PC9 仍低：低电平可能来自 SD 卡侧、板级电路、SDIO 外设状态或其他冲突。
+- CAMOFF 后 PC9 变高但 READTEST 仍为 `DATA_CRC_FAIL`：摄像头确实影响 D1，但读块 CRC 还有其他原因。
+- CAMON、EXIT、RESTORE 后 basic 失败：PWDN power cycle 后可能需要重建 OV5640 初始化或 DCMI 采集链路，CAMOFF 不能直接并入正式流程。
+
+## Stage 11C-5G SDIO 读块失败寄存器快照诊断
+
+### 1. 当前现象
+
+- 使用 C5E after-init 流程时，`SD INIT` 与 CardInfo 均可成功。
+- `SD READTEST 0` 和 `SD READTEST 2048` 均稳定返回 `HAL_SD_ERROR_DATA_CRC_FAIL`。
+- SDIO GPIO 已确认配置为 AF12、Pull-up、Very High，但仍需从 SDIO 外设寄存器层确认数据阶段的实际失败状态。
+- C5F 的 OV5640 PWDN 物理隔离不适合并入正式流程，并且会破坏当前相机恢复链路；本轮不再触碰 PWDN、CAMOFF 或 CAMON。
+
+### 2. 本轮目的
+
+- 不改变 `SD READTEST` 的读前等待、单块 polling 读取和错误处理行为。
+- 仅在 `HAL_SD_ReadBlocks` 前后采集 SDIO 寄存器快照：读前等待之前、等待成功之后、读块返回之后各一份。
+- 仅扩展现有 `SD READINFO`，输出 STA、CLKCR、DCTRL、DLEN、DCOUNT、FIFOCNT、POWER、ARG、CMD、RESPCMD 和读后 RESP1～RESP4。
+- 同时记录读前、读后的 HAL state 与读后的 HAL error，并用 STM32F4 的 `SDIO_STA_xxx` 宏解码关键 STA 标志位。
+- 快照操作严格只读，不写 `SDIO->ICR`，不清除状态标志。
+
+### 3. 本轮保持不变
+
+- 不修改 SD INIT、SD READTEST 主读取流程、SD TAKEOVER ENTER/EXIT 或 SNAPSHOT RESTORE。
+- ClockDiv 继续固定为 `118U`；不恢复动态 CLOCKDIV。
+- 保留 C5D-2 既有的一处 `HAL_SD_ConfigWideBusOperation` 独立诊断调用，不新增第二处调用，也不改变 BUSWIDTH 诊断。
+- 不恢复 IRQOFF，不增加读后 `WaitCardTransfer`。
+- 不写卡、不接 FATFS、不使用 SDIO DMA 或 SDIO IRQ。
+- 不触碰摄像头 PWDN、CAMOFF 或 CAMON。
+- 不新增 CLI 命令，新字段只由 `SD READINFO` 输出。
+
+### 4. 板测流程
+
+继续使用现有 after-init 线状态脚本：
+
+```text
+python tools/uart_sd_line_after_init_auto_test.py --port COM4 --baud 115200 --repeat 0
+```
+
+完成 `SNAPSHOT PREPARE`、`SD TAKEOVER ENTER`、`SD INIT`、`SD READTEST 0/2048` 后，再查看 `SD READINFO` 中新增的 before_wait、before_read、after_read 寄存器字段、HAL state/error 和 STA bit 解码字段。仍需完成 TAKEOVER EXIT、SNAPSHOT RESTORE 及图像链路恢复验证。
+
+### 5. 结果判断
+
+- `read_after_sta_dcrc_fail=1` 且 `read_after_sta_dtimeout=0`：说明底层稳定报告数据 CRC 错误，不是数据超时。
+- `read_after_sta_dtimeout=1`：重点检查数据线、时钟与采样条件导致的数据超时。
+- `read_after_sta_rxoverr=1`：说明 polling 路径可能未及时读取 FIFO；后续再评估节流、DMA 或中断，本阶段不改变读取方式。
+- `read_after_sta_stbiterr=1`：说明数据起始位异常，重点检查 D0 线与 SDIO 采样。
+- `read_after_read_dcount` 不为 0：说明预期数据长度未完整传输。
+- `read_after_read_fifocnt` 异常：说明 FIFO 可能有残留或未正常读出。
+- `read_after_sta_dataend` 或 `read_after_sta_dbckend` 与预期不符：说明数据块结束阶段异常。
+- `read_hal_error_after_read` 应与底层 STA 快照交叉核对；本轮只收集证据，不据此自动清标志或改变返回逻辑。

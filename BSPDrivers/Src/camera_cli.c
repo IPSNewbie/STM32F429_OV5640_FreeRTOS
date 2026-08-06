@@ -1119,6 +1119,7 @@ static void Camera_CLI_PrintSdReadInfo(UART_HandleTypeDef *huart)
     Camera_SDStorage_GetStatus(&status);
     Camera_CLI_WriteLine(huart, "SD READINFO:");
     Camera_CLI_PrintSdBlockReadFields(huart, &status);
+    Camera_SDStorage_DebugPrintReadRegDiag();
 }
 
 static void Camera_CLI_PrintSdReadTestStatus(

@@ -19,6 +19,37 @@ static SD_HandleTypeDef hsd_snapshot;
 /* 使用 uint32_t 数组保证 4 字节对齐，仅用于 HAL SD polling 只读块验证，不写卡。 */
 static uint32_t s_sd_read_test_words[128];
 
+/* C5G 只读保存 HAL_SD_ReadBlocks 前后的 SDIO 寄存器，不清除任何状态标志。 */
+typedef struct
+{
+    uint32_t sta;
+    uint32_t clkcr;
+    uint32_t dctrl;
+    uint32_t dlen;
+    uint32_t dcount;
+    uint32_t fifocnt;
+    uint32_t power;
+    uint32_t arg;
+    uint32_t cmd;
+    uint32_t resp_cmd;
+    uint32_t resp1;
+    uint32_t resp2;
+    uint32_t resp3;
+    uint32_t resp4;
+} Camera_SDSdioRegSnapshot_t;
+
+typedef struct
+{
+    Camera_SDSdioRegSnapshot_t before_wait;
+    Camera_SDSdioRegSnapshot_t before_read;
+    Camera_SDSdioRegSnapshot_t after_read;
+    uint32_t last_hal_state_before_read;
+    uint32_t last_hal_state_after_read;
+    uint32_t last_hal_error_after_read;
+} Camera_SDReadRegDiag_t;
+
+static Camera_SDReadRegDiag_t s_read_reg_diag;
+
 /* C5D-2 独立调试状态：不进入 CameraSdStorageStatus_t，也不参与 INIT/EXIT。 */
 typedef struct
 {
@@ -40,6 +71,37 @@ typedef struct
 } Camera_SDBusWidthDebug_t;
 
 static Camera_SDBusWidthDebug_t s_bus_width_debug = {1U};
+
+static void Camera_SDStorage_CaptureSdioRegSnapshot(
+    Camera_SDSdioRegSnapshot_t *snapshot)
+{
+    if (snapshot == NULL)
+    {
+        return;
+    }
+
+    snapshot->sta = SDIO->STA;
+    snapshot->clkcr = SDIO->CLKCR;
+    snapshot->dctrl = SDIO->DCTRL;
+    snapshot->dlen = SDIO->DLEN;
+    snapshot->dcount = SDIO->DCOUNT;
+    snapshot->fifocnt = SDIO->FIFOCNT;
+    snapshot->power = SDIO->POWER;
+    snapshot->arg = SDIO->ARG;
+    snapshot->cmd = SDIO->CMD;
+    snapshot->resp_cmd = SDIO->RESPCMD;
+    snapshot->resp1 = SDIO->RESP1;
+    snapshot->resp2 = SDIO->RESP2;
+    snapshot->resp3 = SDIO->RESP3;
+    snapshot->resp4 = SDIO->RESP4;
+}
+
+static uint32_t Camera_SDStorage_IsStaFlagSet(
+    uint32_t sta,
+    uint32_t flag)
+{
+    return ((sta & flag) != 0U) ? 1U : 0U;
+}
 
 #define CAMERA_SD_CONFLICT_PIN_MASK \
     (GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_11)
@@ -319,12 +381,16 @@ static uint32_t Camera_SDStorage_ReadBlockTest(uint32_t block_addr)
         return CAMERA_SD_ERR_BLOCK_READ_NOT_READY;
     }
 
+    Camera_SDStorage_CaptureSdioRegSnapshot(&s_read_reg_diag.before_wait);
     wait_result = Camera_SDStorage_WaitCardTransfer(1000U);
     if (wait_result != CAMERA_SD_OK)
     {
         return wait_result;
     }
 
+    Camera_SDStorage_CaptureSdioRegSnapshot(&s_read_reg_diag.before_read);
+    s_read_reg_diag.last_hal_state_before_read =
+        (uint32_t)hsd_snapshot.State;
     s_camera_sd_status.last_block_read_pre_card_state =
         (uint32_t)HAL_SD_GetCardState(&hsd_snapshot);
     memset(read_buffer, 0, sizeof(s_sd_read_test_words));
@@ -339,11 +405,16 @@ static uint32_t Camera_SDStorage_ReadBlockTest(uint32_t block_addr)
         block_addr,
         1U,
         1000U);
+    Camera_SDStorage_CaptureSdioRegSnapshot(&s_read_reg_diag.after_read);
+    s_read_reg_diag.last_hal_state_after_read =
+        (uint32_t)hsd_snapshot.State;
+    s_read_reg_diag.last_hal_error_after_read =
+        HAL_SD_GetError(&hsd_snapshot);
     s_camera_sd_status.last_block_read_operation_ms =
         HAL_GetTick() - start_ms;
     s_camera_sd_status.last_block_read_status = (uint32_t)hal_status;
     s_camera_sd_status.last_block_read_error =
-        HAL_SD_GetError(&hsd_snapshot);
+        s_read_reg_diag.last_hal_error_after_read;
     s_camera_sd_status.last_block_read_error_is_data_crc_fail =
         ((s_camera_sd_status.last_block_read_error &
           HAL_SD_ERROR_DATA_CRC_FAIL) != 0U) ? 1U : 0U;
@@ -779,6 +850,7 @@ void Camera_SDStorage_InitState(void)
     s_camera_sd_status.last_block_read_error_is_data_timeout = 0U;
     s_camera_sd_status.last_block_read_error_is_rx_overrun = 0U;
     s_camera_sd_status.last_block_read_error_is_tx_underrun = 0U;
+    memset(&s_read_reg_diag, 0, sizeof(s_read_reg_diag));
 }
 
 void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status)
@@ -872,6 +944,68 @@ void Camera_SDStorage_DebugPrintBusWidthStatus(void)
     LOG_RAW("  last_operation_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_operation_ms);
     LOG_RAW("  last_wait_operation_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_wait_operation_ms);
     LOG_RAW("  last_wait_timeout_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_wait_timeout_ms);
+}
+
+void Camera_SDStorage_DebugPrintReadRegDiag(void)
+{
+    const Camera_SDSdioRegSnapshot_t *before_wait =
+        &s_read_reg_diag.before_wait;
+    const Camera_SDSdioRegSnapshot_t *before_read =
+        &s_read_reg_diag.before_read;
+    const Camera_SDSdioRegSnapshot_t *after_read =
+        &s_read_reg_diag.after_read;
+    uint32_t after_sta = after_read->sta;
+
+    LOG_RAW("  read_before_wait_sta=0x%08lX\r\n", (unsigned long)before_wait->sta);
+    LOG_RAW("  read_before_wait_clkcr=0x%08lX\r\n", (unsigned long)before_wait->clkcr);
+    LOG_RAW("  read_before_wait_dctrl=0x%08lX\r\n", (unsigned long)before_wait->dctrl);
+    LOG_RAW("  read_before_wait_dlen=%lu\r\n", (unsigned long)before_wait->dlen);
+    LOG_RAW("  read_before_wait_dcount=%lu\r\n", (unsigned long)before_wait->dcount);
+    LOG_RAW("  read_before_wait_fifocnt=%lu\r\n", (unsigned long)before_wait->fifocnt);
+    LOG_RAW("  read_before_wait_power=0x%08lX\r\n", (unsigned long)before_wait->power);
+    LOG_RAW("  read_before_wait_arg=0x%08lX\r\n", (unsigned long)before_wait->arg);
+    LOG_RAW("  read_before_wait_cmd=0x%08lX\r\n", (unsigned long)before_wait->cmd);
+    LOG_RAW("  read_before_wait_resp_cmd=0x%08lX\r\n", (unsigned long)before_wait->resp_cmd);
+
+    LOG_RAW("  read_before_read_sta=0x%08lX\r\n", (unsigned long)before_read->sta);
+    LOG_RAW("  read_before_read_clkcr=0x%08lX\r\n", (unsigned long)before_read->clkcr);
+    LOG_RAW("  read_before_read_dctrl=0x%08lX\r\n", (unsigned long)before_read->dctrl);
+    LOG_RAW("  read_before_read_dlen=%lu\r\n", (unsigned long)before_read->dlen);
+    LOG_RAW("  read_before_read_dcount=%lu\r\n", (unsigned long)before_read->dcount);
+    LOG_RAW("  read_before_read_fifocnt=%lu\r\n", (unsigned long)before_read->fifocnt);
+    LOG_RAW("  read_before_read_power=0x%08lX\r\n", (unsigned long)before_read->power);
+    LOG_RAW("  read_before_read_arg=0x%08lX\r\n", (unsigned long)before_read->arg);
+    LOG_RAW("  read_before_read_cmd=0x%08lX\r\n", (unsigned long)before_read->cmd);
+    LOG_RAW("  read_before_read_resp_cmd=0x%08lX\r\n", (unsigned long)before_read->resp_cmd);
+
+    LOG_RAW("  read_after_read_sta=0x%08lX\r\n", (unsigned long)after_read->sta);
+    LOG_RAW("  read_after_read_clkcr=0x%08lX\r\n", (unsigned long)after_read->clkcr);
+    LOG_RAW("  read_after_read_dctrl=0x%08lX\r\n", (unsigned long)after_read->dctrl);
+    LOG_RAW("  read_after_read_dlen=%lu\r\n", (unsigned long)after_read->dlen);
+    LOG_RAW("  read_after_read_dcount=%lu\r\n", (unsigned long)after_read->dcount);
+    LOG_RAW("  read_after_read_fifocnt=%lu\r\n", (unsigned long)after_read->fifocnt);
+    LOG_RAW("  read_after_read_power=0x%08lX\r\n", (unsigned long)after_read->power);
+    LOG_RAW("  read_after_read_arg=0x%08lX\r\n", (unsigned long)after_read->arg);
+    LOG_RAW("  read_after_read_cmd=0x%08lX\r\n", (unsigned long)after_read->cmd);
+    LOG_RAW("  read_after_read_resp_cmd=0x%08lX\r\n", (unsigned long)after_read->resp_cmd);
+    LOG_RAW("  read_after_read_resp1=0x%08lX\r\n", (unsigned long)after_read->resp1);
+    LOG_RAW("  read_after_read_resp2=0x%08lX\r\n", (unsigned long)after_read->resp2);
+    LOG_RAW("  read_after_read_resp3=0x%08lX\r\n", (unsigned long)after_read->resp3);
+    LOG_RAW("  read_after_read_resp4=0x%08lX\r\n", (unsigned long)after_read->resp4);
+    LOG_RAW("  read_hal_state_before_read=%lu\r\n", (unsigned long)s_read_reg_diag.last_hal_state_before_read);
+    LOG_RAW("  read_hal_state_after_read=%lu\r\n", (unsigned long)s_read_reg_diag.last_hal_state_after_read);
+    LOG_RAW("  read_hal_error_after_read=0x%08lX\r\n", (unsigned long)s_read_reg_diag.last_hal_error_after_read);
+    LOG_RAW("  read_after_sta_dcrc_fail=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_DCRCFAIL));
+    LOG_RAW("  read_after_sta_dtimeout=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_DTIMEOUT));
+    LOG_RAW("  read_after_sta_rxoverr=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_RXOVERR));
+    LOG_RAW("  read_after_sta_stbiterr=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_STBITERR));
+    LOG_RAW("  read_after_sta_dataend=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_DATAEND));
+    LOG_RAW("  read_after_sta_dbckend=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_DBCKEND));
+    LOG_RAW("  read_after_sta_cmdsent=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_CMDSENT));
+    LOG_RAW("  read_after_sta_cmdrend=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_CMDREND));
+    LOG_RAW("  read_after_sta_rxact=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_RXACT));
+    LOG_RAW("  read_after_sta_rxdavl=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_RXDAVL));
+    LOG_RAW("  read_after_sta_txunderr=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_TXUNDERR));
 }
 
 void Camera_SDStorage_PrintLineState(void)

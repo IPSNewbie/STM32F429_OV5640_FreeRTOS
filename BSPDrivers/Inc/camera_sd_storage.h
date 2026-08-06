@@ -165,6 +165,9 @@ uint32_t Camera_SDStorage_DebugSetBusWidth(uint32_t bus_width);
 /* 通过日志串口输出独立 bus width 调试状态。 */
 void Camera_SDStorage_DebugPrintBusWidthStatus(void);
 
+/* 输出最近一次 SD READTEST 前后的只读 SDIO 寄存器快照。 */
+void Camera_SDStorage_DebugPrintReadRegDiag(void);
+
 /* 只读打印 SDIO GPIO 寄存器与六根信号线的当前配置和输入电平。 */
 void Camera_SDStorage_PrintLineState(void);
 
