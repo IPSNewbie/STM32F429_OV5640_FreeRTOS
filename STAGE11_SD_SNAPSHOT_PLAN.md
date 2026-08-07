@@ -7806,3 +7806,75 @@ FAIL_REASON_COUNTS
 下一次开发板测试应首先查看 `ATK1B_HAL_ERROR_VALUES`、`ATK1B_HAL_STATUS_VALUES`、CardInfo 状态、最后卡状态和失败轮次，再判断问题属于 HAL_SD_Init、CardInfo、transfer wait 还是轮间状态残留。在取得这些证据前不修改固件，也不否定 C1 DVP mask 方案。
 
 本轮 Codex 不执行硬件测试，不提交 Git commit。
+
+## Stage 12A CLI / STATUS 删减清理
+
+### 1. 删减原因
+
+Stage 11C 已经完成 SDIO 与 OV5640 共享线的诊断闭环。继续保留大量实验命令、寄存器快照、缓冲区指纹和过程计数器会污染最终工程；原 STATUS 与 SD STATUS 输出也过长，不适合正常项目展示。因此本阶段直接删除历史诊断 CLI、相关解析分支和冗余状态字段，不通过宏或注释保留旧实现。
+
+### 2. 最终保留 CLI
+
+- `HELP`
+- `STATUS`
+- `PROC [BYPASS|GRAY|BINARY]`
+- `THR [0..255]`
+- `RESET`
+- `DUMP`
+- `SD STATUS`
+
+### 3. 删除的 Stage 11C 诊断 CLI
+
+- `SD CARDINFO`
+- `SD READTEST`
+- `SD READINFO`
+- `SD BUSWIDTH`
+- `SD LINESTATE`
+- `SD ATKINIT`
+- `SD ATKSTATUS`
+- `SD ATK1BINIT`
+- `SD ATK1BREAD`
+- `SD ATK1BSTATUS`
+- `SD SENSORSTOP`
+- `SD SENSORRESTORE`
+- `SD SENSORSTATUS`
+- `SD DVPSTOP`
+- `SD DVPRESTORE`
+- `SD DVPSTATUS`
+- `SD INIT`
+- `SD TAKEOVER STATUS`
+- `SD TAKEOVER ENTER`
+- `SD TAKEOVER EXIT`
+- `SNAPSHOT STATUS`
+- `SNAPSHOT PREPARE`
+- `SNAPSHOT RESTORE`
+- `IWDGTEST CAMERA_TIMEOUT`
+
+### 4. STATUS 保留内容
+
+STATUS 仅保留模式与配置、核心健康、关键故障和看门狗关键状态：
+
+- `STATUS`: `mode`、`threshold`、`frame`、`tuning`、`uptime_ms`
+- `HEALTH`: `heap_free`、`heap_min`、`stack_camera_min`、`stack_monitor_min`
+- `FAULT`: `hook_fault`、`assert_line`、`uart_dma_error`、`stream_overflow`
+- `IWDG`: `enabled`、`refresh_skip`、`last_skip_reason`
+
+RTOS 模块不再维护或输出 CLI、DUMP、UART 空闲、二进制请求分类、心跳年龄、IWDG 刷新时间等细碎计数器。看门狗健康判断需要的任务活性时间只作为模块私有状态存在。
+
+### 5. SD STATUS 保留内容
+
+SD STATUS 仅保留：
+
+- `supported`
+- `card_ready`
+- `takeover_required`
+- `sdio_ready`
+- `fatfs_ready`
+- `last_error`
+- `dvp_mask_solution=OV5640_3018_6_4`
+
+SD 状态结构只保留 SD 支持/ready、SDIO/FATFS ready、takeover 需求、最后错误、DVP mask 核心状态、保存的 `0x3018`、恢复状态、最近初始化结果和最近读写结果。ATK、READTEST、LINESTATE、BUSWIDTH、GPIO 完整 readback、SDIO 寄存器快照、缓冲区指纹及实验计数器均已删除。
+
+### 6. 保留的内部流程能力
+
+OV5640 `0x3018[6:4]` DVP mask 与原值恢复继续保留，供后续 SD snapshot 内部流程使用；SDIO GPIO takeover/restore 和基础 HAL SD 初始化能力也继续保留。串口不再暴露 `DVPSTOP`/`DVPRESTORE`，也不再保留 ATK、READTEST、LINESTATE 等实验命令。本阶段不接 FATFS、不写卡、不启用 SDIO DMA 或 IRQ。

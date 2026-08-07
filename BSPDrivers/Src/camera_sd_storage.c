@@ -1,259 +1,15 @@
 #include "camera_sd_storage.h"
 
-#include "bsp_log.h"
 #include "bsp_sccb.h"
-#include "camera_rtos.h"
 #include "camera_snapshot_control.h"
 #include "stm32f4xx_hal.h"
 
 #include <stddef.h>
 #include <string.h>
 
-/*
- * Stage 11C-1 在既有冲突引脚切换成功后，将 PC8～PC12 和 PD2 配置为 SDIO AF12，
- * 并在 EXIT 时先将六个引脚退回 GPIO 输入态，再恢复 PC8、PC9、PC11 的 DCMI AF13。
- * PC8、PC9、PC11 同时被 DCMI 和 SDIO 使用，后续必须先停止 DCMI 和相关 DMA，
- * 再进入 SDIO 接管流程。Stage 11C-4 在 HAL_SD_Init 成功后读取 HAL 层卡信息，
- * 不接入 FATFS，不执行块读写，也不启用 SDIO 中断或 DMA。
- */
-static CameraSdStorageStatus_t s_camera_sd_status;
-static CameraSdOnlyVirtualSnapshotStatus_t s_sd_only_virtual_snapshot_status;
-static SD_HandleTypeDef hsd_snapshot;
-static uint32_t s_atk_official_path_active;
-static uint32_t s_atk_official_hal_initialized;
-static uint32_t s_atk_1bit_path_active;
-static uint32_t s_atk_1bit_hal_initialized;
-/* 使用 uint32_t 数组保证 4 字节对齐，仅用于 HAL SD polling 只读块验证，不写卡。 */
-static uint32_t s_sd_read_test_words[128];
-static uint32_t s_atk_1bit_read_buffer_words[128];
-
-#define CAMERA_SD_READ_BUFFER_LEN 512U
-#define CAMERA_SD_READ_PREFILL_PATTERN 0xA5U
-#define CAMERA_SD_READ_NO_CHANGED_INDEX 0xFFFFFFFFU
-#define CAMERA_SD_ATK_WAIT_TRANSFER_TIMEOUT_MS 1000U
-#define CAMERA_SD_ATK_1BIT_READ_TIMEOUT_MS 1000U
-#define CAMERA_SD_ATK_1BIT_WAIT_POLL_LIMIT 100000U
-#define CAMERA_SD_SENSOR_CTRL_REG 0x3008U
-#define CAMERA_SD_SENSOR_STANDBY_VALUE 0x42U
-#define CAMERA_SD_SENSOR_RUN_VALUE 0x02U
-#define CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN 0xFFFFFFFFU
 #define CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG 0x3018U
-#define CAMERA_SD_DVP_CONFLICT_PAD_KEEP_MASK 0x8FU
-
-/* C5G 只读保存 HAL_SD_ReadBlocks 前后的 SDIO 寄存器，不清除任何状态标志。 */
-typedef struct
-{
-    uint32_t sta;
-    uint32_t clkcr;
-    uint32_t dctrl;
-    uint32_t dlen;
-    uint32_t dcount;
-    uint32_t fifocnt;
-    uint32_t power;
-    uint32_t arg;
-    uint32_t cmd;
-    uint32_t resp_cmd;
-    uint32_t resp1;
-    uint32_t resp2;
-    uint32_t resp3;
-    uint32_t resp4;
-} Camera_SDSdioRegSnapshot_t;
-
-typedef struct
-{
-    Camera_SDSdioRegSnapshot_t before_wait;
-    Camera_SDSdioRegSnapshot_t before_read;
-    Camera_SDSdioRegSnapshot_t after_read;
-    uint32_t last_hal_state_before_read;
-    uint32_t last_hal_state_after_read;
-    uint32_t last_hal_error_after_read;
-    uint32_t last_block_read_buffer_inspected;
-    uint32_t last_block_read_buffer_len;
-    uint32_t last_block_read_prefill_pattern;
-    uint32_t last_block_read_buffer_sum512;
-    uint32_t last_block_read_buffer_xor512;
-    uint32_t last_block_read_buffer_nonzero_count512;
-    uint32_t last_block_read_buffer_zero_count512;
-    uint32_t last_block_read_buffer_ff_count512;
-    uint32_t last_block_read_buffer_prefill_count512;
-    uint32_t last_block_read_buffer_changed_count512;
-    uint32_t last_block_read_buffer_changed;
-    uint32_t last_block_read_buffer_all_prefill;
-    uint32_t last_block_read_buffer_all_zero;
-    uint32_t last_block_read_buffer_all_ff;
-    uint32_t last_block_read_buffer_first_changed_index;
-    uint32_t last_block_read_buffer_last_changed_index;
-    uint8_t last_block_read_buffer_first16[16];
-    uint8_t last_block_read_buffer_first32[32];
-    uint8_t last_block_read_buffer_tail16[16];
-} Camera_SDReadRegDiag_t;
-
-static Camera_SDReadRegDiag_t s_read_reg_diag;
-
-/* C5D-2 独立调试状态：不进入 CameraSdStorageStatus_t，也不参与 INIT/EXIT。 */
-typedef struct
-{
-    uint32_t supported;
-    uint32_t requested_width;
-    uint32_t active_width;
-    uint32_t attempt_count;
-    uint32_t success_count;
-    uint32_t error_count;
-    uint32_t last_result;
-    uint32_t last_hal_status;
-    uint32_t last_hal_error;
-    uint32_t last_pre_card_state;
-    uint32_t last_post_card_state;
-    uint32_t last_wait_card_state;
-    uint32_t last_operation_ms;
-    uint32_t last_wait_operation_ms;
-    uint32_t last_wait_timeout_ms;
-} Camera_SDBusWidthDebug_t;
-
-static Camera_SDBusWidthDebug_t s_bus_width_debug = {1U};
-
-static uint32_t Camera_SDStorage_IsTakeoverPreconditionReady(void)
-{
-#if (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U)
-    return ((s_sd_only_virtual_snapshot_status.camera_control_state ==
-             CAMERA_SNAPSHOT_STATE_CAMERA_PAUSED) &&
-            (s_sd_only_virtual_snapshot_status.software_guard_active == 1U) &&
-            (s_sd_only_virtual_snapshot_status.dump_block_required == 1U) &&
-            (s_sd_only_virtual_snapshot_status.snapshot_pause_confirmed == 1U) &&
-            (s_camera_sd_status.snapshot_pause_confirmed == 1U) &&
-            (s_camera_sd_status.conflict_pin_release_ready == 1U))
-        ? 1U
-        : 0U;
-#else
-    return Camera_SnapshotControl_IsTakeoverPreconditionReady();
-#endif
-}
-
-static void Camera_SDStorage_CaptureSdioRegSnapshot(
-    Camera_SDSdioRegSnapshot_t *snapshot)
-{
-    if (snapshot == NULL)
-    {
-        return;
-    }
-
-    snapshot->sta = SDIO->STA;
-    snapshot->clkcr = SDIO->CLKCR;
-    snapshot->dctrl = SDIO->DCTRL;
-    snapshot->dlen = SDIO->DLEN;
-    snapshot->dcount = SDIO->DCOUNT;
-    snapshot->fifocnt = SDIO->FIFOCNT;
-    snapshot->power = SDIO->POWER;
-    snapshot->arg = SDIO->ARG;
-    snapshot->cmd = SDIO->CMD;
-    snapshot->resp_cmd = SDIO->RESPCMD;
-    snapshot->resp1 = SDIO->RESP1;
-    snapshot->resp2 = SDIO->RESP2;
-    snapshot->resp3 = SDIO->RESP3;
-    snapshot->resp4 = SDIO->RESP4;
-}
-
-static uint32_t Camera_SDStorage_IsStaFlagSet(
-    uint32_t sta,
-    uint32_t flag)
-{
-    return ((sta & flag) != 0U) ? 1U : 0U;
-}
-
-static void Camera_SDStorage_AnalyzeReadBuffer(
-    const uint8_t *buffer,
-    uint32_t length)
-{
-    uint32_t index;
-    uint32_t sum = 0U;
-    uint32_t xor_value = 0U;
-    uint32_t nonzero_count = 0U;
-    uint32_t zero_count = 0U;
-    uint32_t ff_count = 0U;
-    uint32_t prefill_count = 0U;
-    uint32_t changed_count = 0U;
-    uint32_t first_changed_index = CAMERA_SD_READ_NO_CHANGED_INDEX;
-    uint32_t last_changed_index = CAMERA_SD_READ_NO_CHANGED_INDEX;
-
-    if ((buffer == NULL) || (length != CAMERA_SD_READ_BUFFER_LEN))
-    {
-        s_read_reg_diag.last_block_read_buffer_inspected = 0U;
-        s_read_reg_diag.last_block_read_buffer_len = 0U;
-        return;
-    }
-
-    for (index = 0U; index < length; ++index)
-    {
-        uint32_t value = buffer[index];
-
-        sum += value;
-        xor_value ^= value;
-        if (value != 0U)
-        {
-            ++nonzero_count;
-        }
-        else
-        {
-            ++zero_count;
-        }
-
-        if (value == 0xFFU)
-        {
-            ++ff_count;
-        }
-
-        if (value == CAMERA_SD_READ_PREFILL_PATTERN)
-        {
-            ++prefill_count;
-        }
-        else
-        {
-            if (changed_count == 0U)
-            {
-                first_changed_index = index;
-            }
-            last_changed_index = index;
-            ++changed_count;
-        }
-    }
-
-    s_read_reg_diag.last_block_read_buffer_inspected = 1U;
-    s_read_reg_diag.last_block_read_buffer_len = length;
-    s_read_reg_diag.last_block_read_prefill_pattern =
-        CAMERA_SD_READ_PREFILL_PATTERN;
-    s_read_reg_diag.last_block_read_buffer_sum512 = sum;
-    s_read_reg_diag.last_block_read_buffer_xor512 = xor_value;
-    s_read_reg_diag.last_block_read_buffer_nonzero_count512 = nonzero_count;
-    s_read_reg_diag.last_block_read_buffer_zero_count512 = zero_count;
-    s_read_reg_diag.last_block_read_buffer_ff_count512 = ff_count;
-    s_read_reg_diag.last_block_read_buffer_prefill_count512 = prefill_count;
-    s_read_reg_diag.last_block_read_buffer_changed_count512 = changed_count;
-    s_read_reg_diag.last_block_read_buffer_changed =
-        (changed_count > 0U) ? 1U : 0U;
-    s_read_reg_diag.last_block_read_buffer_all_prefill =
-        (prefill_count == length) ? 1U : 0U;
-    s_read_reg_diag.last_block_read_buffer_all_zero =
-        (zero_count == length) ? 1U : 0U;
-    s_read_reg_diag.last_block_read_buffer_all_ff =
-        (ff_count == length) ? 1U : 0U;
-    s_read_reg_diag.last_block_read_buffer_first_changed_index =
-        first_changed_index;
-    s_read_reg_diag.last_block_read_buffer_last_changed_index =
-        last_changed_index;
-    memcpy(
-        s_read_reg_diag.last_block_read_buffer_first16,
-        buffer,
-        sizeof(s_read_reg_diag.last_block_read_buffer_first16));
-    memcpy(
-        s_read_reg_diag.last_block_read_buffer_first32,
-        buffer,
-        sizeof(s_read_reg_diag.last_block_read_buffer_first32));
-    memcpy(
-        s_read_reg_diag.last_block_read_buffer_tail16,
-        &buffer[length -
-                sizeof(s_read_reg_diag.last_block_read_buffer_tail16)],
-        sizeof(s_read_reg_diag.last_block_read_buffer_tail16));
-}
+#define CAMERA_SD_DVP_CONFLICT_PAD_KEEP_MASK  0x8FU
+#define CAMERA_SD_REG_VALUE_UNKNOWN           0xFFFFFFFFU
 
 #define CAMERA_SD_CONFLICT_PIN_MASK \
     (GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_11)
@@ -261,8 +17,7 @@ static void Camera_SDStorage_AnalyzeReadBuffer(
     ((3UL << (8U * 2U)) | (3UL << (9U * 2U)) | (3UL << (11U * 2U)))
 #define CAMERA_SD_CONFLICT_AF_MODE \
     ((2UL << (8U * 2U)) | (2UL << (9U * 2U)) | (2UL << (11U * 2U)))
-#define CAMERA_SD_CONFLICT_SPEED_VERY_HIGH \
-    CAMERA_SD_CONFLICT_MODE_MASK
+#define CAMERA_SD_CONFLICT_SPEED_VERY_HIGH CAMERA_SD_CONFLICT_MODE_MASK
 #define CAMERA_SD_CONFLICT_PULLUP \
     ((1UL << (8U * 2U)) | (1UL << (9U * 2U)) | (1UL << (11U * 2U)))
 #define CAMERA_SD_CONFLICT_AFRH_MASK \
@@ -278,44 +33,36 @@ static void Camera_SDStorage_AnalyzeReadBuffer(
     ((3UL << (8U * 2U)) | (3UL << (9U * 2U)) | \
      (3UL << (10U * 2U)) | (3UL << (11U * 2U)) | \
      (3UL << (12U * 2U)))
-#define CAMERA_SD_FULL_GPIOC_AF_MODE \
-    ((2UL << (8U * 2U)) | (2UL << (9U * 2U)) | \
-     (2UL << (10U * 2U)) | (2UL << (11U * 2U)) | \
-     (2UL << (12U * 2U)))
-#define CAMERA_SD_FULL_GPIOC_PULLUP \
-    ((1UL << (8U * 2U)) | (1UL << (9U * 2U)) | \
-     (1UL << (10U * 2U)) | (1UL << (11U * 2U)) | \
-     (1UL << (12U * 2U)))
-#define CAMERA_SD_FULL_GPIOC_AFRH_MASK \
-    ((0xFUL << 0U) | (0xFUL << 4U) | (0xFUL << 8U) | \
-     (0xFUL << 12U) | (0xFUL << 16U))
-#define CAMERA_SD_FULL_GPIOC_AFRH_AF12 \
-    ((12UL << 0U) | (12UL << 4U) | (12UL << 8U) | \
-     (12UL << 12U) | (12UL << 16U))
-
-#define CAMERA_SD_FULL_GPIOD_PIN_MASK GPIO_PIN_2
+#define CAMERA_SD_FULL_GPIOD_PIN_MASK  GPIO_PIN_2
 #define CAMERA_SD_FULL_GPIOD_MODE_MASK (3UL << (2U * 2U))
-#define CAMERA_SD_FULL_GPIOD_AF_MODE (2UL << (2U * 2U))
-#define CAMERA_SD_FULL_GPIOD_PULLUP (1UL << (2U * 2U))
-#define CAMERA_SD_FULL_GPIOD_AFRL_MASK (0xFUL << 8U)
-#define CAMERA_SD_FULL_GPIOD_AFRL_AF12 (12UL << 8U)
 
 typedef struct
 {
     GPIO_TypeDef *port;
     uint32_t pin_number;
-    const char *name;
-} Camera_SDLineDef_t;
+} CameraSdLine_t;
 
-static const Camera_SDLineDef_t s_camera_sd_lines[] =
+static const CameraSdLine_t s_camera_sd_lines[] =
 {
-    {GPIOC, 8U, "pc8_d0"},
-    {GPIOC, 9U, "pc9_d1"},
-    {GPIOC, 10U, "pc10_d2"},
-    {GPIOC, 11U, "pc11_d3"},
-    {GPIOC, 12U, "pc12_ck"},
-    {GPIOD, 2U, "pd2_cmd"}
+    {GPIOC, 8U},
+    {GPIOC, 9U},
+    {GPIOC, 10U},
+    {GPIOC, 11U},
+    {GPIOC, 12U},
+    {GPIOD, 2U}
 };
+
+static CameraSdStorageStatus_t s_camera_sd_status;
+static SD_HandleTypeDef s_camera_sd_handle;
+static uint32_t s_camera_sd_full_gpio_af12_selected;
+static uint32_t s_camera_sd_clock_enabled;
+
+static void Camera_SDStorage_SetLastError(uint32_t error_code)
+{
+    s_camera_sd_status.last_error_code = error_code;
+    s_camera_sd_status.last_error_text =
+        Camera_SDStorage_ErrorToString(error_code);
+}
 
 static uint32_t Camera_SDStorage_GetPinMode(
     GPIO_TypeDef *port,
@@ -350,59 +97,7 @@ static uint32_t Camera_SDStorage_GetPinAf(
     return (port->AFR[1] >> ((pin_number - 8U) * 4U)) & 0xFU;
 }
 
-static void Camera_SDStorage_CaptureFullGpioReadback(void)
-{
-    s_camera_sd_status.sdio_full_gpio_pc8_mode =
-        Camera_SDStorage_GetPinMode(GPIOC, 8U);
-    s_camera_sd_status.sdio_full_gpio_pc8_pull =
-        Camera_SDStorage_GetPinPull(GPIOC, 8U);
-    s_camera_sd_status.sdio_full_gpio_pc8_speed =
-        Camera_SDStorage_GetPinSpeed(GPIOC, 8U);
-    s_camera_sd_status.sdio_full_gpio_pc8_af =
-        Camera_SDStorage_GetPinAf(GPIOC, 8U);
-    s_camera_sd_status.sdio_full_gpio_pc9_mode =
-        Camera_SDStorage_GetPinMode(GPIOC, 9U);
-    s_camera_sd_status.sdio_full_gpio_pc9_pull =
-        Camera_SDStorage_GetPinPull(GPIOC, 9U);
-    s_camera_sd_status.sdio_full_gpio_pc9_speed =
-        Camera_SDStorage_GetPinSpeed(GPIOC, 9U);
-    s_camera_sd_status.sdio_full_gpio_pc9_af =
-        Camera_SDStorage_GetPinAf(GPIOC, 9U);
-    s_camera_sd_status.sdio_full_gpio_pc10_mode =
-        Camera_SDStorage_GetPinMode(GPIOC, 10U);
-    s_camera_sd_status.sdio_full_gpio_pc10_pull =
-        Camera_SDStorage_GetPinPull(GPIOC, 10U);
-    s_camera_sd_status.sdio_full_gpio_pc10_speed =
-        Camera_SDStorage_GetPinSpeed(GPIOC, 10U);
-    s_camera_sd_status.sdio_full_gpio_pc10_af =
-        Camera_SDStorage_GetPinAf(GPIOC, 10U);
-    s_camera_sd_status.sdio_full_gpio_pc11_mode =
-        Camera_SDStorage_GetPinMode(GPIOC, 11U);
-    s_camera_sd_status.sdio_full_gpio_pc11_pull =
-        Camera_SDStorage_GetPinPull(GPIOC, 11U);
-    s_camera_sd_status.sdio_full_gpio_pc11_speed =
-        Camera_SDStorage_GetPinSpeed(GPIOC, 11U);
-    s_camera_sd_status.sdio_full_gpio_pc11_af =
-        Camera_SDStorage_GetPinAf(GPIOC, 11U);
-    s_camera_sd_status.sdio_full_gpio_pc12_mode =
-        Camera_SDStorage_GetPinMode(GPIOC, 12U);
-    s_camera_sd_status.sdio_full_gpio_pc12_pull =
-        Camera_SDStorage_GetPinPull(GPIOC, 12U);
-    s_camera_sd_status.sdio_full_gpio_pc12_speed =
-        Camera_SDStorage_GetPinSpeed(GPIOC, 12U);
-    s_camera_sd_status.sdio_full_gpio_pc12_af =
-        Camera_SDStorage_GetPinAf(GPIOC, 12U);
-    s_camera_sd_status.sdio_full_gpio_pd2_mode =
-        Camera_SDStorage_GetPinMode(GPIOD, 2U);
-    s_camera_sd_status.sdio_full_gpio_pd2_pull =
-        Camera_SDStorage_GetPinPull(GPIOD, 2U);
-    s_camera_sd_status.sdio_full_gpio_pd2_speed =
-        Camera_SDStorage_GetPinSpeed(GPIOD, 2U);
-    s_camera_sd_status.sdio_full_gpio_pd2_af =
-        Camera_SDStorage_GetPinAf(GPIOD, 2U);
-}
-
-static uint32_t Camera_SDStorage_FindFullGpioErrorPin(void)
+static uint32_t Camera_SDStorage_VerifyFullGpioAf12(void)
 {
     uint32_t index;
 
@@ -410,7 +105,7 @@ static uint32_t Camera_SDStorage_FindFullGpioErrorPin(void)
          index < (sizeof(s_camera_sd_lines) / sizeof(s_camera_sd_lines[0]));
          ++index)
     {
-        const Camera_SDLineDef_t *line = &s_camera_sd_lines[index];
+        const CameraSdLine_t *line = &s_camera_sd_lines[index];
 
         if ((Camera_SDStorage_GetPinMode(line->port, line->pin_number) != 2U) ||
             (Camera_SDStorage_GetPinPull(line->port, line->pin_number) !=
@@ -420,544 +115,17 @@ static uint32_t Camera_SDStorage_FindFullGpioErrorPin(void)
             (Camera_SDStorage_GetPinAf(line->port, line->pin_number) != 12U) ||
             (((line->port->OTYPER >> line->pin_number) & 0x1U) != 0U))
         {
-            return (line->port == GPIOC)
-                ? line->pin_number
-                : CAMERA_SD_FULL_GPIO_ERROR_PIN_PD2;
+            return 0U;
         }
     }
 
-    return CAMERA_SD_FULL_GPIO_ERROR_PIN_NONE;
-}
-
-static uint32_t Camera_SDStorage_GetPinIdr(
-    GPIO_TypeDef *port,
-    uint32_t pin_number)
-{
-    return (port->IDR >> pin_number) & 0x1U;
-}
-
-static void Camera_SDStorage_AnalyzeAtk1BitReadBuffer(
-    const uint8_t *buffer,
-    uint32_t length)
-{
-    uint32_t index;
-    uint32_t sum = 0U;
-    uint32_t xor_value = 0U;
-    uint32_t nonzero_count = 0U;
-    uint32_t zero_count = 0U;
-    uint32_t ff_count = 0U;
-    uint32_t prefill_count = 0U;
-    uint32_t changed_count = 0U;
-    uint32_t first_changed_index = CAMERA_SD_READ_NO_CHANGED_INDEX;
-    uint32_t last_changed_index = CAMERA_SD_READ_NO_CHANGED_INDEX;
-
-    if ((buffer == NULL) || (length != CAMERA_SD_READ_BUFFER_LEN))
-    {
-        s_camera_sd_status.atk_1bit_buffer_inspected = 0U;
-        s_camera_sd_status.atk_1bit_buffer_len = 0U;
-        return;
-    }
-
-    for (index = 0U; index < length; ++index)
-    {
-        uint32_t value = buffer[index];
-
-        sum += value;
-        xor_value ^= value;
-        if (value != 0U)
-        {
-            ++nonzero_count;
-        }
-        else
-        {
-            ++zero_count;
-        }
-
-        if (value == 0xFFU)
-        {
-            ++ff_count;
-        }
-
-        if (value == CAMERA_SD_READ_PREFILL_PATTERN)
-        {
-            ++prefill_count;
-        }
-        else
-        {
-            if (changed_count == 0U)
-            {
-                first_changed_index = index;
-            }
-            last_changed_index = index;
-            ++changed_count;
-        }
-    }
-
-    s_camera_sd_status.atk_1bit_buffer_inspected = 1U;
-    s_camera_sd_status.atk_1bit_buffer_len = length;
-    s_camera_sd_status.atk_1bit_prefill_pattern =
-        CAMERA_SD_READ_PREFILL_PATTERN;
-    s_camera_sd_status.atk_1bit_buffer_sum512 = sum;
-    s_camera_sd_status.atk_1bit_buffer_xor512 = xor_value;
-    s_camera_sd_status.atk_1bit_buffer_nonzero_count512 = nonzero_count;
-    s_camera_sd_status.atk_1bit_buffer_zero_count512 = zero_count;
-    s_camera_sd_status.atk_1bit_buffer_ff_count512 = ff_count;
-    s_camera_sd_status.atk_1bit_buffer_prefill_count512 = prefill_count;
-    s_camera_sd_status.atk_1bit_buffer_changed_count512 = changed_count;
-    s_camera_sd_status.atk_1bit_buffer_changed =
-        (changed_count > 0U) ? 1U : 0U;
-    s_camera_sd_status.atk_1bit_buffer_all_prefill =
-        (prefill_count == length) ? 1U : 0U;
-    s_camera_sd_status.atk_1bit_buffer_all_zero =
-        (zero_count == length) ? 1U : 0U;
-    s_camera_sd_status.atk_1bit_buffer_all_ff =
-        (ff_count == length) ? 1U : 0U;
-    s_camera_sd_status.atk_1bit_buffer_first_changed_index =
-        first_changed_index;
-    s_camera_sd_status.atk_1bit_buffer_last_changed_index =
-        last_changed_index;
-    memcpy(s_camera_sd_status.atk_1bit_buffer_first16, buffer,
-           sizeof(s_camera_sd_status.atk_1bit_buffer_first16));
-    memcpy(s_camera_sd_status.atk_1bit_buffer_first32, buffer,
-           sizeof(s_camera_sd_status.atk_1bit_buffer_first32));
-    memcpy(s_camera_sd_status.atk_1bit_buffer_tail16,
-           &buffer[length - sizeof(s_camera_sd_status.atk_1bit_buffer_tail16)],
-           sizeof(s_camera_sd_status.atk_1bit_buffer_tail16));
-}
-
-static uint32_t Camera_SDStorage_ApplyAtkOfficialSdioGpioConfig(void)
-{
-    GPIO_InitTypeDef gpio = {0};
-    uint32_t index;
-
-    ++s_camera_sd_status.atk_official_gpio_config_attempt_count;
-
-    __HAL_RCC_GPIOC_CLK_ENABLE();
-    __HAL_RCC_GPIOD_CLK_ENABLE();
-
-    gpio.Pin = CAMERA_SD_FULL_GPIOC_PIN_MASK;
-    gpio.Mode = GPIO_MODE_AF_PP;
-    gpio.Pull = GPIO_PULLUP;
-    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
-    gpio.Alternate = GPIO_AF12_SDIO;
-    HAL_GPIO_Init(GPIOC, &gpio);
-
-    gpio.Pin = CAMERA_SD_FULL_GPIOD_PIN_MASK;
-    HAL_GPIO_Init(GPIOD, &gpio);
-
-    for (index = 0U;
-         index < (sizeof(s_camera_sd_lines) / sizeof(s_camera_sd_lines[0]));
-         ++index)
-    {
-        const Camera_SDLineDef_t *line = &s_camera_sd_lines[index];
-
-        if ((Camera_SDStorage_GetPinMode(line->port, line->pin_number) != 2U) ||
-            (Camera_SDStorage_GetPinPull(line->port, line->pin_number) !=
-             GPIO_PULLUP) ||
-            (Camera_SDStorage_GetPinSpeed(line->port, line->pin_number) !=
-             GPIO_SPEED_FREQ_HIGH) ||
-            (Camera_SDStorage_GetPinAf(line->port, line->pin_number) != 12U))
-        {
-            return CAMERA_SD_ERR_SDIO_FULL_GPIO_SWITCH_FAILED;
-        }
-    }
-
-    ++s_camera_sd_status.atk_official_gpio_config_success_count;
-    return CAMERA_SD_OK;
-}
-
-static void Camera_SDStorage_PrepareSdHandle(void)
-{
-    hsd_snapshot.Instance = SDIO;
-    hsd_snapshot.Init.ClockEdge = SDIO_CLOCK_EDGE_RISING;
-    hsd_snapshot.Init.ClockBypass = SDIO_CLOCK_BYPASS_DISABLE;
-    hsd_snapshot.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
-    /* Stage 11C-4 保持 1-bit 初始化，不切换 4-bit，也不配置宽总线。 */
-    hsd_snapshot.Init.BusWide = SDIO_BUS_WIDE_1B;
-    hsd_snapshot.Init.HardwareFlowControl =
-        SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
-    /* 编译期固定分频用于 C5J 单固件、单参数的 SDIO 采样稳定性对照。 */
-    hsd_snapshot.Init.ClockDiv = CAMERA_SD_INIT_CLOCK_DIV;
-    /* Stage 11C-4 读取 HAL 层卡信息，不接 FATFS，不执行块读写。 */
-}
-
-static void Camera_SDStorage_PrepareAtkOfficialSdHandle(void)
-{
-    hsd_snapshot.Instance = SDIO;
-    hsd_snapshot.Init.ClockEdge = SDIO_CLOCK_EDGE_RISING;
-    hsd_snapshot.Init.ClockBypass = SDIO_CLOCK_BYPASS_DISABLE;
-    hsd_snapshot.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
-    hsd_snapshot.Init.BusWide = SDIO_BUS_WIDE_1B;
-    hsd_snapshot.Init.HardwareFlowControl =
-        SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
-    hsd_snapshot.Init.ClockDiv = 1U;
-}
-
-static void Camera_SDStorage_EnableSdioClock(void)
-{
-    __HAL_RCC_SDIO_CLK_ENABLE();
-    s_camera_sd_status.sdio_clock_enabled = 1U;
-}
-
-static void Camera_SDStorage_DisableSdioClock(void)
-{
-    __HAL_RCC_SDIO_CLK_DISABLE();
-    s_camera_sd_status.sdio_clock_enabled = 0U;
-}
-
-static uint32_t Camera_SDStorage_ReadCardInfo(void)
-{
-    uint32_t start_ms;
-    HAL_StatusTypeDef hal_status;
-    HAL_SD_CardInfoTypeDef card_info;
-
-    if ((s_camera_sd_status.is_initialized != 1U) ||
-        (s_camera_sd_status.sdio_ready != 1U))
-    {
-        /* HAL_SD_Init 未成功时禁止访问卡信息，也不增加实际读取计数。 */
-        return CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED;
-    }
-
-    ++s_camera_sd_status.card_info_read_attempt_count;
-    start_ms = HAL_GetTick();
-    hal_status = HAL_SD_GetCardInfo(&hsd_snapshot, &card_info);
-    s_camera_sd_status.last_card_info_operation_ms =
-        HAL_GetTick() - start_ms;
-    s_camera_sd_status.last_card_info_status = (uint32_t)hal_status;
-    s_camera_sd_status.last_card_info_error = HAL_SD_GetError(&hsd_snapshot);
-    s_camera_sd_status.last_hal_sd_state =
-        (uint32_t)HAL_SD_GetState(&hsd_snapshot);
-    s_camera_sd_status.last_hal_sd_card_state =
-        (uint32_t)HAL_SD_GetCardState(&hsd_snapshot);
-
-    if (hal_status == HAL_OK)
-    {
-        ++s_camera_sd_status.card_info_read_success_count;
-        s_camera_sd_status.card_type = card_info.CardType;
-        s_camera_sd_status.card_version = card_info.CardVersion;
-        s_camera_sd_status.card_class = card_info.Class;
-        s_camera_sd_status.card_rel_card_add = card_info.RelCardAdd;
-        s_camera_sd_status.card_block_nbr = card_info.BlockNbr;
-        s_camera_sd_status.card_block_size = card_info.BlockSize;
-        s_camera_sd_status.card_log_block_nbr = card_info.LogBlockNbr;
-        s_camera_sd_status.card_log_block_size = card_info.LogBlockSize;
-        s_camera_sd_status.last_error_code = CAMERA_SD_OK;
-        return CAMERA_SD_OK;
-    }
-
-    ++s_camera_sd_status.card_info_read_error_count;
-    s_camera_sd_status.last_error_code = CAMERA_SD_ERR_CARD_INFO_FAILED;
-    return CAMERA_SD_ERR_CARD_INFO_FAILED;
-}
-
-static uint32_t Camera_SDStorage_WaitCardTransfer(uint32_t timeout_ms)
-{
-    uint32_t start_ms;
-    uint32_t elapsed_ms;
-    HAL_SD_CardStateTypeDef card_state;
-
-    if ((s_camera_sd_status.is_initialized != 1U) ||
-        (s_camera_sd_status.sdio_ready != 1U))
-    {
-        s_camera_sd_status.last_error_code =
-            CAMERA_SD_ERR_BLOCK_READ_NOT_READY;
-        return CAMERA_SD_ERR_BLOCK_READ_NOT_READY;
-    }
-
-    ++s_camera_sd_status.block_read_wait_transfer_attempt_count;
-    s_camera_sd_status.last_block_read_wait_timeout_ms = timeout_ms;
-    start_ms = HAL_GetTick();
-
-    for (;;)
-    {
-        card_state = HAL_SD_GetCardState(&hsd_snapshot);
-        s_camera_sd_status.last_block_read_wait_card_state =
-            (uint32_t)card_state;
-        elapsed_ms = HAL_GetTick() - start_ms;
-
-        if (card_state == HAL_SD_CARD_TRANSFER)
-        {
-            ++s_camera_sd_status.block_read_wait_transfer_success_count;
-            s_camera_sd_status.last_block_read_wait_operation_ms = elapsed_ms;
-            return CAMERA_SD_OK;
-        }
-
-        if (elapsed_ms >= timeout_ms)
-        {
-            ++s_camera_sd_status.block_read_wait_transfer_error_count;
-            s_camera_sd_status.last_block_read_wait_operation_ms = elapsed_ms;
-            s_camera_sd_status.last_error_code =
-                CAMERA_SD_ERR_BLOCK_READ_NOT_READY;
-            return CAMERA_SD_ERR_BLOCK_READ_NOT_READY;
-        }
-
-        HAL_Delay(1U);
-    }
-}
-
-/* 与 C5R 读前等待使用相同的 polling 方式，但只更新独立调试状态。 */
-static uint32_t Camera_SDStorage_DebugWaitCardTransfer(uint32_t timeout_ms)
-{
-    uint32_t start_ms = HAL_GetTick();
-    uint32_t elapsed_ms;
-    HAL_SD_CardStateTypeDef card_state = HAL_SD_GetCardState(&hsd_snapshot);
-
-    s_bus_width_debug.last_wait_timeout_ms = timeout_ms;
-    s_bus_width_debug.last_wait_operation_ms = 0U;
-    s_bus_width_debug.last_pre_card_state = (uint32_t)card_state;
-
-    for (;;)
-    {
-        s_bus_width_debug.last_wait_card_state = (uint32_t)card_state;
-        elapsed_ms = HAL_GetTick() - start_ms;
-
-        if (card_state == HAL_SD_CARD_TRANSFER)
-        {
-            s_bus_width_debug.last_wait_operation_ms = elapsed_ms;
-            return CAMERA_SD_OK;
-        }
-
-        if (elapsed_ms >= timeout_ms)
-        {
-            s_bus_width_debug.last_wait_operation_ms = elapsed_ms;
-            return CAMERA_SD_ERR_BUS_WIDTH_WAIT_TRANSFER_FAILED;
-        }
-
-        HAL_Delay(1U);
-        card_state = HAL_SD_GetCardState(&hsd_snapshot);
-    }
-}
-
-static void Camera_SDStorage_ResetAtkOfficialAttemptStatus(void)
-{
-    s_camera_sd_status.atk_official_hal_init_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.atk_official_hal_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.atk_official_cardinfo_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.atk_official_cardinfo_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.atk_official_widebus_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.atk_official_widebus_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.atk_official_last_card_state = 0U;
-    s_camera_sd_status.atk_official_last_operation_ms = 0U;
-    s_camera_sd_status.atk_official_init_ready = 0U;
-    s_camera_sd_status.atk_official_bus_width_after_init = 0U;
-    s_camera_sd_status.atk_official_bus_width_after_widebus = 0U;
-}
-
-static uint32_t Camera_SDStorage_AtkOfficialWaitCardTransfer(
-    uint32_t timeout_ms)
-{
-    uint32_t start_ms = HAL_GetTick();
-
-    ++s_camera_sd_status.atk_official_wait_transfer_attempt_count;
-
-    for (;;)
-    {
-        HAL_SD_CardStateTypeDef card_state =
-            HAL_SD_GetCardState(&hsd_snapshot);
-
-        s_camera_sd_status.atk_official_last_card_state =
-            (uint32_t)card_state;
-
-        if (card_state == HAL_SD_CARD_TRANSFER)
-        {
-            ++s_camera_sd_status.atk_official_wait_transfer_success_count;
-            return CAMERA_SD_OK;
-        }
-
-        if ((HAL_GetTick() - start_ms) >= timeout_ms)
-        {
-            ++s_camera_sd_status.atk_official_wait_transfer_error_count;
-            return CAMERA_SD_ERR_BUS_WIDTH_WAIT_TRANSFER_FAILED;
-        }
-
-        HAL_Delay(1U);
-    }
-}
-
-static void Camera_SDStorage_ResetAtk1BitAttemptStatus(void)
-{
-    s_camera_sd_status.atk_1bit_hal_init_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.atk_1bit_hal_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.atk_1bit_cardinfo_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.atk_1bit_cardinfo_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.atk_1bit_last_card_state = 0U;
-    s_camera_sd_status.atk_1bit_last_operation_ms = 0U;
-    s_camera_sd_status.atk_1bit_init_ready = 0U;
-    s_camera_sd_status.atk_1bit_bus_width = 1U;
-}
-
-static uint32_t Camera_SDStorage_Atk1BitWaitCardTransfer(
-    uint32_t timeout_ms)
-{
-    uint32_t start_ms = HAL_GetTick();
-
-    ++s_camera_sd_status.atk_1bit_wait_transfer_attempt_count;
-
-    for (;;)
-    {
-        HAL_SD_CardStateTypeDef card_state =
-            HAL_SD_GetCardState(&hsd_snapshot);
-
-        s_camera_sd_status.atk_1bit_last_card_state =
-            (uint32_t)card_state;
-
-        if (card_state == HAL_SD_CARD_TRANSFER)
-        {
-            ++s_camera_sd_status.atk_1bit_wait_transfer_success_count;
-            return CAMERA_SD_OK;
-        }
-
-        if ((HAL_GetTick() - start_ms) >= timeout_ms)
-        {
-            ++s_camera_sd_status.atk_1bit_wait_transfer_error_count;
-            return CAMERA_SD_ERR_BLOCK_READ_NOT_READY;
-        }
-
-        HAL_Delay(1U);
-    }
-}
-
-static uint32_t Camera_SDStorage_ReadBlockTest(uint32_t block_addr)
-{
-    uint8_t *read_buffer = (uint8_t *)s_sd_read_test_words;
-    uint32_t start_ms;
-    uint32_t index;
-    uint32_t sum = 0U;
-    uint32_t xor_value = 0U;
-    uint32_t nonzero_count = 0U;
-    uint32_t wait_result;
-    HAL_StatusTypeDef hal_status;
-
-    if ((s_camera_sd_status.block_read_test_enabled != 1U) ||
-        (s_camera_sd_status.is_initialized != 1U) ||
-        (s_camera_sd_status.sdio_ready != 1U) ||
-        (s_camera_sd_status.card_info_read_success_count == 0U) ||
-        ((s_camera_sd_status.card_log_block_size != 512U) &&
-         (s_camera_sd_status.card_block_size != 512U)) ||
-        ((s_camera_sd_status.card_log_block_nbr != 0U) &&
-         (block_addr >= s_camera_sd_status.card_log_block_nbr)))
-    {
-        /* 前置条件不满足时不访问硬件，也不覆盖上一次成功读取的缓存。 */
-        s_camera_sd_status.last_error_code =
-            CAMERA_SD_ERR_BLOCK_READ_NOT_READY;
-        return CAMERA_SD_ERR_BLOCK_READ_NOT_READY;
-    }
-
-    Camera_SDStorage_CaptureSdioRegSnapshot(&s_read_reg_diag.before_wait);
-    wait_result = Camera_SDStorage_WaitCardTransfer(1000U);
-    if (wait_result != CAMERA_SD_OK)
-    {
-        return wait_result;
-    }
-
-    Camera_SDStorage_CaptureSdioRegSnapshot(&s_read_reg_diag.before_read);
-    s_read_reg_diag.last_hal_state_before_read =
-        (uint32_t)hsd_snapshot.State;
-    s_camera_sd_status.last_block_read_pre_card_state =
-        (uint32_t)HAL_SD_GetCardState(&hsd_snapshot);
-    memset(
-        read_buffer,
-        CAMERA_SD_READ_PREFILL_PATTERN,
-        sizeof(s_sd_read_test_words));
-    ++s_camera_sd_status.block_read_attempt_count;
-    s_camera_sd_status.last_block_read_addr = block_addr;
-    s_camera_sd_status.last_block_read_count = 1U;
-
-    start_ms = HAL_GetTick();
-    hal_status = HAL_SD_ReadBlocks(
-        &hsd_snapshot,
-        read_buffer,
-        block_addr,
-        1U,
-        1000U);
-    Camera_SDStorage_CaptureSdioRegSnapshot(&s_read_reg_diag.after_read);
-    s_read_reg_diag.last_hal_state_after_read =
-        (uint32_t)hsd_snapshot.State;
-    s_read_reg_diag.last_hal_error_after_read =
-        HAL_SD_GetError(&hsd_snapshot);
-    Camera_SDStorage_AnalyzeReadBuffer(
-        (const uint8_t *)read_buffer,
-        CAMERA_SD_READ_BUFFER_LEN);
-    s_camera_sd_status.last_block_read_operation_ms =
-        HAL_GetTick() - start_ms;
-    s_camera_sd_status.last_block_read_status = (uint32_t)hal_status;
-    s_camera_sd_status.last_block_read_error =
-        s_read_reg_diag.last_hal_error_after_read;
-    s_camera_sd_status.last_block_read_error_is_data_crc_fail =
-        ((s_camera_sd_status.last_block_read_error &
-          HAL_SD_ERROR_DATA_CRC_FAIL) != 0U) ? 1U : 0U;
-    s_camera_sd_status.last_block_read_error_is_cmd_crc_fail =
-        ((s_camera_sd_status.last_block_read_error &
-          HAL_SD_ERROR_CMD_CRC_FAIL) != 0U) ? 1U : 0U;
-    s_camera_sd_status.last_block_read_error_is_cmd_rsp_timeout =
-        ((s_camera_sd_status.last_block_read_error &
-          HAL_SD_ERROR_CMD_RSP_TIMEOUT) != 0U) ? 1U : 0U;
-    s_camera_sd_status.last_block_read_error_is_data_timeout =
-        ((s_camera_sd_status.last_block_read_error &
-          HAL_SD_ERROR_DATA_TIMEOUT) != 0U) ? 1U : 0U;
-    s_camera_sd_status.last_block_read_error_is_rx_overrun =
-        ((s_camera_sd_status.last_block_read_error &
-          HAL_SD_ERROR_RX_OVERRUN) != 0U) ? 1U : 0U;
-    s_camera_sd_status.last_block_read_error_is_tx_underrun =
-        ((s_camera_sd_status.last_block_read_error &
-          HAL_SD_ERROR_TX_UNDERRUN) != 0U) ? 1U : 0U;
-    s_camera_sd_status.last_hal_sd_state =
-        (uint32_t)HAL_SD_GetState(&hsd_snapshot);
-    s_camera_sd_status.last_block_read_post_card_state =
-        (uint32_t)HAL_SD_GetCardState(&hsd_snapshot);
-    s_camera_sd_status.last_hal_sd_card_state =
-        s_camera_sd_status.last_block_read_post_card_state;
-
-    if (hal_status != HAL_OK)
-    {
-        ++s_camera_sd_status.block_read_error_count;
-        s_camera_sd_status.last_block_read_size = 0U;
-        s_camera_sd_status.last_block_read_sum = 0U;
-        s_camera_sd_status.last_block_read_xor = 0U;
-        s_camera_sd_status.last_block_read_nonzero_count = 0U;
-        memset(
-            s_camera_sd_status.last_block_read_first16,
-            0,
-            sizeof(s_camera_sd_status.last_block_read_first16));
-        s_camera_sd_status.last_error_code =
-            CAMERA_SD_ERR_BLOCK_READ_FAILED;
-        return CAMERA_SD_ERR_BLOCK_READ_FAILED;
-    }
-
-    for (index = 0U; index < sizeof(s_sd_read_test_words); ++index)
-    {
-        uint32_t value = read_buffer[index];
-
-        sum += value;
-        xor_value ^= value;
-        if (value != 0U)
-        {
-            ++nonzero_count;
-        }
-    }
-
-    ++s_camera_sd_status.block_read_success_count;
-    s_camera_sd_status.last_block_read_size =
-        (uint32_t)sizeof(s_sd_read_test_words);
-    s_camera_sd_status.last_block_read_sum = sum;
-    s_camera_sd_status.last_block_read_xor = xor_value;
-    s_camera_sd_status.last_block_read_nonzero_count = nonzero_count;
-    memcpy(
-        s_camera_sd_status.last_block_read_first16,
-        read_buffer,
-        sizeof(s_camera_sd_status.last_block_read_first16));
-    s_camera_sd_status.last_error_code = CAMERA_SD_OK;
-    return CAMERA_SD_OK;
+    return 1U;
 }
 
 static uint32_t Camera_SDStorage_ReleaseConflictPins(void)
 {
-    uint32_t start_ms = HAL_GetTick();
     GPIO_InitTypeDef gpio = {0};
 
-    ++s_camera_sd_status.conflict_pin_release_attempt_count;
-
-    /* 只释放 PC8、PC9、PC11；不配置 PC10、PC12、PD2 或任何 SDIO 复用。 */
     gpio.Pin = CAMERA_SD_CONFLICT_PIN_MASK;
     gpio.Mode = GPIO_MODE_INPUT;
     gpio.Pull = GPIO_NOPULL;
@@ -967,40 +135,22 @@ static uint32_t Camera_SDStorage_ReleaseConflictPins(void)
     if (((GPIOC->MODER & CAMERA_SD_CONFLICT_MODE_MASK) != 0U) ||
         ((GPIOC->PUPDR & CAMERA_SD_CONFLICT_MODE_MASK) != 0U))
     {
-        ++s_camera_sd_status.conflict_pin_release_error_count;
-        s_camera_sd_status.conflict_pins_released = 0U;
-        s_camera_sd_status.last_conflict_pin_error_code =
-            CAMERA_SD_ERR_CONFLICT_PIN_RELEASE_FAILED;
-        s_camera_sd_status.last_conflict_pin_operation_ms =
-            HAL_GetTick() - start_ms;
         return CAMERA_SD_ERR_CONFLICT_PIN_RELEASE_FAILED;
     }
 
-    ++s_camera_sd_status.conflict_pin_release_success_count;
-    s_camera_sd_status.conflict_pins_released = 1U;
-    s_camera_sd_status.last_conflict_pin_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.last_conflict_pin_operation_ms =
-        HAL_GetTick() - start_ms;
     return CAMERA_SD_OK;
 }
 
 static uint32_t Camera_SDStorage_SwitchConflictPinsToSdioAf12(void)
 {
-    uint32_t start_ms = HAL_GetTick();
     GPIO_InitTypeDef gpio = {0};
 
-    ++s_camera_sd_status.sdio_af12_switch_attempt_count;
-
-    /* 只将 PC8、PC9、PC11 切换为 SDIO AF12，不处理 PC10、PC12、PD2。 */
     gpio.Pin = CAMERA_SD_CONFLICT_PIN_MASK;
     gpio.Mode = GPIO_MODE_AF_PP;
     gpio.Pull = GPIO_PULLUP;
     gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     gpio.Alternate = GPIO_AF12_SDIO;
     HAL_GPIO_Init(GPIOC, &gpio);
-
-    /* 进入复用态后已不再是 GPIO 输入释放态。 */
-    s_camera_sd_status.conflict_pins_released = 0U;
 
     if (((GPIOC->MODER & CAMERA_SD_CONFLICT_MODE_MASK) !=
          CAMERA_SD_CONFLICT_AF_MODE) ||
@@ -1012,72 +162,19 @@ static uint32_t Camera_SDStorage_SwitchConflictPinsToSdioAf12(void)
         ((GPIOC->AFR[1] & CAMERA_SD_CONFLICT_AFRH_MASK) !=
          CAMERA_SD_CONFLICT_AFRH_AF12))
     {
-        ++s_camera_sd_status.sdio_af12_switch_error_count;
-        s_camera_sd_status.sdio_af12_selected = 0U;
-        s_camera_sd_status.last_sdio_af12_error_code =
-            CAMERA_SD_ERR_SDIO_AF12_SWITCH_FAILED;
-        s_camera_sd_status.last_sdio_af12_operation_ms =
-            HAL_GetTick() - start_ms;
         return CAMERA_SD_ERR_SDIO_AF12_SWITCH_FAILED;
     }
 
-    ++s_camera_sd_status.sdio_af12_switch_success_count;
-    s_camera_sd_status.sdio_af12_selected = 1U;
-    s_camera_sd_status.last_sdio_af12_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.last_sdio_af12_operation_ms =
-        HAL_GetTick() - start_ms;
-    return CAMERA_SD_OK;
-}
-
-static uint32_t Camera_SDStorage_LeaveSdioAf12ToInput(void)
-{
-    uint32_t start_ms = HAL_GetTick();
-    GPIO_InitTypeDef gpio = {0};
-
-    ++s_camera_sd_status.sdio_af12_restore_attempt_count;
-
-    /* 只将 PC8、PC9、PC11 从 SDIO AF12 退回无上下拉的 GPIO 输入态。 */
-    gpio.Pin = CAMERA_SD_CONFLICT_PIN_MASK;
-    gpio.Mode = GPIO_MODE_INPUT;
-    gpio.Pull = GPIO_NOPULL;
-    gpio.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOC, &gpio);
-
-    if (((GPIOC->MODER & CAMERA_SD_CONFLICT_MODE_MASK) != 0U) ||
-        ((GPIOC->PUPDR & CAMERA_SD_CONFLICT_MODE_MASK) != 0U))
-    {
-        ++s_camera_sd_status.sdio_af12_restore_error_count;
-        s_camera_sd_status.sdio_af12_selected = 0U;
-        s_camera_sd_status.conflict_pins_released = 0U;
-        s_camera_sd_status.last_sdio_af12_error_code =
-            CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED;
-        s_camera_sd_status.last_sdio_af12_operation_ms =
-            HAL_GetTick() - start_ms;
-        return CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED;
-    }
-
-    ++s_camera_sd_status.sdio_af12_restore_success_count;
-    s_camera_sd_status.sdio_af12_selected = 0U;
-    s_camera_sd_status.conflict_pins_released = 1U;
-    s_camera_sd_status.last_sdio_af12_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.last_sdio_af12_operation_ms =
-        HAL_GetTick() - start_ms;
     return CAMERA_SD_OK;
 }
 
 static uint32_t Camera_SDStorage_SwitchFullSdioGpioToAf12(void)
 {
-    uint32_t start_ms = HAL_GetTick();
     GPIO_InitTypeDef gpio = {0};
-    uint32_t error_pin;
 
-    ++s_camera_sd_status.sdio_full_gpio_switch_attempt_count;
-
-    /* SD-only 不经过 DCMI 初始化，因此 full switch 必须自行保证端口时钟可用。 */
     __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_GPIOD_CLK_ENABLE();
 
-    /* 配置 PC8、PC9、PC10、PC11、PC12 为完整 SDIO GPIO 的 AF12。 */
     gpio.Pin = CAMERA_SD_FULL_GPIOC_PIN_MASK;
     gpio.Mode = GPIO_MODE_AF_PP;
     gpio.Pull = GPIO_PULLUP;
@@ -1085,87 +182,48 @@ static uint32_t Camera_SDStorage_SwitchFullSdioGpioToAf12(void)
     gpio.Alternate = GPIO_AF12_SDIO;
     HAL_GPIO_Init(GPIOC, &gpio);
 
-    /* 配置 PD2 为 SDIO_CMD 的 AF12，不访问 SDIO 外设。 */
     gpio.Pin = CAMERA_SD_FULL_GPIOD_PIN_MASK;
     HAL_GPIO_Init(GPIOD, &gpio);
 
-    Camera_SDStorage_CaptureFullGpioReadback();
-    error_pin = Camera_SDStorage_FindFullGpioErrorPin();
-    s_camera_sd_status.sdio_full_gpio_last_error_pin = error_pin;
-
-    if (error_pin != CAMERA_SD_FULL_GPIO_ERROR_PIN_NONE)
+    if (Camera_SDStorage_VerifyFullGpioAf12() == 0U)
     {
-        ++s_camera_sd_status.sdio_full_gpio_switch_error_count;
-        s_camera_sd_status.sdio_full_gpio_af12_selected = 0U;
-        s_camera_sd_status.last_sdio_full_gpio_error_code =
-            CAMERA_SD_ERR_SDIO_FULL_GPIO_SWITCH_FAILED;
-        s_camera_sd_status.last_sdio_full_gpio_operation_ms =
-            HAL_GetTick() - start_ms;
+        s_camera_sd_full_gpio_af12_selected = 0U;
         return CAMERA_SD_ERR_SDIO_FULL_GPIO_SWITCH_FAILED;
     }
 
-    ++s_camera_sd_status.sdio_full_gpio_switch_success_count;
-    s_camera_sd_status.sdio_full_gpio_af12_selected = 1U;
-    s_camera_sd_status.sdio_af12_selected = 1U;
-    s_camera_sd_status.sdio_full_gpio_last_error_pin =
-        CAMERA_SD_FULL_GPIO_ERROR_PIN_NONE;
-    s_camera_sd_status.last_sdio_full_gpio_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.last_sdio_full_gpio_operation_ms =
-        HAL_GetTick() - start_ms;
+    s_camera_sd_full_gpio_af12_selected = 1U;
     return CAMERA_SD_OK;
 }
 
 static uint32_t Camera_SDStorage_LeaveFullSdioGpioToInput(void)
 {
-    uint32_t start_ms = HAL_GetTick();
     GPIO_InitTypeDef gpio = {0};
 
-    ++s_camera_sd_status.sdio_full_gpio_restore_attempt_count;
-
-    /* 将 PC8～PC12 全部退回无上下拉的 GPIO 输入态。 */
     gpio.Pin = CAMERA_SD_FULL_GPIOC_PIN_MASK;
     gpio.Mode = GPIO_MODE_INPUT;
     gpio.Pull = GPIO_NOPULL;
     gpio.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOC, &gpio);
 
-    /* 将 PD2 同步退回 GPIO 输入态。 */
     gpio.Pin = CAMERA_SD_FULL_GPIOD_PIN_MASK;
     HAL_GPIO_Init(GPIOD, &gpio);
 
-    s_camera_sd_status.sdio_af12_selected = 0U;
-    s_camera_sd_status.sdio_full_gpio_af12_selected = 0U;
-
+    s_camera_sd_full_gpio_af12_selected = 0U;
     if (((GPIOC->MODER & CAMERA_SD_FULL_GPIOC_MODE_MASK) != 0U) ||
         ((GPIOC->PUPDR & CAMERA_SD_FULL_GPIOC_MODE_MASK) != 0U) ||
         ((GPIOD->MODER & CAMERA_SD_FULL_GPIOD_MODE_MASK) != 0U) ||
         ((GPIOD->PUPDR & CAMERA_SD_FULL_GPIOD_MODE_MASK) != 0U))
     {
-        ++s_camera_sd_status.sdio_full_gpio_restore_error_count;
-        s_camera_sd_status.conflict_pins_released = 0U;
-        s_camera_sd_status.last_sdio_full_gpio_error_code =
-            CAMERA_SD_ERR_SDIO_FULL_GPIO_RESTORE_FAILED;
-        s_camera_sd_status.last_sdio_full_gpio_operation_ms =
-            HAL_GetTick() - start_ms;
         return CAMERA_SD_ERR_SDIO_FULL_GPIO_RESTORE_FAILED;
     }
 
-    ++s_camera_sd_status.sdio_full_gpio_restore_success_count;
-    s_camera_sd_status.conflict_pins_released = 1U;
-    s_camera_sd_status.last_sdio_full_gpio_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.last_sdio_full_gpio_operation_ms =
-        HAL_GetTick() - start_ms;
     return CAMERA_SD_OK;
 }
 
 static uint32_t Camera_SDStorage_RestoreConflictPins(void)
 {
-    uint32_t start_ms = HAL_GetTick();
     GPIO_InitTypeDef gpio = {0};
 
-    ++s_camera_sd_status.conflict_pin_restore_attempt_count;
-
-    /* 只把 PC8、PC9、PC11 恢复为 DCMI AF13，不重启 DCMI 或 DMA。 */
     gpio.Pin = CAMERA_SD_CONFLICT_PIN_MASK;
     gpio.Mode = GPIO_MODE_AF_PP;
     gpio.Pull = GPIO_NOPULL;
@@ -1182,1528 +240,274 @@ static uint32_t Camera_SDStorage_RestoreConflictPins(void)
         ((GPIOC->AFR[1] & CAMERA_SD_CONFLICT_AFRH_MASK) !=
          CAMERA_SD_CONFLICT_AFRH_AF13))
     {
-        ++s_camera_sd_status.conflict_pin_restore_error_count;
-        s_camera_sd_status.conflict_pins_released = 1U;
-        s_camera_sd_status.last_conflict_pin_error_code =
-            CAMERA_SD_ERR_CONFLICT_PIN_RESTORE_FAILED;
-        s_camera_sd_status.last_conflict_pin_operation_ms =
-            HAL_GetTick() - start_ms;
         return CAMERA_SD_ERR_CONFLICT_PIN_RESTORE_FAILED;
     }
 
-    ++s_camera_sd_status.conflict_pin_restore_success_count;
-    s_camera_sd_status.conflict_pins_released = 0U;
-    s_camera_sd_status.last_conflict_pin_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.last_conflict_pin_operation_ms =
-        HAL_GetTick() - start_ms;
     return CAMERA_SD_OK;
+}
+
+static void Camera_SDStorage_PrepareSdHandle(void)
+{
+    s_camera_sd_handle.Instance = SDIO;
+    s_camera_sd_handle.Init.ClockEdge = SDIO_CLOCK_EDGE_RISING;
+    s_camera_sd_handle.Init.ClockBypass = SDIO_CLOCK_BYPASS_DISABLE;
+    s_camera_sd_handle.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
+    s_camera_sd_handle.Init.BusWide = SDIO_BUS_WIDE_1B;
+    s_camera_sd_handle.Init.HardwareFlowControl =
+        SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
+    s_camera_sd_handle.Init.ClockDiv = CAMERA_SD_INIT_CLOCK_DIV;
+}
+
+static void Camera_SDStorage_EnableSdioClock(void)
+{
+    __HAL_RCC_SDIO_CLK_ENABLE();
+    s_camera_sd_clock_enabled = 1U;
+}
+
+static void Camera_SDStorage_DisableSdioClock(void)
+{
+    __HAL_RCC_SDIO_CLK_DISABLE();
+    s_camera_sd_clock_enabled = 0U;
 }
 
 void Camera_SDStorage_InitState(void)
 {
-    s_atk_official_path_active = 0U;
-    s_atk_official_hal_initialized = 0U;
-    s_atk_1bit_path_active = 0U;
-    s_atk_1bit_hal_initialized = 0U;
-    s_sd_only_virtual_snapshot_status.prepare_attempt_count = 0U;
-    s_sd_only_virtual_snapshot_status.restore_attempt_count = 0U;
-    s_sd_only_virtual_snapshot_status.prepare_success_count = 0U;
-    s_sd_only_virtual_snapshot_status.restore_success_count = 0U;
-    s_sd_only_virtual_snapshot_status.control_error_count = 0U;
-    s_sd_only_virtual_snapshot_status.last_error_code = CAMERA_SNAPSHOT_OK;
-    s_sd_only_virtual_snapshot_status.last_operation_ms = 0U;
-    s_sd_only_virtual_snapshot_status.camera_control_state =
-        CAMERA_SNAPSHOT_STATE_IDLE;
-    s_sd_only_virtual_snapshot_status.software_guard_active = 0U;
-    s_sd_only_virtual_snapshot_status.dump_block_required = 0U;
-    s_sd_only_virtual_snapshot_status.snapshot_pause_confirmed = 0U;
-    s_camera_sd_status.init_attempt_count = 0U;
-    s_camera_sd_status.init_success_count = 0U;
-    s_camera_sd_status.init_error_count = 0U;
-    s_camera_sd_status.last_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.is_initialized = 0U;
+    memset(&s_camera_sd_status, 0, sizeof(s_camera_sd_status));
+    memset(&s_camera_sd_handle, 0, sizeof(s_camera_sd_handle));
+
+    s_camera_sd_status.supported = 1U;
     s_camera_sd_status.takeover_required = 1U;
-    s_camera_sd_status.sdio_ready = 0U;
-    s_camera_sd_status.fatfs_ready = 0U;
-    s_camera_sd_status.sensor_stop_supported = 1U;
-    s_camera_sd_status.sensor_stop_attempt_count = 0U;
-    s_camera_sd_status.sensor_stop_success_count = 0U;
-    s_camera_sd_status.sensor_stop_error_count = 0U;
-    s_camera_sd_status.sensor_restore_attempt_count = 0U;
-    s_camera_sd_status.sensor_restore_success_count = 0U;
-    s_camera_sd_status.sensor_restore_error_count = 0U;
-    s_camera_sd_status.sensor_stopped = 0U;
-    s_camera_sd_status.sensor_stop_last_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.sensor_stop_last_error_text = "OK";
-    s_camera_sd_status.sensor_stop_last_reg_3008_before =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.sensor_stop_last_reg_3008_after =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.sensor_restore_last_reg_3008_before =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.sensor_restore_last_reg_3008_after =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.sensor_stop_last_operation_ms = 0U;
-    s_camera_sd_status.sensor_restore_last_operation_ms = 0U;
     s_camera_sd_status.dvp_mask_supported = 1U;
-    s_camera_sd_status.dvp_mask_attempt_count = 0U;
-    s_camera_sd_status.dvp_mask_success_count = 0U;
-    s_camera_sd_status.dvp_mask_error_count = 0U;
-    s_camera_sd_status.dvp_restore_attempt_count = 0U;
-    s_camera_sd_status.dvp_restore_success_count = 0U;
-    s_camera_sd_status.dvp_restore_error_count = 0U;
-    s_camera_sd_status.dvp_mask_active = 0U;
-    s_camera_sd_status.dvp_mask_last_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.dvp_mask_last_error_text = "OK";
     s_camera_sd_status.dvp_mask_reg_3018_saved =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.dvp_mask_reg_3018_before =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.dvp_mask_reg_3018_written =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.dvp_mask_reg_3018_after =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.dvp_restore_reg_3018_before =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.dvp_restore_reg_3018_written =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.dvp_restore_reg_3018_after =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.dvp_mask_last_operation_ms = 0U;
-    s_camera_sd_status.dvp_restore_last_operation_ms = 0U;
-    s_camera_sd_status.last_operation_ms = 0U;
-    s_camera_sd_status.takeover_state = CAMERA_SD_TAKEOVER_STATE_IDLE;
-    s_camera_sd_status.takeover_enter_attempt_count = 0U;
-    s_camera_sd_status.takeover_exit_attempt_count = 0U;
-    s_camera_sd_status.takeover_enter_success_count = 0U;
-    s_camera_sd_status.takeover_exit_success_count = 0U;
-    s_camera_sd_status.takeover_error_count = 0U;
-    s_camera_sd_status.last_takeover_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.last_takeover_operation_ms = 0U;
-    s_camera_sd_status.takeover_precheck_required = 1U;
-    s_camera_sd_status.takeover_precheck_attempt_count = 0U;
-    s_camera_sd_status.takeover_precheck_success_count = 0U;
-    s_camera_sd_status.takeover_precheck_fail_count = 0U;
-    s_camera_sd_status.snapshot_pause_required = 1U;
-    s_camera_sd_status.snapshot_pause_confirmed = 0U;
-    s_camera_sd_status.conflict_pin_release_ready = 0U;
-    s_camera_sd_status.last_takeover_precheck_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.conflict_pin_release_attempt_count = 0U;
-    s_camera_sd_status.conflict_pin_release_success_count = 0U;
-    s_camera_sd_status.conflict_pin_release_error_count = 0U;
-    s_camera_sd_status.conflict_pin_restore_attempt_count = 0U;
-    s_camera_sd_status.conflict_pin_restore_success_count = 0U;
-    s_camera_sd_status.conflict_pin_restore_error_count = 0U;
-    s_camera_sd_status.conflict_pins_released = 0U;
-    s_camera_sd_status.last_conflict_pin_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.last_conflict_pin_operation_ms = 0U;
-    s_camera_sd_status.sdio_af12_switch_attempt_count = 0U;
-    s_camera_sd_status.sdio_af12_switch_success_count = 0U;
-    s_camera_sd_status.sdio_af12_switch_error_count = 0U;
-    s_camera_sd_status.sdio_af12_restore_attempt_count = 0U;
-    s_camera_sd_status.sdio_af12_restore_success_count = 0U;
-    s_camera_sd_status.sdio_af12_restore_error_count = 0U;
-    s_camera_sd_status.sdio_af12_selected = 0U;
-    s_camera_sd_status.last_sdio_af12_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.last_sdio_af12_operation_ms = 0U;
-    s_camera_sd_status.sdio_full_gpio_switch_attempt_count = 0U;
-    s_camera_sd_status.sdio_full_gpio_switch_success_count = 0U;
-    s_camera_sd_status.sdio_full_gpio_switch_error_count = 0U;
-    s_camera_sd_status.sdio_full_gpio_restore_attempt_count = 0U;
-    s_camera_sd_status.sdio_full_gpio_restore_success_count = 0U;
-    s_camera_sd_status.sdio_full_gpio_restore_error_count = 0U;
-    s_camera_sd_status.sdio_full_gpio_af12_selected = 0U;
-    s_camera_sd_status.last_sdio_full_gpio_error_code = CAMERA_SD_OK;
-    s_camera_sd_status.last_sdio_full_gpio_operation_ms = 0U;
-    s_camera_sd_status.sdio_full_gpio_last_error_pin =
-        CAMERA_SD_FULL_GPIO_ERROR_PIN_NONE;
-    s_camera_sd_status.sdio_full_gpio_pc8_mode = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc8_pull = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc8_speed = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc8_af = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc9_mode = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc9_pull = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc9_speed = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc9_af = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc10_mode = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc10_pull = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc10_speed = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc10_af = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc11_mode = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc11_pull = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc11_speed = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc11_af = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc12_mode = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc12_pull = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc12_speed = 0U;
-    s_camera_sd_status.sdio_full_gpio_pc12_af = 0U;
-    s_camera_sd_status.sdio_full_gpio_pd2_mode = 0U;
-    s_camera_sd_status.sdio_full_gpio_pd2_pull = 0U;
-    s_camera_sd_status.sdio_full_gpio_pd2_speed = 0U;
-    s_camera_sd_status.sdio_full_gpio_pd2_af = 0U;
-    s_camera_sd_status.real_hal_sd_init_enabled = 1U;
-    s_camera_sd_status.sdio_clock_enabled = 0U;
-    s_camera_sd_status.sdio_hal_init_attempt_count = 0U;
-    s_camera_sd_status.sdio_hal_init_success_count = 0U;
-    s_camera_sd_status.sdio_hal_init_error_count = 0U;
-    s_camera_sd_status.sdio_hal_deinit_attempt_count = 0U;
-    s_camera_sd_status.sdio_hal_deinit_success_count = 0U;
-    s_camera_sd_status.sdio_hal_deinit_error_count = 0U;
-    s_camera_sd_status.last_hal_sd_init_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.last_hal_sd_deinit_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.last_hal_sd_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.last_sdio_hal_init_operation_ms = 0U;
-    s_camera_sd_status.last_sdio_hal_deinit_operation_ms = 0U;
-    s_camera_sd_status.card_info_read_attempt_count = 0U;
-    s_camera_sd_status.card_info_read_success_count = 0U;
-    s_camera_sd_status.card_info_read_error_count = 0U;
-    s_camera_sd_status.last_card_info_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.last_card_info_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.last_card_info_operation_ms = 0U;
-    s_camera_sd_status.last_hal_sd_state = 0U;
-    s_camera_sd_status.last_hal_sd_card_state = 0U;
-    s_camera_sd_status.card_type = 0U;
-    s_camera_sd_status.card_version = 0U;
-    s_camera_sd_status.card_class = 0U;
-    s_camera_sd_status.card_rel_card_add = 0U;
-    s_camera_sd_status.card_block_nbr = 0U;
-    s_camera_sd_status.card_block_size = 0U;
-    s_camera_sd_status.card_log_block_nbr = 0U;
-    s_camera_sd_status.card_log_block_size = 0U;
-    s_camera_sd_status.atk_official_init_supported = 1U;
-    s_camera_sd_status.atk_official_init_attempt_count = 0U;
-    s_camera_sd_status.atk_official_init_success_count = 0U;
-    s_camera_sd_status.atk_official_init_error_count = 0U;
-    s_camera_sd_status.atk_official_gpio_config_attempt_count = 0U;
-    s_camera_sd_status.atk_official_gpio_config_success_count = 0U;
-    s_camera_sd_status.atk_official_hal_init_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.atk_official_hal_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.atk_official_cardinfo_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.atk_official_cardinfo_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.atk_official_widebus_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.atk_official_widebus_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.atk_official_wait_transfer_attempt_count = 0U;
-    s_camera_sd_status.atk_official_wait_transfer_success_count = 0U;
-    s_camera_sd_status.atk_official_wait_transfer_error_count = 0U;
-    s_camera_sd_status.atk_official_last_card_state = 0U;
-    s_camera_sd_status.atk_official_last_operation_ms = 0U;
-    s_camera_sd_status.atk_official_init_ready = 0U;
-    s_camera_sd_status.atk_official_clock_div = 1U;
-    s_camera_sd_status.atk_official_bus_width_after_init = 0U;
-    s_camera_sd_status.atk_official_bus_width_after_widebus = 0U;
-    s_camera_sd_status.atk_1bit_supported = 1U;
-    s_camera_sd_status.atk_1bit_init_attempt_count = 0U;
-    s_camera_sd_status.atk_1bit_init_success_count = 0U;
-    s_camera_sd_status.atk_1bit_init_error_count = 0U;
-    s_camera_sd_status.atk_1bit_gpio_config_attempt_count = 0U;
-    s_camera_sd_status.atk_1bit_gpio_config_success_count = 0U;
-    s_camera_sd_status.atk_1bit_hal_init_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.atk_1bit_hal_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.atk_1bit_cardinfo_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.atk_1bit_cardinfo_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.atk_1bit_wait_transfer_attempt_count = 0U;
-    s_camera_sd_status.atk_1bit_wait_transfer_success_count = 0U;
-    s_camera_sd_status.atk_1bit_wait_transfer_error_count = 0U;
-    s_camera_sd_status.atk_1bit_last_card_state = 0U;
-    s_camera_sd_status.atk_1bit_last_operation_ms = 0U;
-    s_camera_sd_status.atk_1bit_init_ready = 0U;
-    s_camera_sd_status.atk_1bit_clock_div = 1U;
-    s_camera_sd_status.atk_1bit_bus_width = 1U;
-    s_camera_sd_status.atk_1bit_read_attempt_count = 0U;
-    s_camera_sd_status.atk_1bit_read_success_count = 0U;
-    s_camera_sd_status.atk_1bit_read_error_count = 0U;
-    s_camera_sd_status.atk_1bit_last_read_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.atk_1bit_last_read_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.atk_1bit_last_read_operation_ms = 0U;
-    s_camera_sd_status.atk_1bit_last_read_addr = 0U;
-    s_camera_sd_status.atk_1bit_last_read_count = 0U;
-    s_camera_sd_status.atk_1bit_last_read_size = 0U;
-    s_camera_sd_status.atk_1bit_read_pre_card_state = 0U;
-    s_camera_sd_status.atk_1bit_read_post_card_state = 0U;
-    s_camera_sd_status.atk_1bit_read_wait_card_state = 0U;
-    s_camera_sd_status.atk_1bit_read_wait_operation_ms = 0U;
-    s_camera_sd_status.atk_1bit_read_wait_timeout_ms = 0U;
-    s_camera_sd_status.atk_1bit_read_error_is_data_crc_fail = 0U;
-    s_camera_sd_status.atk_1bit_read_error_is_cmd_crc_fail = 0U;
-    s_camera_sd_status.atk_1bit_read_error_is_cmd_rsp_timeout = 0U;
-    s_camera_sd_status.atk_1bit_read_error_is_data_timeout = 0U;
-    s_camera_sd_status.atk_1bit_read_error_is_rx_overrun = 0U;
-    s_camera_sd_status.atk_1bit_read_error_is_tx_underrun = 0U;
-    s_camera_sd_status.atk_1bit_buffer_inspected = 0U;
-    s_camera_sd_status.atk_1bit_buffer_len = 0U;
-    s_camera_sd_status.atk_1bit_prefill_pattern =
-        CAMERA_SD_READ_PREFILL_PATTERN;
-    s_camera_sd_status.atk_1bit_buffer_sum512 = 0U;
-    s_camera_sd_status.atk_1bit_buffer_xor512 = 0U;
-    s_camera_sd_status.atk_1bit_buffer_nonzero_count512 = 0U;
-    s_camera_sd_status.atk_1bit_buffer_zero_count512 = 0U;
-    s_camera_sd_status.atk_1bit_buffer_ff_count512 = 0U;
-    s_camera_sd_status.atk_1bit_buffer_prefill_count512 = 0U;
-    s_camera_sd_status.atk_1bit_buffer_changed_count512 = 0U;
-    s_camera_sd_status.atk_1bit_buffer_changed = 0U;
-    s_camera_sd_status.atk_1bit_buffer_all_prefill = 0U;
-    s_camera_sd_status.atk_1bit_buffer_all_zero = 0U;
-    s_camera_sd_status.atk_1bit_buffer_all_ff = 0U;
-    s_camera_sd_status.atk_1bit_buffer_first_changed_index =
-        CAMERA_SD_READ_NO_CHANGED_INDEX;
-    s_camera_sd_status.atk_1bit_buffer_last_changed_index =
-        CAMERA_SD_READ_NO_CHANGED_INDEX;
-    memset(s_camera_sd_status.atk_1bit_buffer_first16, 0,
-           sizeof(s_camera_sd_status.atk_1bit_buffer_first16));
-    memset(s_camera_sd_status.atk_1bit_buffer_first32, 0,
-           sizeof(s_camera_sd_status.atk_1bit_buffer_first32));
-    memset(s_camera_sd_status.atk_1bit_buffer_tail16, 0,
-           sizeof(s_camera_sd_status.atk_1bit_buffer_tail16));
-    s_camera_sd_status.block_read_test_enabled = 1U;
-    s_camera_sd_status.block_read_attempt_count = 0U;
-    s_camera_sd_status.block_read_success_count = 0U;
-    s_camera_sd_status.block_read_error_count = 0U;
-    s_camera_sd_status.last_block_read_status = (uint32_t)HAL_OK;
-    s_camera_sd_status.last_block_read_error = HAL_SD_ERROR_NONE;
-    s_camera_sd_status.last_block_read_operation_ms = 0U;
-    s_camera_sd_status.last_block_read_addr = 0U;
-    s_camera_sd_status.last_block_read_count = 0U;
-    s_camera_sd_status.last_block_read_size = 0U;
-    s_camera_sd_status.last_block_read_sum = 0U;
-    s_camera_sd_status.last_block_read_xor = 0U;
-    s_camera_sd_status.last_block_read_nonzero_count = 0U;
-    memset(
-        s_camera_sd_status.last_block_read_first16,
-        0,
-        sizeof(s_camera_sd_status.last_block_read_first16));
-    s_camera_sd_status.block_read_wait_transfer_attempt_count = 0U;
-    s_camera_sd_status.block_read_wait_transfer_success_count = 0U;
-    s_camera_sd_status.block_read_wait_transfer_error_count = 0U;
-    s_camera_sd_status.last_block_read_pre_card_state = 0U;
-    s_camera_sd_status.last_block_read_post_card_state = 0U;
-    s_camera_sd_status.last_block_read_wait_card_state = 0U;
-    s_camera_sd_status.last_block_read_wait_operation_ms = 0U;
-    s_camera_sd_status.last_block_read_wait_timeout_ms = 0U;
-    s_camera_sd_status.last_block_read_error_is_data_crc_fail = 0U;
-    s_camera_sd_status.last_block_read_error_is_cmd_crc_fail = 0U;
-    s_camera_sd_status.last_block_read_error_is_cmd_rsp_timeout = 0U;
-    s_camera_sd_status.last_block_read_error_is_data_timeout = 0U;
-    s_camera_sd_status.last_block_read_error_is_rx_overrun = 0U;
-    s_camera_sd_status.last_block_read_error_is_tx_underrun = 0U;
-    memset(&s_read_reg_diag, 0, sizeof(s_read_reg_diag));
-    memset(s_atk_1bit_read_buffer_words, CAMERA_SD_READ_PREFILL_PATTERN,
-           sizeof(s_atk_1bit_read_buffer_words));
+        CAMERA_SD_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.dvp_mask_restored = 1U;
+    s_camera_sd_status.last_init_result = CAMERA_SD_ERR_NOT_IMPLEMENTED;
+    s_camera_sd_status.last_io_result = CAMERA_SD_ERR_NOT_IMPLEMENTED;
+    s_camera_sd_full_gpio_af12_selected = 0U;
+    s_camera_sd_clock_enabled = 0U;
+    Camera_SDStorage_SetLastError(CAMERA_SD_OK);
 }
 
 void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status)
 {
-    if (status == NULL)
+    if (status != NULL)
     {
-        return;
+        *status = s_camera_sd_status;
     }
-
-    *status = s_camera_sd_status;
-}
-
-uint32_t Camera_SDStorage_StopSensorOutput(void)
-{
-    uint32_t start_ms = HAL_GetTick();
-    uint32_t result = CAMERA_SD_OK;
-    uint8_t reg_value = 0U;
-
-    ++s_camera_sd_status.sensor_stop_attempt_count;
-    s_camera_sd_status.sensor_stop_last_reg_3008_before =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.sensor_stop_last_reg_3008_after =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-
-    if (Camera_SDStorage_IsTakeoverPreconditionReady() == 0U)
-    {
-        result = CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED;
-    }
-    else if (SCCB_ReadReg(CAMERA_SD_SENSOR_CTRL_REG, &reg_value) != 0U)
-    {
-        result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
-    }
-    else
-    {
-        s_camera_sd_status.sensor_stop_last_reg_3008_before = reg_value;
-
-        if (SCCB_WriteReg(CAMERA_SD_SENSOR_CTRL_REG,
-                          CAMERA_SD_SENSOR_STANDBY_VALUE) != 0U)
-        {
-            result = CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED;
-        }
-        else
-        {
-            HAL_Delay(20U);
-
-            if (SCCB_ReadReg(CAMERA_SD_SENSOR_CTRL_REG, &reg_value) != 0U)
-            {
-                result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
-            }
-            else
-            {
-                s_camera_sd_status.sensor_stop_last_reg_3008_after = reg_value;
-                if (reg_value != CAMERA_SD_SENSOR_STANDBY_VALUE)
-                {
-                    result = CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED;
-                }
-            }
-        }
-    }
-
-    if (result == CAMERA_SD_OK)
-    {
-        ++s_camera_sd_status.sensor_stop_success_count;
-        s_camera_sd_status.sensor_stopped = 1U;
-    }
-    else
-    {
-        ++s_camera_sd_status.sensor_stop_error_count;
-        s_camera_sd_status.sensor_stopped = 0U;
-    }
-
-    s_camera_sd_status.sensor_stop_last_error_code = result;
-    s_camera_sd_status.sensor_stop_last_error_text =
-        Camera_SDStorage_ErrorToString(result);
-    s_camera_sd_status.sensor_stop_last_operation_ms =
-        HAL_GetTick() - start_ms;
-    return result;
-}
-
-uint32_t Camera_SDStorage_RestoreSensorOutput(void)
-{
-    uint32_t start_ms = HAL_GetTick();
-    uint32_t result = CAMERA_SD_OK;
-    uint8_t reg_value = 0U;
-
-    ++s_camera_sd_status.sensor_restore_attempt_count;
-    s_camera_sd_status.sensor_restore_last_reg_3008_before =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.sensor_restore_last_reg_3008_after =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-
-    if ((s_camera_sd_status.takeover_state ==
-         CAMERA_SD_TAKEOVER_STATE_ACTIVE) ||
-        (s_camera_sd_status.sdio_full_gpio_af12_selected != 0U))
-    {
-        result = CAMERA_SD_ERR_TAKEOVER_ALREADY_ACTIVE;
-    }
-    else if (SCCB_ReadReg(CAMERA_SD_SENSOR_CTRL_REG, &reg_value) != 0U)
-    {
-        result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
-    }
-    else
-    {
-        s_camera_sd_status.sensor_restore_last_reg_3008_before = reg_value;
-
-        if (SCCB_WriteReg(CAMERA_SD_SENSOR_CTRL_REG,
-                          CAMERA_SD_SENSOR_RUN_VALUE) != 0U)
-        {
-            result = CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED;
-        }
-        else
-        {
-            HAL_Delay(50U);
-
-            if (SCCB_ReadReg(CAMERA_SD_SENSOR_CTRL_REG, &reg_value) != 0U)
-            {
-                result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
-            }
-            else
-            {
-                s_camera_sd_status.sensor_restore_last_reg_3008_after = reg_value;
-                if (reg_value != CAMERA_SD_SENSOR_RUN_VALUE)
-                {
-                    result = CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED;
-                }
-            }
-        }
-    }
-
-    if (result == CAMERA_SD_OK)
-    {
-        ++s_camera_sd_status.sensor_restore_success_count;
-        s_camera_sd_status.sensor_stopped = 0U;
-    }
-    else
-    {
-        ++s_camera_sd_status.sensor_restore_error_count;
-    }
-
-    s_camera_sd_status.sensor_stop_last_error_code = result;
-    s_camera_sd_status.sensor_stop_last_error_text =
-        Camera_SDStorage_ErrorToString(result);
-    s_camera_sd_status.sensor_restore_last_operation_ms =
-        HAL_GetTick() - start_ms;
-    return result;
 }
 
 uint32_t Camera_SDStorage_StopDvpConflictPads(void)
 {
-    uint32_t start_ms = HAL_GetTick();
     uint32_t result = CAMERA_SD_OK;
-    uint8_t reg_value = 0U;
-    uint8_t masked_value = 0U;
+    uint8_t register_value = 0U;
+    uint8_t masked_value;
 
-    ++s_camera_sd_status.dvp_mask_attempt_count;
-    s_camera_sd_status.dvp_mask_reg_3018_before =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.dvp_mask_reg_3018_written =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.dvp_mask_reg_3018_after =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-
-    if (Camera_SDStorage_IsTakeoverPreconditionReady() == 0U)
+    if (Camera_SnapshotControl_IsTakeoverPreconditionReady() == 0U)
     {
         result = CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED;
     }
-    else if (SCCB_ReadReg(CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
-                          &reg_value) != 0U)
+    else if (SCCB_ReadReg(
+                 CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
+                 &register_value) != 0U)
     {
         result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
     }
     else
     {
-        s_camera_sd_status.dvp_mask_reg_3018_before = reg_value;
         if (s_camera_sd_status.dvp_mask_active == 0U)
         {
-            s_camera_sd_status.dvp_mask_reg_3018_saved = reg_value;
+            s_camera_sd_status.dvp_mask_reg_3018_saved = register_value;
         }
 
-        masked_value =
-            (uint8_t)(reg_value & CAMERA_SD_DVP_CONFLICT_PAD_KEEP_MASK);
-        s_camera_sd_status.dvp_mask_reg_3018_written = masked_value;
-
-        if (SCCB_WriteReg(CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
-                          masked_value) != 0U)
+        masked_value = (uint8_t)(
+            register_value & CAMERA_SD_DVP_CONFLICT_PAD_KEEP_MASK);
+        if (SCCB_WriteReg(
+                CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
+                masked_value) != 0U)
         {
             result = CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED;
         }
         else
         {
             HAL_Delay(5U);
-
-            if (SCCB_ReadReg(CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
-                             &reg_value) != 0U)
+            if (SCCB_ReadReg(
+                    CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
+                    &register_value) != 0U)
             {
                 result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
             }
-            else
+            else if (register_value != masked_value)
             {
-                s_camera_sd_status.dvp_mask_reg_3018_after = reg_value;
-                if (reg_value != masked_value)
-                {
-                    result = CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED;
-                }
+                result = CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED;
             }
         }
     }
 
     if (result == CAMERA_SD_OK)
     {
-        ++s_camera_sd_status.dvp_mask_success_count;
         s_camera_sd_status.dvp_mask_active = 1U;
+        s_camera_sd_status.dvp_mask_restored = 0U;
     }
-    else
-    {
-        ++s_camera_sd_status.dvp_mask_error_count;
-    }
-
-    s_camera_sd_status.dvp_mask_last_error_code = result;
-    s_camera_sd_status.dvp_mask_last_error_text =
-        Camera_SDStorage_ErrorToString(result);
-    s_camera_sd_status.dvp_mask_last_operation_ms =
-        HAL_GetTick() - start_ms;
+    Camera_SDStorage_SetLastError(result);
     return result;
 }
 
 uint32_t Camera_SDStorage_RestoreDvpConflictPads(void)
 {
-    uint32_t start_ms = HAL_GetTick();
     uint32_t result = CAMERA_SD_OK;
-    uint8_t reg_value = 0U;
-    uint8_t saved_value = 0U;
-
-    ++s_camera_sd_status.dvp_restore_attempt_count;
-    s_camera_sd_status.dvp_restore_reg_3018_before =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.dvp_restore_reg_3018_written =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
-    s_camera_sd_status.dvp_restore_reg_3018_after =
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    uint8_t register_value = 0U;
+    uint8_t saved_value;
 
     if (s_camera_sd_status.dvp_mask_reg_3018_saved ==
-        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN)
+        CAMERA_SD_REG_VALUE_UNKNOWN)
     {
         result = CAMERA_SD_ERR_NO_SAVED_3018;
     }
-    else if ((s_camera_sd_status.takeover_state ==
-              CAMERA_SD_TAKEOVER_STATE_ACTIVE) ||
-             (s_camera_sd_status.sdio_full_gpio_af12_selected != 0U))
+    else if (s_camera_sd_full_gpio_af12_selected != 0U)
     {
         result = CAMERA_SD_ERR_TAKEOVER_ALREADY_ACTIVE;
     }
-    else if (SCCB_ReadReg(CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
-                          &reg_value) != 0U)
-    {
-        result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
-    }
     else
     {
-        s_camera_sd_status.dvp_restore_reg_3018_before = reg_value;
         saved_value =
             (uint8_t)s_camera_sd_status.dvp_mask_reg_3018_saved;
-        s_camera_sd_status.dvp_restore_reg_3018_written = saved_value;
-
-        if (SCCB_WriteReg(CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
-                          saved_value) != 0U)
+        if (SCCB_WriteReg(
+                CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
+                saved_value) != 0U)
         {
             result = CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED;
         }
         else
         {
             HAL_Delay(5U);
-
-            if (SCCB_ReadReg(CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
-                             &reg_value) != 0U)
+            if (SCCB_ReadReg(
+                    CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
+                    &register_value) != 0U)
             {
                 result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
             }
-            else
+            else if (register_value != saved_value)
             {
-                s_camera_sd_status.dvp_restore_reg_3018_after = reg_value;
-                if (reg_value != saved_value)
-                {
-                    result = CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED;
-                }
+                result = CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED;
             }
         }
     }
 
     if (result == CAMERA_SD_OK)
     {
-        ++s_camera_sd_status.dvp_restore_success_count;
         s_camera_sd_status.dvp_mask_active = 0U;
+        s_camera_sd_status.dvp_mask_restored = 1U;
     }
-    else
-    {
-        ++s_camera_sd_status.dvp_restore_error_count;
-    }
-
-    s_camera_sd_status.dvp_mask_last_error_code = result;
-    s_camera_sd_status.dvp_mask_last_error_text =
-        Camera_SDStorage_ErrorToString(result);
-    s_camera_sd_status.dvp_restore_last_operation_ms =
-        HAL_GetTick() - start_ms;
+    Camera_SDStorage_SetLastError(result);
     return result;
-}
-
-uint32_t Camera_SDStorage_RequestSdOnlyVirtualPrepare(void)
-{
-    uint32_t start_ms = HAL_GetTick();
-
-    ++s_sd_only_virtual_snapshot_status.prepare_attempt_count;
-    ++s_sd_only_virtual_snapshot_status.prepare_success_count;
-    s_sd_only_virtual_snapshot_status.camera_control_state =
-        CAMERA_SNAPSHOT_STATE_CAMERA_PAUSED;
-    s_sd_only_virtual_snapshot_status.software_guard_active = 1U;
-    s_sd_only_virtual_snapshot_status.dump_block_required = 1U;
-    s_sd_only_virtual_snapshot_status.snapshot_pause_confirmed = 1U;
-    s_sd_only_virtual_snapshot_status.last_error_code = CAMERA_SNAPSHOT_OK;
-    s_sd_only_virtual_snapshot_status.last_operation_ms =
-        HAL_GetTick() - start_ms;
-    s_camera_sd_status.snapshot_pause_confirmed = 1U;
-    s_camera_sd_status.conflict_pin_release_ready = 1U;
-    s_camera_sd_status.last_takeover_precheck_error_code = CAMERA_SD_OK;
-
-    return CAMERA_SNAPSHOT_OK;
-}
-
-uint32_t Camera_SDStorage_RequestSdOnlyVirtualRestore(void)
-{
-    uint32_t start_ms = HAL_GetTick();
-
-    ++s_sd_only_virtual_snapshot_status.restore_attempt_count;
-    s_sd_only_virtual_snapshot_status.camera_control_state =
-        CAMERA_SNAPSHOT_STATE_RESTORE_DEFERRED;
-    s_sd_only_virtual_snapshot_status.software_guard_active = 0U;
-    s_sd_only_virtual_snapshot_status.dump_block_required = 0U;
-    s_sd_only_virtual_snapshot_status.snapshot_pause_confirmed = 0U;
-    s_sd_only_virtual_snapshot_status.last_error_code =
-        CAMERA_SNAPSHOT_ERR_CAMERA_RESTORE_NOT_IMPLEMENTED;
-    s_sd_only_virtual_snapshot_status.last_operation_ms =
-        HAL_GetTick() - start_ms;
-    s_camera_sd_status.snapshot_pause_confirmed = 0U;
-    s_camera_sd_status.conflict_pin_release_ready = 0U;
-
-    return CAMERA_SNAPSHOT_ERR_CAMERA_RESTORE_NOT_IMPLEMENTED;
-}
-
-void Camera_SDStorage_GetSdOnlyVirtualSnapshotStatus(
-    CameraSdOnlyVirtualSnapshotStatus_t *status)
-{
-    if (status == NULL)
-    {
-        return;
-    }
-
-    *status = s_sd_only_virtual_snapshot_status;
-}
-
-uint32_t Camera_SDStorage_DebugSetBusWidth(uint32_t bus_width)
-{
-    uint32_t wait_result;
-    uint32_t hal_bus_width;
-    uint32_t start_ms;
-    HAL_StatusTypeDef hal_status;
-
-    if ((bus_width != 1U) && (bus_width != 4U))
-    {
-        ++s_bus_width_debug.error_count;
-        s_bus_width_debug.last_result = CAMERA_SD_ERR_BUS_WIDTH_INVALID;
-        return CAMERA_SD_ERR_BUS_WIDTH_INVALID;
-    }
-
-    if ((s_camera_sd_status.is_initialized != 1U) ||
-        (s_camera_sd_status.sdio_ready != 1U))
-    {
-        ++s_bus_width_debug.error_count;
-        s_bus_width_debug.last_result = CAMERA_SD_ERR_BUS_WIDTH_NOT_READY;
-        return CAMERA_SD_ERR_BUS_WIDTH_NOT_READY;
-    }
-
-    s_bus_width_debug.requested_width = bus_width;
-    ++s_bus_width_debug.attempt_count;
-
-    wait_result = Camera_SDStorage_DebugWaitCardTransfer(1000U);
-    if (wait_result != CAMERA_SD_OK)
-    {
-        ++s_bus_width_debug.error_count;
-        s_bus_width_debug.last_result =
-            CAMERA_SD_ERR_BUS_WIDTH_WAIT_TRANSFER_FAILED;
-        return CAMERA_SD_ERR_BUS_WIDTH_WAIT_TRANSFER_FAILED;
-    }
-
-    s_bus_width_debug.last_pre_card_state =
-        (uint32_t)HAL_SD_GetCardState(&hsd_snapshot);
-    hal_bus_width = (bus_width == 1U)
-        ? SDIO_BUS_WIDE_1B
-        : SDIO_BUS_WIDE_4B;
-    start_ms = HAL_GetTick();
-    hal_status = HAL_SD_ConfigWideBusOperation(
-        &hsd_snapshot,
-        hal_bus_width);
-    s_bus_width_debug.last_operation_ms = HAL_GetTick() - start_ms;
-    s_bus_width_debug.last_hal_status = (uint32_t)hal_status;
-    s_bus_width_debug.last_hal_error = HAL_SD_GetError(&hsd_snapshot);
-    s_bus_width_debug.last_post_card_state =
-        (uint32_t)HAL_SD_GetCardState(&hsd_snapshot);
-
-    if (hal_status == HAL_OK)
-    {
-        s_bus_width_debug.active_width = bus_width;
-        ++s_bus_width_debug.success_count;
-        s_bus_width_debug.last_result = CAMERA_SD_OK;
-        return CAMERA_SD_OK;
-    }
-
-    ++s_bus_width_debug.error_count;
-    s_bus_width_debug.last_result = CAMERA_SD_ERR_BUS_WIDTH_CONFIG_FAILED;
-    return CAMERA_SD_ERR_BUS_WIDTH_CONFIG_FAILED;
-}
-
-void Camera_SDStorage_DebugPrintBusWidthStatus(void)
-{
-    /* LOG_RAW 使用项目现有 printf 风格串口输出，不依赖 CLI 私有函数。 */
-    LOG_RAW("SD BUSWIDTH:\r\n");
-    LOG_RAW("  supported=%lu\r\n", (unsigned long)s_bus_width_debug.supported);
-    LOG_RAW("  requested_width=%lu\r\n", (unsigned long)s_bus_width_debug.requested_width);
-    LOG_RAW("  active_width=%lu\r\n", (unsigned long)s_bus_width_debug.active_width);
-    LOG_RAW("  attempt_count=%lu\r\n", (unsigned long)s_bus_width_debug.attempt_count);
-    LOG_RAW("  success_count=%lu\r\n", (unsigned long)s_bus_width_debug.success_count);
-    LOG_RAW("  error_count=%lu\r\n", (unsigned long)s_bus_width_debug.error_count);
-    LOG_RAW("  last_result=%lu\r\n", (unsigned long)s_bus_width_debug.last_result);
-    LOG_RAW("  last_hal_status=%lu\r\n", (unsigned long)s_bus_width_debug.last_hal_status);
-    LOG_RAW("  last_hal_error=0x%08lX\r\n", (unsigned long)s_bus_width_debug.last_hal_error);
-    LOG_RAW("  last_pre_card_state=%lu\r\n", (unsigned long)s_bus_width_debug.last_pre_card_state);
-    LOG_RAW("  last_post_card_state=%lu\r\n", (unsigned long)s_bus_width_debug.last_post_card_state);
-    LOG_RAW("  last_wait_card_state=%lu\r\n", (unsigned long)s_bus_width_debug.last_wait_card_state);
-    LOG_RAW("  last_operation_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_operation_ms);
-    LOG_RAW("  last_wait_operation_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_wait_operation_ms);
-    LOG_RAW("  last_wait_timeout_ms=%lu\r\n", (unsigned long)s_bus_width_debug.last_wait_timeout_ms);
-}
-
-static void Camera_SDStorage_PrintReadBufferBytes(
-    const char *field_name,
-    const uint8_t *buffer,
-    uint32_t length)
-{
-    uint32_t index;
-
-    LOG_RAW("  %s=", field_name);
-    for (index = 0U; index < length; ++index)
-    {
-        LOG_RAW(
-            (index == 0U) ? "%02lX" : " %02lX",
-            (unsigned long)buffer[index]);
-    }
-    LOG_RAW("\r\n");
-}
-
-void Camera_SDStorage_DebugPrintReadRegDiag(void)
-{
-    const Camera_SDSdioRegSnapshot_t *before_wait =
-        &s_read_reg_diag.before_wait;
-    const Camera_SDSdioRegSnapshot_t *before_read =
-        &s_read_reg_diag.before_read;
-    const Camera_SDSdioRegSnapshot_t *after_read =
-        &s_read_reg_diag.after_read;
-    uint32_t after_sta = after_read->sta;
-
-    LOG_RAW("  read_before_wait_sta=0x%08lX\r\n", (unsigned long)before_wait->sta);
-    LOG_RAW("  read_before_wait_clkcr=0x%08lX\r\n", (unsigned long)before_wait->clkcr);
-    LOG_RAW("  read_before_wait_dctrl=0x%08lX\r\n", (unsigned long)before_wait->dctrl);
-    LOG_RAW("  read_before_wait_dlen=%lu\r\n", (unsigned long)before_wait->dlen);
-    LOG_RAW("  read_before_wait_dcount=%lu\r\n", (unsigned long)before_wait->dcount);
-    LOG_RAW("  read_before_wait_fifocnt=%lu\r\n", (unsigned long)before_wait->fifocnt);
-    LOG_RAW("  read_before_wait_power=0x%08lX\r\n", (unsigned long)before_wait->power);
-    LOG_RAW("  read_before_wait_arg=0x%08lX\r\n", (unsigned long)before_wait->arg);
-    LOG_RAW("  read_before_wait_cmd=0x%08lX\r\n", (unsigned long)before_wait->cmd);
-    LOG_RAW("  read_before_wait_resp_cmd=0x%08lX\r\n", (unsigned long)before_wait->resp_cmd);
-
-    LOG_RAW("  read_before_read_sta=0x%08lX\r\n", (unsigned long)before_read->sta);
-    LOG_RAW("  read_before_read_clkcr=0x%08lX\r\n", (unsigned long)before_read->clkcr);
-    LOG_RAW("  read_before_read_dctrl=0x%08lX\r\n", (unsigned long)before_read->dctrl);
-    LOG_RAW("  read_before_read_dlen=%lu\r\n", (unsigned long)before_read->dlen);
-    LOG_RAW("  read_before_read_dcount=%lu\r\n", (unsigned long)before_read->dcount);
-    LOG_RAW("  read_before_read_fifocnt=%lu\r\n", (unsigned long)before_read->fifocnt);
-    LOG_RAW("  read_before_read_power=0x%08lX\r\n", (unsigned long)before_read->power);
-    LOG_RAW("  read_before_read_arg=0x%08lX\r\n", (unsigned long)before_read->arg);
-    LOG_RAW("  read_before_read_cmd=0x%08lX\r\n", (unsigned long)before_read->cmd);
-    LOG_RAW("  read_before_read_resp_cmd=0x%08lX\r\n", (unsigned long)before_read->resp_cmd);
-
-    LOG_RAW("  read_after_read_sta=0x%08lX\r\n", (unsigned long)after_read->sta);
-    LOG_RAW("  read_after_read_clkcr=0x%08lX\r\n", (unsigned long)after_read->clkcr);
-    LOG_RAW("  read_after_read_dctrl=0x%08lX\r\n", (unsigned long)after_read->dctrl);
-    LOG_RAW("  read_after_read_dlen=%lu\r\n", (unsigned long)after_read->dlen);
-    LOG_RAW("  read_after_read_dcount=%lu\r\n", (unsigned long)after_read->dcount);
-    LOG_RAW("  read_after_read_fifocnt=%lu\r\n", (unsigned long)after_read->fifocnt);
-    LOG_RAW("  read_after_read_power=0x%08lX\r\n", (unsigned long)after_read->power);
-    LOG_RAW("  read_after_read_arg=0x%08lX\r\n", (unsigned long)after_read->arg);
-    LOG_RAW("  read_after_read_cmd=0x%08lX\r\n", (unsigned long)after_read->cmd);
-    LOG_RAW("  read_after_read_resp_cmd=0x%08lX\r\n", (unsigned long)after_read->resp_cmd);
-    LOG_RAW("  read_after_read_resp1=0x%08lX\r\n", (unsigned long)after_read->resp1);
-    LOG_RAW("  read_after_read_resp2=0x%08lX\r\n", (unsigned long)after_read->resp2);
-    LOG_RAW("  read_after_read_resp3=0x%08lX\r\n", (unsigned long)after_read->resp3);
-    LOG_RAW("  read_after_read_resp4=0x%08lX\r\n", (unsigned long)after_read->resp4);
-    LOG_RAW("  read_hal_state_before_read=%lu\r\n", (unsigned long)s_read_reg_diag.last_hal_state_before_read);
-    LOG_RAW("  read_hal_state_after_read=%lu\r\n", (unsigned long)s_read_reg_diag.last_hal_state_after_read);
-    LOG_RAW("  read_hal_error_after_read=0x%08lX\r\n", (unsigned long)s_read_reg_diag.last_hal_error_after_read);
-    LOG_RAW("  read_after_sta_dcrc_fail=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_DCRCFAIL));
-    LOG_RAW("  read_after_sta_dtimeout=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_DTIMEOUT));
-    LOG_RAW("  read_after_sta_rxoverr=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_RXOVERR));
-    LOG_RAW("  read_after_sta_stbiterr=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_STBITERR));
-    LOG_RAW("  read_after_sta_dataend=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_DATAEND));
-    LOG_RAW("  read_after_sta_dbckend=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_DBCKEND));
-    LOG_RAW("  read_after_sta_cmdsent=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_CMDSENT));
-    LOG_RAW("  read_after_sta_cmdrend=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_CMDREND));
-    LOG_RAW("  read_after_sta_rxact=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_RXACT));
-    LOG_RAW("  read_after_sta_rxdavl=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_RXDAVL));
-    LOG_RAW("  read_after_sta_txunderr=%lu\r\n", (unsigned long)Camera_SDStorage_IsStaFlagSet(after_sta, SDIO_STA_TXUNDERR));
-    LOG_RAW("  last_block_read_buffer_inspected=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_inspected);
-    LOG_RAW("  last_block_read_buffer_len=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_len);
-    LOG_RAW("  last_block_read_prefill_pattern=0x%02lX\r\n", (unsigned long)s_read_reg_diag.last_block_read_prefill_pattern);
-    LOG_RAW("  last_block_read_buffer_sum512=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_sum512);
-    LOG_RAW("  last_block_read_buffer_xor512=0x%02lX\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_xor512);
-    LOG_RAW("  last_block_read_buffer_nonzero_count512=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_nonzero_count512);
-    LOG_RAW("  last_block_read_buffer_zero_count512=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_zero_count512);
-    LOG_RAW("  last_block_read_buffer_ff_count512=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_ff_count512);
-    LOG_RAW("  last_block_read_buffer_prefill_count512=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_prefill_count512);
-    LOG_RAW("  last_block_read_buffer_changed_count512=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_changed_count512);
-    LOG_RAW("  last_block_read_buffer_changed=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_changed);
-    LOG_RAW("  last_block_read_buffer_all_prefill=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_all_prefill);
-    LOG_RAW("  last_block_read_buffer_all_zero=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_all_zero);
-    LOG_RAW("  last_block_read_buffer_all_ff=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_all_ff);
-    LOG_RAW("  last_block_read_buffer_first_changed_index=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_first_changed_index);
-    LOG_RAW("  last_block_read_buffer_last_changed_index=%lu\r\n", (unsigned long)s_read_reg_diag.last_block_read_buffer_last_changed_index);
-    Camera_SDStorage_PrintReadBufferBytes(
-        "last_block_read_buffer_first16",
-        s_read_reg_diag.last_block_read_buffer_first16,
-        sizeof(s_read_reg_diag.last_block_read_buffer_first16));
-    Camera_SDStorage_PrintReadBufferBytes(
-        "last_block_read_buffer_first32",
-        s_read_reg_diag.last_block_read_buffer_first32,
-        sizeof(s_read_reg_diag.last_block_read_buffer_first32));
-    Camera_SDStorage_PrintReadBufferBytes(
-        "last_block_read_buffer_tail16",
-        s_read_reg_diag.last_block_read_buffer_tail16,
-        sizeof(s_read_reg_diag.last_block_read_buffer_tail16));
-}
-
-void Camera_SDStorage_PrintLineState(void)
-{
-    uint32_t index;
-
-    LOG_RAW("SD LINESTATE:\r\n");
-    LOG_RAW("  linestate_readonly=1\r\n");
-    LOG_RAW("  linestate_hal_sd_api_call=0\r\n");
-    LOG_RAW("  is_initialized=%lu\r\n", (unsigned long)s_camera_sd_status.is_initialized);
-    LOG_RAW("  sdio_ready=%lu\r\n", (unsigned long)s_camera_sd_status.sdio_ready);
-    LOG_RAW("  sdio_full_gpio_af12_selected=%lu\r\n", (unsigned long)s_camera_sd_status.sdio_full_gpio_af12_selected);
-    LOG_RAW("  sdio_af12_selected=%lu\r\n", (unsigned long)s_camera_sd_status.sdio_af12_selected);
-    LOG_RAW("  conflict_pins_released=%lu\r\n", (unsigned long)s_camera_sd_status.conflict_pins_released);
-    LOG_RAW("  hal_sd_state=%lu\r\n", (unsigned long)s_camera_sd_status.last_hal_sd_state);
-    LOG_RAW("  hal_sd_card_state=%lu\r\n", (unsigned long)s_camera_sd_status.last_hal_sd_card_state);
-    LOG_RAW("  gpioc_moder=0x%08lX\r\n", (unsigned long)GPIOC->MODER);
-    LOG_RAW("  gpioc_pupdr=0x%08lX\r\n", (unsigned long)GPIOC->PUPDR);
-    LOG_RAW("  gpioc_ospeedr=0x%08lX\r\n", (unsigned long)GPIOC->OSPEEDR);
-    LOG_RAW("  gpioc_afr1=0x%08lX\r\n", (unsigned long)GPIOC->AFR[1]);
-    LOG_RAW("  gpioc_idr=0x%08lX\r\n", (unsigned long)GPIOC->IDR);
-    LOG_RAW("  gpiod_moder=0x%08lX\r\n", (unsigned long)GPIOD->MODER);
-    LOG_RAW("  gpiod_pupdr=0x%08lX\r\n", (unsigned long)GPIOD->PUPDR);
-    LOG_RAW("  gpiod_ospeedr=0x%08lX\r\n", (unsigned long)GPIOD->OSPEEDR);
-    LOG_RAW("  gpiod_afr0=0x%08lX\r\n", (unsigned long)GPIOD->AFR[0]);
-    LOG_RAW("  gpiod_idr=0x%08lX\r\n", (unsigned long)GPIOD->IDR);
-
-    for (index = 0U;
-         index < (sizeof(s_camera_sd_lines) / sizeof(s_camera_sd_lines[0]));
-         ++index)
-    {
-        const Camera_SDLineDef_t *line = &s_camera_sd_lines[index];
-
-        LOG_RAW(
-            "  %s_mode=%lu\r\n",
-            line->name,
-            (unsigned long)Camera_SDStorage_GetPinMode(
-                line->port,
-                line->pin_number));
-        LOG_RAW(
-            "  %s_pull=%lu\r\n",
-            line->name,
-            (unsigned long)Camera_SDStorage_GetPinPull(
-                line->port,
-                line->pin_number));
-        LOG_RAW(
-            "  %s_speed=%lu\r\n",
-            line->name,
-            (unsigned long)Camera_SDStorage_GetPinSpeed(
-                line->port,
-                line->pin_number));
-        LOG_RAW(
-            "  %s_af=%lu\r\n",
-            line->name,
-            (unsigned long)Camera_SDStorage_GetPinAf(
-                line->port,
-                line->pin_number));
-        LOG_RAW(
-            "  %s_idr=%lu\r\n",
-            line->name,
-            (unsigned long)Camera_SDStorage_GetPinIdr(
-                line->port,
-                line->pin_number));
-    }
-}
-
-uint32_t Camera_SDStorage_RequestBlockReadTest(uint32_t block_addr)
-{
-    return Camera_SDStorage_ReadBlockTest(block_addr);
-}
-
-uint32_t Camera_SDStorage_AtkOfficialInit(void)
-{
-    uint32_t start_ms = HAL_GetTick();
-    uint32_t result;
-    HAL_StatusTypeDef hal_status;
-    HAL_SD_CardInfoTypeDef card_info;
-
-    ++s_camera_sd_status.atk_official_init_attempt_count;
-
-    if (s_camera_sd_status.sdio_full_gpio_af12_selected != 1U)
-    {
-        ++s_camera_sd_status.atk_official_init_error_count;
-        s_camera_sd_status.atk_official_init_ready = 0U;
-        s_camera_sd_status.atk_official_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return CAMERA_SD_ERR_NEED_TAKEOVER;
-    }
-
-    if (Camera_SDStorage_IsTakeoverPreconditionReady() == 0U)
-    {
-        ++s_camera_sd_status.atk_official_init_error_count;
-        s_camera_sd_status.atk_official_init_ready = 0U;
-        s_camera_sd_status.atk_official_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED;
-    }
-
-    Camera_SDStorage_ResetAtkOfficialAttemptStatus();
-
-    result = Camera_SDStorage_ApplyAtkOfficialSdioGpioConfig();
-    if (result != CAMERA_SD_OK)
-    {
-        ++s_camera_sd_status.atk_official_init_error_count;
-        s_camera_sd_status.atk_official_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return result;
-    }
-
-    Camera_SDStorage_EnableSdioClock();
-    s_atk_official_path_active = 1U;
-    Camera_SDStorage_PrepareAtkOfficialSdHandle();
-
-    hal_status = HAL_SD_Init(&hsd_snapshot);
-    s_camera_sd_status.atk_official_hal_init_status =
-        (uint32_t)hal_status;
-    s_camera_sd_status.atk_official_hal_error =
-        HAL_SD_GetError(&hsd_snapshot);
-
-    if (hal_status != HAL_OK)
-    {
-        ++s_camera_sd_status.atk_official_init_error_count;
-        s_camera_sd_status.atk_official_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED;
-    }
-
-    s_atk_official_hal_initialized = 1U;
-    s_camera_sd_status.atk_official_bus_width_after_init = 1U;
-
-    hal_status = HAL_SD_GetCardInfo(&hsd_snapshot, &card_info);
-    s_camera_sd_status.atk_official_cardinfo_status =
-        (uint32_t)hal_status;
-    s_camera_sd_status.atk_official_cardinfo_error =
-        HAL_SD_GetError(&hsd_snapshot);
-
-    if (hal_status != HAL_OK)
-    {
-        ++s_camera_sd_status.atk_official_init_error_count;
-        s_camera_sd_status.atk_official_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return CAMERA_SD_ERR_CARD_INFO_FAILED;
-    }
-
-    hal_status = HAL_SD_ConfigWideBusOperation(
-        &hsd_snapshot,
-        SDIO_BUS_WIDE_4B);
-    s_camera_sd_status.atk_official_widebus_status =
-        (uint32_t)hal_status;
-    s_camera_sd_status.atk_official_widebus_error =
-        HAL_SD_GetError(&hsd_snapshot);
-
-    if (hal_status != HAL_OK)
-    {
-        ++s_camera_sd_status.atk_official_init_error_count;
-        s_camera_sd_status.atk_official_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return CAMERA_SD_ERR_BUS_WIDTH_CONFIG_FAILED;
-    }
-
-    s_camera_sd_status.atk_official_bus_width_after_widebus = 4U;
-    result = Camera_SDStorage_AtkOfficialWaitCardTransfer(
-        CAMERA_SD_ATK_WAIT_TRANSFER_TIMEOUT_MS);
-    if (result != CAMERA_SD_OK)
-    {
-        ++s_camera_sd_status.atk_official_init_error_count;
-        s_camera_sd_status.atk_official_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return result;
-    }
-
-    ++s_camera_sd_status.atk_official_init_success_count;
-    s_camera_sd_status.atk_official_init_ready = 1U;
-    s_camera_sd_status.atk_official_last_operation_ms =
-        HAL_GetTick() - start_ms;
-    return CAMERA_SD_OK;
-}
-
-uint32_t Camera_SDStorage_AtkOfficial1BitInit(void)
-{
-    uint32_t start_ms = HAL_GetTick();
-    uint32_t result;
-    HAL_StatusTypeDef hal_status;
-    HAL_SD_CardInfoTypeDef card_info;
-
-    ++s_camera_sd_status.atk_1bit_init_attempt_count;
-
-    if (Camera_SDStorage_IsTakeoverPreconditionReady() == 0U)
-    {
-        ++s_camera_sd_status.atk_1bit_init_error_count;
-        s_camera_sd_status.atk_1bit_init_ready = 0U;
-        s_camera_sd_status.atk_1bit_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED;
-    }
-
-    if (s_camera_sd_status.sdio_full_gpio_af12_selected != 1U)
-    {
-        ++s_camera_sd_status.atk_1bit_init_error_count;
-        s_camera_sd_status.atk_1bit_init_ready = 0U;
-        s_camera_sd_status.atk_1bit_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return CAMERA_SD_ERR_NEED_TAKEOVER;
-    }
-
-    Camera_SDStorage_ResetAtk1BitAttemptStatus();
-    ++s_camera_sd_status.atk_1bit_gpio_config_attempt_count;
-    result = Camera_SDStorage_ApplyAtkOfficialSdioGpioConfig();
-    if (result != CAMERA_SD_OK)
-    {
-        ++s_camera_sd_status.atk_1bit_init_error_count;
-        s_camera_sd_status.atk_1bit_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return result;
-    }
-    ++s_camera_sd_status.atk_1bit_gpio_config_success_count;
-
-    Camera_SDStorage_EnableSdioClock();
-    s_atk_1bit_path_active = 1U;
-    Camera_SDStorage_PrepareAtkOfficialSdHandle();
-
-    hal_status = HAL_SD_Init(&hsd_snapshot);
-    s_camera_sd_status.atk_1bit_hal_init_status = (uint32_t)hal_status;
-    s_camera_sd_status.atk_1bit_hal_error =
-        HAL_SD_GetError(&hsd_snapshot);
-    if (hal_status != HAL_OK)
-    {
-        ++s_camera_sd_status.atk_1bit_init_error_count;
-        s_camera_sd_status.atk_1bit_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED;
-    }
-
-    s_atk_1bit_hal_initialized = 1U;
-    s_camera_sd_status.atk_1bit_bus_width = 1U;
-    hal_status = HAL_SD_GetCardInfo(&hsd_snapshot, &card_info);
-    s_camera_sd_status.atk_1bit_cardinfo_status = (uint32_t)hal_status;
-    s_camera_sd_status.atk_1bit_cardinfo_error =
-        HAL_SD_GetError(&hsd_snapshot);
-    if (hal_status != HAL_OK)
-    {
-        ++s_camera_sd_status.atk_1bit_init_error_count;
-        s_camera_sd_status.atk_1bit_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return CAMERA_SD_ERR_CARD_INFO_FAILED;
-    }
-
-    result = Camera_SDStorage_Atk1BitWaitCardTransfer(
-        CAMERA_SD_ATK_WAIT_TRANSFER_TIMEOUT_MS);
-    if (result != CAMERA_SD_OK)
-    {
-        ++s_camera_sd_status.atk_1bit_init_error_count;
-        s_camera_sd_status.atk_1bit_last_operation_ms =
-            HAL_GetTick() - start_ms;
-        return result;
-    }
-
-    ++s_camera_sd_status.atk_1bit_init_success_count;
-    s_camera_sd_status.atk_1bit_init_ready = 1U;
-    s_camera_sd_status.atk_1bit_last_operation_ms =
-        HAL_GetTick() - start_ms;
-    return CAMERA_SD_OK;
-}
-
-uint32_t Camera_SDStorage_AtkOfficial1BitReadBlock(uint32_t block_addr)
-{
-    uint8_t *read_buffer = (uint8_t *)s_atk_1bit_read_buffer_words;
-    uint32_t operation_start_ms;
-    uint32_t wait_start_ms;
-    uint32_t primask;
-    uint32_t wait_poll_count = 0U;
-    uint32_t wait_success = 0U;
-    uint32_t hal_error;
-    HAL_StatusTypeDef hal_status;
-    HAL_SD_CardStateTypeDef card_state;
-
-    if ((s_camera_sd_status.atk_1bit_init_ready != 1U) ||
-        (s_atk_1bit_hal_initialized != 1U) ||
-        (s_atk_1bit_path_active != 1U))
-    {
-        return CAMERA_SD_ERR_BLOCK_READ_NOT_READY;
-    }
-
-    memset(read_buffer, CAMERA_SD_READ_PREFILL_PATTERN,
-           sizeof(s_atk_1bit_read_buffer_words));
-    ++s_camera_sd_status.atk_1bit_read_attempt_count;
-    s_camera_sd_status.atk_1bit_last_read_addr = block_addr;
-    s_camera_sd_status.atk_1bit_last_read_count = 1U;
-    s_camera_sd_status.atk_1bit_last_read_size = 0U;
-    s_camera_sd_status.atk_1bit_read_wait_timeout_ms =
-        CAMERA_SD_ATK_1BIT_READ_TIMEOUT_MS;
-    s_camera_sd_status.atk_1bit_read_pre_card_state =
-        (uint32_t)HAL_SD_GetCardState(&hsd_snapshot);
-
-    operation_start_ms = HAL_GetTick();
-    primask = __get_PRIMASK();
-    __disable_irq();
-
-    hal_status = HAL_SD_ReadBlocks(
-        &hsd_snapshot,
-        read_buffer,
-        block_addr,
-        1U,
-        CAMERA_SD_ATK_1BIT_READ_TIMEOUT_MS);
-    hal_error = HAL_SD_GetError(&hsd_snapshot);
-    card_state = HAL_SD_GetCardState(&hsd_snapshot);
-    s_camera_sd_status.atk_1bit_read_post_card_state =
-        (uint32_t)card_state;
-    wait_start_ms = HAL_GetTick();
-
-    for (;;)
-    {
-        s_camera_sd_status.atk_1bit_read_wait_card_state =
-            (uint32_t)card_state;
-        if (card_state == HAL_SD_CARD_TRANSFER)
-        {
-            wait_success = 1U;
-            break;
-        }
-
-        if (wait_poll_count >= CAMERA_SD_ATK_1BIT_WAIT_POLL_LIMIT)
-        {
-            break;
-        }
-
-        ++wait_poll_count;
-        card_state = HAL_SD_GetCardState(&hsd_snapshot);
-    }
-
-    if (primask == 0U)
-    {
-        __enable_irq();
-    }
-
-    s_camera_sd_status.atk_1bit_last_read_operation_ms =
-        HAL_GetTick() - operation_start_ms;
-    s_camera_sd_status.atk_1bit_read_wait_operation_ms =
-        HAL_GetTick() - wait_start_ms;
-    s_camera_sd_status.atk_1bit_last_read_status = (uint32_t)hal_status;
-    s_camera_sd_status.atk_1bit_last_read_error = hal_error;
-    s_camera_sd_status.atk_1bit_read_error_is_data_crc_fail =
-        ((hal_error & HAL_SD_ERROR_DATA_CRC_FAIL) != 0U) ? 1U : 0U;
-    s_camera_sd_status.atk_1bit_read_error_is_cmd_crc_fail =
-        ((hal_error & HAL_SD_ERROR_CMD_CRC_FAIL) != 0U) ? 1U : 0U;
-    s_camera_sd_status.atk_1bit_read_error_is_cmd_rsp_timeout =
-        ((hal_error & HAL_SD_ERROR_CMD_RSP_TIMEOUT) != 0U) ? 1U : 0U;
-    s_camera_sd_status.atk_1bit_read_error_is_data_timeout =
-        ((hal_error & HAL_SD_ERROR_DATA_TIMEOUT) != 0U) ? 1U : 0U;
-    s_camera_sd_status.atk_1bit_read_error_is_rx_overrun =
-        ((hal_error & HAL_SD_ERROR_RX_OVERRUN) != 0U) ? 1U : 0U;
-    s_camera_sd_status.atk_1bit_read_error_is_tx_underrun =
-        ((hal_error & HAL_SD_ERROR_TX_UNDERRUN) != 0U) ? 1U : 0U;
-    Camera_SDStorage_AnalyzeAtk1BitReadBuffer(
-        (const uint8_t *)read_buffer,
-        CAMERA_SD_READ_BUFFER_LEN);
-
-    if ((hal_status == HAL_OK) && (wait_success != 0U))
-    {
-        ++s_camera_sd_status.atk_1bit_read_success_count;
-        s_camera_sd_status.atk_1bit_last_read_size =
-            CAMERA_SD_READ_BUFFER_LEN;
-        return CAMERA_SD_OK;
-    }
-
-    ++s_camera_sd_status.atk_1bit_read_error_count;
-    if (hal_status != HAL_OK)
-    {
-        return CAMERA_SD_ERR_BLOCK_READ_FAILED;
-    }
-
-    return CAMERA_SD_ERR_BLOCK_READ_NOT_READY;
-}
-
-uint32_t Camera_SDStorage_RequestInit(void)
-{
-    uint32_t start_ms = HAL_GetTick();
-    uint32_t hal_start_ms;
-    HAL_StatusTypeDef hal_status;
-
-    ++s_camera_sd_status.init_attempt_count;
-
-    if (s_camera_sd_status.sdio_full_gpio_af12_selected != 1U)
-    {
-        /* 完整 SDIO GPIO 未接管时只返回 NEED_TAKEOVER，不调用 HAL_SD_Init。 */
-        s_camera_sd_status.last_error_code = CAMERA_SD_ERR_NEED_TAKEOVER;
-        s_camera_sd_status.is_initialized = 0U;
-        s_camera_sd_status.takeover_required = 1U;
-        s_camera_sd_status.sdio_ready = 0U;
-        s_camera_sd_status.fatfs_ready = 0U;
-        s_camera_sd_status.last_operation_ms = HAL_GetTick() - start_ms;
-        return CAMERA_SD_ERR_NEED_TAKEOVER;
-    }
-
-    Camera_SDStorage_PrepareSdHandle();
-    Camera_SDStorage_EnableSdioClock();
-    ++s_camera_sd_status.sdio_hal_init_attempt_count;
-
-    hal_start_ms = HAL_GetTick();
-    hal_status = HAL_SD_Init(&hsd_snapshot);
-    s_camera_sd_status.last_sdio_hal_init_operation_ms =
-        HAL_GetTick() - hal_start_ms;
-    s_camera_sd_status.last_hal_sd_init_status = (uint32_t)hal_status;
-    s_camera_sd_status.last_hal_sd_error = HAL_SD_GetError(&hsd_snapshot);
-    s_camera_sd_status.fatfs_ready = 0U;
-
-    if (hal_status == HAL_OK)
-    {
-        uint32_t card_info_result;
-
-        ++s_camera_sd_status.init_success_count;
-        ++s_camera_sd_status.sdio_hal_init_success_count;
-        s_camera_sd_status.is_initialized = 1U;
-        s_camera_sd_status.sdio_ready = 1U;
-        card_info_result = Camera_SDStorage_ReadCardInfo();
-        s_camera_sd_status.last_operation_ms = HAL_GetTick() - start_ms;
-        return card_info_result;
-    }
-
-    ++s_camera_sd_status.init_error_count;
-    ++s_camera_sd_status.sdio_hal_init_error_count;
-    s_camera_sd_status.is_initialized = 0U;
-    s_camera_sd_status.sdio_ready = 0U;
-    s_camera_sd_status.last_error_code = CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED;
-    s_camera_sd_status.last_operation_ms = HAL_GetTick() - start_ms;
-    return CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED;
 }
 
 uint32_t Camera_SDStorage_RequestTakeoverEnter(void)
 {
-    uint32_t start_ms = HAL_GetTick();
     uint32_t result;
 
-    ++s_camera_sd_status.takeover_enter_attempt_count;
-    ++s_camera_sd_status.takeover_precheck_attempt_count;
-
-    if (Camera_SDStorage_IsTakeoverPreconditionReady() == 0U)
+    if (Camera_SnapshotControl_IsTakeoverPreconditionReady() == 0U)
     {
-        ++s_camera_sd_status.takeover_precheck_fail_count;
-        s_camera_sd_status.snapshot_pause_confirmed = 0U;
-        s_camera_sd_status.conflict_pin_release_ready = 0U;
-        s_camera_sd_status.conflict_pins_released = 0U;
-        s_camera_sd_status.sdio_af12_selected = 0U;
-        s_camera_sd_status.sdio_full_gpio_af12_selected = 0U;
-        /* 前置条件失败时保持 IDLE，避免误认为接管流程已经开始。 */
-        s_camera_sd_status.takeover_state = CAMERA_SD_TAKEOVER_STATE_IDLE;
-        s_camera_sd_status.last_takeover_error_code =
-            CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED;
-        s_camera_sd_status.last_takeover_precheck_error_code =
-            CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED;
         result = CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED;
     }
     else
     {
-        uint32_t pin_result;
-
-        ++s_camera_sd_status.takeover_precheck_success_count;
-        s_camera_sd_status.snapshot_pause_confirmed = 1U;
-        s_camera_sd_status.conflict_pin_release_ready = 1U;
-        s_camera_sd_status.last_takeover_precheck_error_code = CAMERA_SD_OK;
-
-        pin_result = Camera_SDStorage_ReleaseConflictPins();
-        if (pin_result == CAMERA_SD_OK)
+        result = Camera_SDStorage_ReleaseConflictPins();
+        if (result == CAMERA_SD_OK)
         {
-            uint32_t af12_result;
-
-            af12_result = Camera_SDStorage_SwitchConflictPinsToSdioAf12();
-            if (af12_result == CAMERA_SD_OK)
-            {
-                uint32_t full_gpio_result;
-
-                full_gpio_result =
-                    Camera_SDStorage_SwitchFullSdioGpioToAf12();
-                if (full_gpio_result == CAMERA_SD_OK)
-                {
-                    /* 六个 SDIO GPIO 已切换到 AF12，但不初始化 SDIO 外设。 */
-                    s_camera_sd_status.sdio_af12_selected = 1U;
-                    s_camera_sd_status.sdio_full_gpio_af12_selected = 1U;
-                    s_camera_sd_status.conflict_pins_released = 0U;
-                    s_camera_sd_status.takeover_state =
-                        CAMERA_SD_TAKEOVER_STATE_ENTER_DEFERRED;
-                    s_camera_sd_status.last_conflict_pin_error_code =
-                        CAMERA_SD_OK;
-                    s_camera_sd_status.last_sdio_af12_error_code = CAMERA_SD_OK;
-                    s_camera_sd_status.last_sdio_full_gpio_error_code =
-                        CAMERA_SD_OK;
-                    s_camera_sd_status.last_takeover_precheck_error_code =
-                        CAMERA_SD_OK;
-                    s_camera_sd_status.last_takeover_error_code =
-                        CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
-                    result = CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
-                }
-                else
-                {
-                    ++s_camera_sd_status.takeover_error_count;
-                    s_camera_sd_status.sdio_full_gpio_af12_selected = 0U;
-                    s_camera_sd_status.takeover_state =
-                        CAMERA_SD_TAKEOVER_STATE_ERROR;
-                    s_camera_sd_status.last_takeover_error_code =
-                        CAMERA_SD_ERR_SDIO_FULL_GPIO_SWITCH_FAILED;
-                    result = CAMERA_SD_ERR_SDIO_FULL_GPIO_SWITCH_FAILED;
-                }
-            }
-            else
-            {
-                ++s_camera_sd_status.takeover_error_count;
-                s_camera_sd_status.sdio_af12_selected = 0U;
-                s_camera_sd_status.sdio_full_gpio_af12_selected = 0U;
-                s_camera_sd_status.takeover_state =
-                    CAMERA_SD_TAKEOVER_STATE_ERROR;
-                s_camera_sd_status.last_takeover_error_code =
-                    CAMERA_SD_ERR_SDIO_AF12_SWITCH_FAILED;
-                result = CAMERA_SD_ERR_SDIO_AF12_SWITCH_FAILED;
-            }
+            result = Camera_SDStorage_SwitchConflictPinsToSdioAf12();
         }
-        else
+        if (result == CAMERA_SD_OK)
         {
-            ++s_camera_sd_status.takeover_error_count;
-            s_camera_sd_status.conflict_pin_release_ready = 0U;
-            s_camera_sd_status.sdio_af12_selected = 0U;
-            s_camera_sd_status.sdio_full_gpio_af12_selected = 0U;
-            s_camera_sd_status.takeover_state =
-                CAMERA_SD_TAKEOVER_STATE_ERROR;
-            s_camera_sd_status.last_takeover_error_code =
-                CAMERA_SD_ERR_CONFLICT_PIN_RELEASE_FAILED;
-            result = CAMERA_SD_ERR_CONFLICT_PIN_RELEASE_FAILED;
+            result = Camera_SDStorage_SwitchFullSdioGpioToAf12();
         }
     }
 
-    s_camera_sd_status.last_takeover_operation_ms = HAL_GetTick() - start_ms;
+    Camera_SDStorage_SetLastError(result);
+    return result;
+}
 
+uint32_t Camera_SDStorage_RequestInit(void)
+{
+    HAL_StatusTypeDef hal_status;
+    HAL_SD_CardInfoTypeDef card_info;
+    uint32_t result;
+
+    if (s_camera_sd_full_gpio_af12_selected == 0U)
+    {
+        result = CAMERA_SD_ERR_NEED_TAKEOVER;
+    }
+    else
+    {
+        Camera_SDStorage_PrepareSdHandle();
+        Camera_SDStorage_EnableSdioClock();
+        hal_status = HAL_SD_Init(&s_camera_sd_handle);
+        if (hal_status != HAL_OK)
+        {
+            s_camera_sd_status.card_ready = 0U;
+            s_camera_sd_status.sdio_ready = 0U;
+            result = CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED;
+        }
+        else
+        {
+            s_camera_sd_status.sdio_ready = 1U;
+            hal_status = HAL_SD_GetCardInfo(&s_camera_sd_handle, &card_info);
+            if (hal_status == HAL_OK)
+            {
+                s_camera_sd_status.card_ready = 1U;
+                result = CAMERA_SD_OK;
+            }
+            else
+            {
+                s_camera_sd_status.card_ready = 0U;
+                result = CAMERA_SD_ERR_CARD_INFO_FAILED;
+            }
+        }
+    }
+
+    s_camera_sd_status.fatfs_ready = 0U;
+    s_camera_sd_status.last_init_result = result;
+    Camera_SDStorage_SetLastError(result);
     return result;
 }
 
 uint32_t Camera_SDStorage_RequestTakeoverExit(void)
 {
-    uint32_t start_ms = HAL_GetTick();
-    uint32_t pin_result;
-    uint32_t result;
+    uint32_t result = CAMERA_SD_OK;
+    uint32_t gpio_result;
 
-    ++s_camera_sd_status.takeover_exit_attempt_count;
-    s_camera_sd_status.conflict_pin_release_ready = 0U;
-
-    if (s_atk_1bit_path_active != 0U)
+    if (s_camera_sd_status.sdio_ready != 0U)
     {
-        if ((s_atk_1bit_hal_initialized != 0U) ||
-            (s_camera_sd_status.atk_1bit_init_ready != 0U))
+        if (HAL_SD_DeInit(&s_camera_sd_handle) != HAL_OK)
         {
-            (void)HAL_SD_DeInit(&hsd_snapshot);
+            result = CAMERA_SD_ERR_SDIO_HAL_DEINIT_FAILED;
         }
-
-        if (s_camera_sd_status.sdio_clock_enabled != 0U)
-        {
-            Camera_SDStorage_DisableSdioClock();
-        }
-
-        s_atk_1bit_path_active = 0U;
-        s_atk_1bit_hal_initialized = 0U;
-        s_camera_sd_status.atk_1bit_init_ready = 0U;
     }
-    else if (s_atk_official_path_active != 0U)
+
+    if (s_camera_sd_clock_enabled != 0U)
     {
-        if ((s_atk_official_hal_initialized != 0U) ||
-            (s_camera_sd_status.atk_official_init_ready != 0U))
-        {
-            (void)HAL_SD_DeInit(&hsd_snapshot);
-        }
-
-        if (s_camera_sd_status.sdio_clock_enabled != 0U)
-        {
-            Camera_SDStorage_DisableSdioClock();
-        }
-
-        s_atk_official_path_active = 0U;
-        s_atk_official_hal_initialized = 0U;
-        s_camera_sd_status.atk_official_init_ready = 0U;
-    }
-    else if ((s_camera_sd_status.is_initialized != 0U) ||
-             (s_camera_sd_status.sdio_clock_enabled != 0U))
-    {
-        uint32_t hal_start_ms = HAL_GetTick();
-        HAL_StatusTypeDef hal_status;
-
-        ++s_camera_sd_status.sdio_hal_deinit_attempt_count;
-        hal_status = HAL_SD_DeInit(&hsd_snapshot);
-        s_camera_sd_status.last_sdio_hal_deinit_operation_ms =
-            HAL_GetTick() - hal_start_ms;
-        s_camera_sd_status.last_hal_sd_deinit_status = (uint32_t)hal_status;
-        s_camera_sd_status.last_hal_sd_error = HAL_SD_GetError(&hsd_snapshot);
-
-        if (hal_status == HAL_OK)
-        {
-            ++s_camera_sd_status.sdio_hal_deinit_success_count;
-        }
-        else
-        {
-            ++s_camera_sd_status.sdio_hal_deinit_error_count;
-            s_camera_sd_status.last_error_code =
-                CAMERA_SD_ERR_SDIO_HAL_DEINIT_FAILED;
-        }
-
-        /* 即使 HAL_SD_DeInit 失败，也必须关时钟并继续恢复 GPIO。 */
         Camera_SDStorage_DisableSdioClock();
     }
-
-    s_camera_sd_status.is_initialized = 0U;
+    s_camera_sd_status.card_ready = 0U;
     s_camera_sd_status.sdio_ready = 0U;
     s_camera_sd_status.fatfs_ready = 0U;
 
-    if (s_camera_sd_status.sdio_full_gpio_af12_selected != 0U)
+    if (s_camera_sd_full_gpio_af12_selected != 0U)
     {
-        uint32_t full_gpio_result =
-            Camera_SDStorage_LeaveFullSdioGpioToInput();
-
-        if (full_gpio_result != CAMERA_SD_OK)
+        gpio_result = Camera_SDStorage_LeaveFullSdioGpioToInput();
+        if (gpio_result != CAMERA_SD_OK)
         {
-            ++s_camera_sd_status.takeover_error_count;
-            s_camera_sd_status.sdio_af12_selected = 0U;
-            s_camera_sd_status.takeover_state = CAMERA_SD_TAKEOVER_STATE_ERROR;
-            s_camera_sd_status.last_takeover_error_code =
-                CAMERA_SD_ERR_SDIO_FULL_GPIO_RESTORE_FAILED;
-            s_camera_sd_status.last_takeover_operation_ms =
-                HAL_GetTick() - start_ms;
-            return CAMERA_SD_ERR_SDIO_FULL_GPIO_RESTORE_FAILED;
-        }
-    }
-    else if (s_camera_sd_status.sdio_af12_selected != 0U)
-    {
-        uint32_t af12_result = Camera_SDStorage_LeaveSdioAf12ToInput();
-
-        if (af12_result != CAMERA_SD_OK)
-        {
-            ++s_camera_sd_status.takeover_error_count;
-            s_camera_sd_status.takeover_state = CAMERA_SD_TAKEOVER_STATE_ERROR;
-            s_camera_sd_status.last_takeover_error_code =
-                CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED;
-            s_camera_sd_status.last_takeover_operation_ms =
-                HAL_GetTick() - start_ms;
-            return CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED;
+            result = gpio_result;
         }
     }
 
-    pin_result = Camera_SDStorage_RestoreConflictPins();
-
-    if (pin_result == CAMERA_SD_OK)
+    gpio_result = Camera_SDStorage_RestoreConflictPins();
+    if (gpio_result != CAMERA_SD_OK)
     {
-        s_camera_sd_status.conflict_pins_released = 0U;
-        s_camera_sd_status.sdio_af12_selected = 0U;
-        s_camera_sd_status.sdio_full_gpio_af12_selected = 0U;
-        s_camera_sd_status.snapshot_pause_confirmed = 0U;
-        s_camera_sd_status.takeover_state =
-            CAMERA_SD_TAKEOVER_STATE_EXIT_DEFERRED;
-        s_camera_sd_status.last_conflict_pin_error_code = CAMERA_SD_OK;
-        s_camera_sd_status.last_sdio_af12_error_code = CAMERA_SD_OK;
-        s_camera_sd_status.last_sdio_full_gpio_error_code = CAMERA_SD_OK;
-        s_camera_sd_status.last_takeover_error_code =
-            CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
-        result = CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED;
-    }
-    else
-    {
-        ++s_camera_sd_status.takeover_error_count;
-        s_camera_sd_status.takeover_state = CAMERA_SD_TAKEOVER_STATE_ERROR;
-        s_camera_sd_status.last_takeover_error_code =
-            CAMERA_SD_ERR_CONFLICT_PIN_RESTORE_FAILED;
-        result = CAMERA_SD_ERR_CONFLICT_PIN_RESTORE_FAILED;
+        result = gpio_result;
     }
 
-    s_camera_sd_status.last_takeover_operation_ms = HAL_GetTick() - start_ms;
-
+    Camera_SDStorage_SetLastError(result);
     return result;
 }
 
@@ -2713,122 +517,41 @@ const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
     {
         case CAMERA_SD_OK:
             return "OK";
-
         case CAMERA_SD_ERR_NOT_IMPLEMENTED:
             return "NOT_IMPLEMENTED";
-
-        case CAMERA_SD_ERR_PIN_CONFLICT:
-            return "PIN_CONFLICT";
-
         case CAMERA_SD_ERR_NEED_TAKEOVER:
             return "NEED_TAKEOVER";
-
-        case CAMERA_SD_ERR_INIT_FAILED:
-            return "INIT_FAILED";
-
-        case CAMERA_SD_ERR_INVALID_ARGUMENT:
-            return "INVALID_ARGUMENT";
-
-        case CAMERA_SD_ERR_TAKEOVER_NOT_IMPLEMENTED:
-            return "TAKEOVER_NOT_IMPLEMENTED";
-
-        case CAMERA_SD_ERR_TAKEOVER_NOT_ACTIVE:
-            return "TAKEOVER_NOT_ACTIVE";
-
         case CAMERA_SD_ERR_TAKEOVER_ALREADY_ACTIVE:
             return "TAKEOVER_ALREADY_ACTIVE";
-
         case CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED:
             return "SNAPSHOT_NOT_PAUSED";
-
-        case CAMERA_SD_ERR_TAKEOVER_PRECHECK_FAILED:
-            return "TAKEOVER_PRECHECK_FAILED";
-
         case CAMERA_SD_ERR_CONFLICT_PIN_RELEASE_FAILED:
             return "CONFLICT_PIN_RELEASE_FAILED";
-
         case CAMERA_SD_ERR_CONFLICT_PIN_RESTORE_FAILED:
             return "CONFLICT_PIN_RESTORE_FAILED";
-
-        case CAMERA_SD_ERR_CONFLICT_PIN_NOT_RELEASED:
-            return "CONFLICT_PIN_NOT_RELEASED";
-
         case CAMERA_SD_ERR_SDIO_AF12_SWITCH_FAILED:
             return "SDIO_AF12_SWITCH_FAILED";
-
         case CAMERA_SD_ERR_SDIO_AF12_RESTORE_FAILED:
             return "SDIO_AF12_RESTORE_FAILED";
-
         case CAMERA_SD_ERR_SDIO_FULL_GPIO_SWITCH_FAILED:
             return "SDIO_FULL_GPIO_SWITCH_FAILED";
-
         case CAMERA_SD_ERR_SDIO_FULL_GPIO_RESTORE_FAILED:
             return "SDIO_FULL_GPIO_RESTORE_FAILED";
-
         case CAMERA_SD_ERR_SDIO_HAL_INIT_FAILED:
             return "SDIO_HAL_INIT_FAILED";
-
         case CAMERA_SD_ERR_SDIO_HAL_DEINIT_FAILED:
             return "SDIO_HAL_DEINIT_FAILED";
-
         case CAMERA_SD_ERR_CARD_INFO_FAILED:
             return "CARD_INFO_FAILED";
-
-        case CAMERA_SD_ERR_BLOCK_READ_NOT_READY:
-            return "BLOCK_READ_NOT_READY";
-
-        case CAMERA_SD_ERR_BLOCK_READ_FAILED:
-            return "BLOCK_READ_FAILED";
-
-        case CAMERA_SD_ERR_BUS_WIDTH_NOT_READY:
-            return "BUS_WIDTH_NOT_READY";
-
-        case CAMERA_SD_ERR_BUS_WIDTH_INVALID:
-            return "BUS_WIDTH_INVALID";
-
-        case CAMERA_SD_ERR_BUS_WIDTH_WAIT_TRANSFER_FAILED:
-            return "BUS_WIDTH_WAIT_TRANSFER_FAILED";
-
-        case CAMERA_SD_ERR_BUS_WIDTH_CONFIG_FAILED:
-            return "BUS_WIDTH_CONFIG_FAILED";
-
         case CAMERA_SD_ERR_SENSOR_REG_READ_FAILED:
             return "SENSOR_REG_READ_FAILED";
-
         case CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED:
             return "SENSOR_REG_WRITE_FAILED";
-
         case CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED:
             return "SENSOR_REG_VERIFY_FAILED";
-
         case CAMERA_SD_ERR_NO_SAVED_3018:
             return "NO_SAVED_3018";
-
         default:
             return "UNKNOWN_ERROR";
-    }
-}
-
-const char *Camera_SDStorage_TakeoverStateToString(uint32_t state)
-{
-    switch (state)
-    {
-        case CAMERA_SD_TAKEOVER_STATE_IDLE:
-            return "IDLE";
-
-        case CAMERA_SD_TAKEOVER_STATE_ENTER_DEFERRED:
-            return "ENTER_DEFERRED";
-
-        case CAMERA_SD_TAKEOVER_STATE_ACTIVE:
-            return "ACTIVE";
-
-        case CAMERA_SD_TAKEOVER_STATE_EXIT_DEFERRED:
-            return "EXIT_DEFERRED";
-
-        case CAMERA_SD_TAKEOVER_STATE_ERROR:
-            return "ERROR";
-
-        default:
-            return "UNKNOWN";
     }
 }
