@@ -7958,3 +7958,179 @@ IWDG 心跳年龄阈值宏仍由正式刷新判断直接使用；删除的只是
 ### 5. 范围约束
 
 Stage 12C 不修改 Core、CMake、tools、SD storage、PC dump、UART dispatcher、image request、CRC、OV5640、SCCB 或 LCD 模块；不新增 CLI，不接 FATFS，不写卡，不启用 SDIO DMA/IRQ，不执行硬件测试，也不提交 Git commit。
+
+## Stage 12D 最终 SD snapshot 内部流程接口设计
+
+### 1. 当前阶段结论
+
+- SDIO 硬件本身正常。
+- SD 卡、卡座、`HAL_SD_Init` 和 `HAL_SD_ReadBlocks` polling 路径已经通过 SD-only 与 DVP mask 诊断验证。
+- 正常工程中的 SDIO 读块失败并非 SDIO、SD 卡或卡座故障，根因是 OV5640 DVP 输出持续驱动共享的 PC8/PC9/PC11。
+- 已验证的有效方案是：进入 SD 会话时保存 OV5640 `0x3018` 原值，并将 `0x3018[6:4]` 清零；退出 SD 会话时写回保存值，使 DVP 图像链路恢复。
+- Stage 12 已删除大量 Stage 11C 诊断 CLI。最终工程不再通过串口暴露分步骤 takeover、DVP mask、读块或传感器控制等调试入口，SD snapshot 必须通过完整的内部函数链路执行。
+
+### 2. 最终 CLI 策略
+
+当前最终 CLI 只保留以下 7 个命令：
+
+```text
+HELP
+STATUS
+PROC [BYPASS|GRAY|BINARY]
+THR [0..255]
+RESET
+DUMP
+SD STATUS
+```
+
+- 不恢复 `SD ATK*`。
+- 不恢复 `SD DVPSTOP`、`SD DVPRESTORE`、`SD DVPSTATUS`。
+- 不恢复 `SD READTEST`、`SD READINFO`。
+- 不恢复 `SNAPSHOT PREPARE`、`SNAPSHOT RESTORE`。
+- 后续真正保存图像时，可以增加一个最终用户功能命令，例如 `SD SNAPSHOT`；该命令必须一次触发完整的 begin/save/end 流程，不得把内部步骤重新拆成临时诊断命令。
+
+### 3. 最终 SD snapshot 内部流程
+
+本节只定义接口职责与执行顺序，Stage 12D 不实现代码。
+
+#### `Camera_SDStorage_SnapshotBegin()`
+
+1. 获取 snapshot software guard，拒绝并发 DUMP、binary image request 或另一个 SD snapshot；停止 DCMI，暂停相机输出链路。
+2. 读取并保存 OV5640 `0x3018` 原值，同时记录“原值已保存”状态，供任意失败路径恢复。
+3. 写入 `saved_3018 & 0x8F`，释放 OV5640 D2/D3/D4，即清除 `0x3018[6:4]`。
+4. 将 PC8/PC9/PC10/PC11/PC12/PD2 切换为 SDIO AF12。
+5. 使能 SDIO clock。
+6. 执行 `HAL_SD_Init`，成功后进入 `CARD_READY`。
+7. Stage 13A 在此基础上接入 FATFS `f_mount`，成功后进入 `FATFS_READY`。
+
+`SnapshotBegin()` 只有在上述步骤全部成功后才返回成功；任一步失败均进入统一清理路径，不允许调用方自行拼接恢复步骤。
+
+#### `Camera_SDStorage_SnapshotSave()`
+
+1. Stage 13C 才实现，本阶段仅保留接口设计。
+2. 仅允许在 `FATFS_READY` 状态调用，并从当前 front frame buffer 获取一帧稳定图像。
+3. 创建并写入 SD 卡文件，更新保存结果、文件名和文件大小等最终状态。
+4. 文件写入完成后关闭文件；成功或失败均转入统一 `SnapshotEnd()`/cleanup 流程。
+
+#### `Camera_SDStorage_SnapshotEnd()`
+
+1. 如果文件已打开，执行 FATFS close；如果文件系统已挂载，执行 unmount。相关能力在后续 Stage 13 实现。
+2. 如果 SD HAL 已初始化，执行 `HAL_SD_DeInit`。
+3. 关闭 SDIO clock。
+4. 将 PC8/PC9/PC11 恢复为 DCMI AF13。
+5. 将 PC10/PC12/PD2 恢复为安全输入状态。
+6. 如果 OV5640 `0x3018` 原值已保存，写回保存值。
+7. 解除 snapshot software guard，随后恢复相机链路；内部状态保持 `CLEANUP`，只有恢复完成并回到 `IDLE` 后才重新接受 DUMP、binary image request 或下一次 snapshot。
+
+`SnapshotEnd()` 必须是幂等的尽力清理接口：每个步骤依据已完成标志决定是否执行，即使前一步失败也继续尝试后续恢复。
+
+### 4. 推荐内部状态机
+
+| 状态 | 含义 | 可进入条件 | 退出条件 |
+|---|---|---|---|
+| `IDLE` | 普通图像采集状态 | 上电初始化完成或清理恢复完成 | 请求 SD snapshot 并成功获取 guard |
+| `CAMERA_PAUSED` | DCMI 已暂停 | `SnapshotBegin` 第一步成功 | 成功保存并 mask DVP，或失败转清理 |
+| `DVP_MASKED` | OV5640 D2/D3/D4 已释放 | `0x3018` 保存和写入成功 | SDIO GPIO takeover 成功，或失败转清理 |
+| `SDIO_ACTIVE` | STM32 引脚已切到 SDIO | GPIO AF12 切换与 SDIO clock 使能成功 | SD init 成功，或失败转清理 |
+| `CARD_READY` | SD HAL 初始化成功 | `HAL_SD_Init` 成功 | FATFS mount 成功，或失败转清理 |
+| `FATFS_READY` | 文件系统可用 | `f_mount` 成功 | 开始保存并成功打开文件，或请求正常结束 |
+| `SAVING` | 正在写文件 | 文件打开成功 | 写入完成或失败后转清理 |
+| `CLEANUP` | 正在按统一顺序清理和恢复 | 保存成功、主动结束或任一步失败 | 所有可执行恢复步骤完成 |
+| `ERROR` | 本次流程发生错误 | 任一步失败并记录首个错误 | 强制进入 `CLEANUP`，完成后回到 `IDLE` |
+
+状态迁移由 SD storage 模块内部控制，外部调用方不能直接改写状态，也不能跳过 `SnapshotBegin()` 或 `SnapshotEnd()`。
+
+### 5. 错误清理顺序
+
+无论在哪一步失败，都保留首个业务错误，并按以下顺序尽力清理；清理步骤本身失败时记录清理错误，但不得中断剩余恢复动作：
+
+1. 如果文件已打开，关闭文件。
+2. 如果 FATFS 已挂载，卸载或标记为未挂载。
+3. 如果 SD HAL 已初始化，执行 `HAL_SD_DeInit`。
+4. 关闭 SDIO clock。
+5. 恢复 SDIO GPIO / DCMI GPIO：PC8/PC9/PC11 回到 DCMI AF13，PC10/PC12/PD2 回到安全输入状态。
+6. 如果 OV5640 `0x3018` 已保存，写回原值。
+7. 解除 snapshot software guard。
+8. 恢复图像链路；此时内部状态仍为 `CLEANUP`，不得接受新请求进入半恢复状态。
+9. 更新 SD STATUS `last_error`，并使内部状态最终回到 `IDLE`。
+
+### 6. 必须保留的内部能力
+
+以下能力是最终 SD snapshot 主流程依赖，不得作为旧诊断残留删除：
+
+- OV5640 `0x3018[6:4]` mask 与保存原值恢复能力。
+- SDIO GPIO takeover / restore。
+- SDIO clock enable / disable。
+- `HAL_SD_Init` / `HAL_SD_DeInit`。
+- 后续 FATFS mount / open / write / close。
+- front frame buffer 稳定帧读取能力。
+- DUMP / binary image request 链路及其互斥保护。
+- FreeRTOS / UART DMA / stream buffer / IWDG 健康链路。
+
+### 7. SD STATUS 最终设计
+
+当前阶段继续保持简洁输出：
+
+```text
+SD STATUS:
+  supported=
+  card_ready=
+  takeover_required=
+  sdio_ready=
+  fatfs_ready=
+  last_error=
+  dvp_mask_solution=OV5640_3018_6_4
+```
+
+Stage 13 可随最终保存功能增加：
+
+```text
+last_snapshot_result=
+last_file=
+last_file_size=
+save_count=
+save_error=
+```
+
+这些字段只描述最终功能结果，不得恢复 Stage 11C 的 ATK、READTEST、LINESTATE、GPIO/SDIO 寄存器或逐步骤诊断输出。
+
+### 8. 后续阶段规划
+
+#### Stage 13A：FATFS 最小挂载
+
+- 只实现 `f_mount` 和必要的卸载/错误清理。
+- 不创建或写入文件。
+- `SD STATUS` 显示 `fatfs_ready`。
+
+#### Stage 13B：SD 文件写入固定字符串
+
+- 创建固定测试文件。
+- 写入固定字符串并正确 close。
+- 通过读回或电脑检查验证内容。
+- 仍不保存图像。
+
+#### Stage 13C：保存一帧 RGB565 图像
+
+- 从 front frame buffer 获取 `160x120 RGB565` 图像。
+- 优先保存为 raw；BMP 作为后续增强，不与首次图像保存同时引入。
+- 保存完成后执行统一 cleanup，确保相机链路恢复。
+
+#### Stage 13D：最终 `SD SNAPSHOT` 命令
+
+- 只增加一个最终功能命令，一次触发完整 snapshot 流程。
+- 不恢复或新增分步骤诊断命令。
+
+### 9. 禁止事项
+
+- 不恢复 `SD ATK*`。
+- 不恢复 `SD DVP*`。
+- 不恢复 `SD SENSOR*`。
+- 不恢复 `SD READTEST` / `SD READINFO`。
+- 不恢复 `SD LINESTATE` / `SD BUSWIDTH`。
+- 不恢复 `SNAPSHOT PREPARE` / `SNAPSHOT RESTORE`。
+- 不新增临时 CLI。
+- 不启用 SDIO DMA。
+- 不启用 SDIO IRQ。
+- 不触碰 PWDN / `CAMOFF` / `CAMON`。
+- 不写 OV5640 `0x3008`。
+- 不写 OV5640 `0x4202`。
