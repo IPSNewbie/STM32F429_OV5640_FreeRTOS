@@ -7363,3 +7363,53 @@ SD SENSORSTATUS
 ```
 
 5Q 只实现最小、可回滚的传感器输出控制与寄存器保存/回读，不接 FATFS、不写卡。建议先单独验证方案 B：在 snapshot prepare 已确认 DCMI/DMA 静止后，保存并回读 `0x3008`，执行 software standby，再进入既有 SD takeover 与 ATK1B read；退出 takeover 后恢复 `0x3008`，等待 sensor 稳定，再执行 basic/repeat 图像验证。若 SD 仍不稳定，再保持相同测试顺序单独验证方案 C；方案 A 与方案 D 分别作为 DVP 适用性较弱和恢复风险较高的后续候选。本轮不实现上述 CLI，也不执行任何 OV5640 寄存器写入或硬件测试。
+
+## Stage 11C-5Q OV5640 0x3008 software standby 最小诊断
+
+### 1. 5O / 5P 结论
+
+- 正常 OV5640 环境中 ATK1B block 0 为 1/20 PASS、block 2048 为 2/20 PASS；SD-only 环境中两个 block 合计 40/40 PASS，说明 SDIO 硬件与 1-bit polling read 本身可用，根因优先指向 OV5640 未释放共享 DVP 数据线。
+- 5P 查证确认当前工程与 ATK 初始化表都使用 `0x3008=0x42/0x02`，Linux DVP stream 也使用同一组 software power-down/power-up 值；`0x4202` 属于其 MIPI stream 路径，`0x3017/0x3018` pad output enable 的直接控制风险更高。
+- 因此本轮只验证 `0x3008=0x42/0x02`，不混入其他传感器输出控制寄存器，保持单变量归因。
+
+### 2. 最小诊断命令
+
+- `SD SENSORSTOP`：只允许在 `SNAPSHOT PREPARE` 已完成、相机暂停且 software guard 生效后执行；先保存 `0x3008` 原值，再写 `0x42`，等待 20 ms 并读回确认。
+- `SD SENSORRESTORE`：只在 SD takeover 已退出后写 `0x3008=0x02`，等待 50 ms 并读回确认；不重新初始化 OV5640、不重写初始化表、不启动 DCMI DMA。
+- `SD SENSORSTATUS`：输出 stop/restore 尝试、成功、错误、停止状态、最近错误文本、`0x3008` 写前/写后值和耗时。
+- `SD STATUS` 追加 sensor stop 支持、停止状态、stop/restore 成败计数及最近写后回读值摘要。
+- `SD TAKEOVER ENTER` 不自动执行 SENSORSTOP，`SD TAKEOVER EXIT` 也不自动执行 SENSORRESTORE。
+
+### 3. 推荐测试流程
+
+```text
+SNAPSHOT PREPARE
+SD SENSORSTOP
+SD SENSORSTATUS
+SD TAKEOVER ENTER
+SD ATK1BINIT
+SD ATK1BREAD 0
+SD ATK1BREAD 2048
+SD TAKEOVER EXIT
+SD SENSORRESTORE
+SD SENSORSTATUS
+SNAPSHOT RESTORE
+basic/repeat 图像恢复
+```
+
+连续读稳定性仍应使用既有 ATK1B repeat 测试方法扩大样本；上述两次单块命令先用于确认完整手动流程可执行。
+
+### 4. 结果判断
+
+- 如果 SENSORSTOP 后 ATK1BREAD 明显改善，说明 `0x3008` software standby 能够停止或充分抑制 OV5640 DVP 输出，可继续验证大样本稳定性与恢复闭环。
+- 如果 SENSORSTOP 后仍出现随机 CRC_FAIL，说明仅 `0x3008` standby 不足；下一轮再单独考虑 `0x3017/0x3018` pad output enable，不与本轮寄存器混写。
+- 如果 SENSORRESTORE 后 basic/repeat 图像不能恢复，说明 `0x3008` 方案恢复风险过高，不能直接并入正式 takeover 主流程。
+- 只有 SD 连续读稳定且相机 basic/repeat 恢复均通过，才可认为该候选具备进入后续集成的条件。
+
+### 5. 明确边界
+
+- 禁止 PWDN、CAMOFF、CAMON、PCF8574_P2 路线。
+- 不写 `0x4202`，不写 `0x3017/0x3018`，不写 `0x3008=0x82`。
+- 不修改 ATK1B init/read 参数、SD INIT 主路径或 SD READTEST 主路径。
+- 不接 FATFS、不写卡、不启用 SDIO DMA/IRQ。
+- 本轮不执行硬件测试，也不提交 Git commit。

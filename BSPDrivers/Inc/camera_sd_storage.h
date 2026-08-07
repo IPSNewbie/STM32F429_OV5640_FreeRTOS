@@ -36,6 +36,9 @@
 #define CAMERA_SD_ERR_BUS_WIDTH_INVALID                24U
 #define CAMERA_SD_ERR_BUS_WIDTH_WAIT_TRANSFER_FAILED   25U
 #define CAMERA_SD_ERR_BUS_WIDTH_CONFIG_FAILED          26U
+#define CAMERA_SD_ERR_SENSOR_REG_READ_FAILED            27U
+#define CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED           28U
+#define CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED          29U
 
 /* SDIO 接管状态。Stage 11B-2 只会进入请求延后状态，不会进入 ACTIVE。 */
 #define CAMERA_SD_TAKEOVER_STATE_IDLE             0U
@@ -79,6 +82,22 @@ typedef struct
     uint32_t takeover_required;  /* 是否需要停止 DCMI 并由 SDIO 接管冲突引脚。 */
     uint32_t sdio_ready;         /* SDIO 是否已完成 HAL 初始化。 */
     uint32_t fatfs_ready;        /* FATFS 是否已挂载，Stage 11C-4 固定为 0。 */
+    uint32_t sensor_stop_supported;             /* 是否支持 OV5640 software standby 诊断。 */
+    uint32_t sensor_stop_attempt_count;
+    uint32_t sensor_stop_success_count;
+    uint32_t sensor_stop_error_count;
+    uint32_t sensor_restore_attempt_count;
+    uint32_t sensor_restore_success_count;
+    uint32_t sensor_restore_error_count;
+    uint32_t sensor_stopped;                    /* 0x3008=0x42 已读回确认时为 1。 */
+    uint32_t sensor_stop_last_error_code;       /* 最近一次 SENSORSTOP/RESTORE 错误码。 */
+    const char *sensor_stop_last_error_text;    /* 最近一次 SENSORSTOP/RESTORE 错误文本。 */
+    uint32_t sensor_stop_last_reg_3008_before;
+    uint32_t sensor_stop_last_reg_3008_after;
+    uint32_t sensor_restore_last_reg_3008_before;
+    uint32_t sensor_restore_last_reg_3008_after;
+    uint32_t sensor_stop_last_operation_ms;
+    uint32_t sensor_restore_last_operation_ms;
     uint32_t last_operation_ms;  /* 最近一次 SD INIT 请求的处理耗时。 */
     uint32_t takeover_state;     /* 当前 SDIO 接管状态。 */
     uint32_t takeover_enter_attempt_count; /* 请求进入接管模式的次数。 */
@@ -290,6 +309,12 @@ void Camera_SDStorage_InitState(void);
 
 /* 将当前软件状态复制到调用者提供的结构体。 */
 void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status);
+
+/* SNAPSHOT PREPARE 后将 OV5640 0x3008 写为 0x42 并读回确认。 */
+uint32_t Camera_SDStorage_StopSensorOutput(void);
+
+/* 将 OV5640 0x3008 写为 0x02 并读回确认，不启动 DCMI/DMA。 */
+uint32_t Camera_SDStorage_RestoreSensorOutput(void);
 
 /* SD-only 启动下建立虚拟相机暂停状态，不访问 DCMI、DMA 或相机电源。 */
 uint32_t Camera_SDStorage_RequestSdOnlyVirtualPrepare(void);

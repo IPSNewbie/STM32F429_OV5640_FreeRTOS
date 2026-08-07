@@ -308,6 +308,9 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart) // 输出当前 CLI 
     Camera_CLI_WriteLine(huart, "SD ATK1BINIT - initialize independent ATK official 1-bit polling path");
     Camera_CLI_WriteLine(huart, "SD ATK1BREAD [block] - read one block on ATK 1-bit polling path, default 0");
     Camera_CLI_WriteLine(huart, "SD ATK1BSTATUS - show ATK official 1-bit polling diagnostic status");
+    Camera_CLI_WriteLine(huart, "SD SENSORSTOP - set OV5640 0x3008 software standby after SNAPSHOT PREPARE");
+    Camera_CLI_WriteLine(huart, "SD SENSORRESTORE - clear OV5640 0x3008 software standby after TAKEOVER EXIT");
+    Camera_CLI_WriteLine(huart, "SD SENSORSTATUS - show OV5640 software standby diagnostic status");
     Camera_CLI_WriteLine(huart, "SD INIT - request SD card init, currently deferred until SDIO takeover"); // 请求初始化，本阶段延后到 SDIO 接管完成后
     Camera_CLI_WriteLine(huart, "SD TAKEOVER STATUS - show SDIO takeover status"); // 查询 SDIO 接管软件状态
     Camera_CLI_WriteLine(huart, "SD TAKEOVER ENTER - request SDIO takeover, currently deferred"); // 请求进入接管模式，本阶段只记录请求
@@ -1306,6 +1309,35 @@ static void Camera_CLI_PrintSdStatus(UART_HandleTypeDef *huart)
     Camera_CLI_WriteStatLine(huart, "fatfs_ready", status.fatfs_ready);
     Camera_CLI_WriteStatLine(
         huart,
+        "sensor_stop_supported",
+        status.sensor_stop_supported);
+    Camera_CLI_WriteStatLine(huart, "sensor_stopped", status.sensor_stopped);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sensor_stop_success_count",
+        status.sensor_stop_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sensor_stop_error_count",
+        status.sensor_stop_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sensor_restore_success_count",
+        status.sensor_restore_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sensor_restore_error_count",
+        status.sensor_restore_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sensor_stop_last_reg_3008_after",
+        status.sensor_stop_last_reg_3008_after);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sensor_restore_last_reg_3008_after",
+        status.sensor_restore_last_reg_3008_after);
+    Camera_CLI_WriteStatLine(
+        huart,
         "sd_init_clock_div_configured",
         CAMERA_SD_INIT_CLOCK_DIV);
     Camera_CLI_WriteStatLine(huart, "init_attempt_count", status.init_attempt_count);
@@ -1390,6 +1422,35 @@ static void Camera_CLI_PrintSdAtk1BitStatus(UART_HandleTypeDef *huart)
     Camera_CLI_PrintSdAtk1BitFields(huart, &status);
 }
 
+static void Camera_CLI_PrintSdSensorStatus(UART_HandleTypeDef *huart)
+{
+    CameraSdStorageStatus_t status;
+
+    Camera_SDStorage_GetStatus(&status);
+    Camera_CLI_WriteLine(huart, "SD SENSOR:");
+    Camera_CLI_WriteStatLine(huart, "sensor_stop_supported", status.sensor_stop_supported);
+    Camera_CLI_WriteStatLine(huart, "sensor_stop_attempt_count", status.sensor_stop_attempt_count);
+    Camera_CLI_WriteStatLine(huart, "sensor_stop_success_count", status.sensor_stop_success_count);
+    Camera_CLI_WriteStatLine(huart, "sensor_stop_error_count", status.sensor_stop_error_count);
+    Camera_CLI_WriteStatLine(huart, "sensor_restore_attempt_count", status.sensor_restore_attempt_count);
+    Camera_CLI_WriteStatLine(huart, "sensor_restore_success_count", status.sensor_restore_success_count);
+    Camera_CLI_WriteStatLine(huart, "sensor_restore_error_count", status.sensor_restore_error_count);
+    Camera_CLI_WriteStatLine(huart, "sensor_stopped", status.sensor_stopped);
+    Camera_CLI_WriteStatLine(huart, "sensor_stop_last_error_code", status.sensor_stop_last_error_code);
+    Camera_CLI_WriteText(huart, "  sensor_stop_last_error_text=");
+    Camera_CLI_WriteLine(
+        huart,
+        (status.sensor_stop_last_error_text != NULL)
+            ? status.sensor_stop_last_error_text
+            : "UNKNOWN");
+    Camera_CLI_WriteStatLine(huart, "sensor_stop_last_reg_3008_before", status.sensor_stop_last_reg_3008_before);
+    Camera_CLI_WriteStatLine(huart, "sensor_stop_last_reg_3008_after", status.sensor_stop_last_reg_3008_after);
+    Camera_CLI_WriteStatLine(huart, "sensor_restore_last_reg_3008_before", status.sensor_restore_last_reg_3008_before);
+    Camera_CLI_WriteStatLine(huart, "sensor_restore_last_reg_3008_after", status.sensor_restore_last_reg_3008_after);
+    Camera_CLI_WriteStatLine(huart, "sensor_stop_last_operation_ms", status.sensor_stop_last_operation_ms);
+    Camera_CLI_WriteStatLine(huart, "sensor_restore_last_operation_ms", status.sensor_restore_last_operation_ms);
+}
+
 /* 单独输出 SDIO 接管状态，不执行任何硬件接管操作。 */
 static void Camera_CLI_PrintSdTakeoverStatus(UART_HandleTypeDef *huart)
 {
@@ -1441,6 +1502,68 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
     if (Camera_CLI_TokenEquals(arg, arg_len, "STATUS") != 0U)
     {
         Camera_CLI_PrintSdStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "SENSORSTATUS") != 0U)
+    {
+        Camera_CLI_PrintSdSensorStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "SENSORSTOP") != 0U)
+    {
+        result = Camera_SDStorage_StopSensorOutput();
+
+        if (result == CAMERA_SD_OK)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD SENSORSTOP: OV5640 software standby set, reg3008=0x42.");
+        }
+        else if (result == CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD SENSORSTOP: blocked, run SNAPSHOT PREPARE first.");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SD SENSORSTOP: ");
+            Camera_CLI_WriteText(
+                huart,
+                Camera_SDStorage_ErrorToString(result));
+            Camera_CLI_WriteText(huart, ".\r\n");
+        }
+
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "SENSORRESTORE") != 0U)
+    {
+        result = Camera_SDStorage_RestoreSensorOutput();
+
+        if (result == CAMERA_SD_OK)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD SENSORRESTORE: OV5640 software standby cleared, reg3008=0x02.");
+        }
+        else if (result == CAMERA_SD_ERR_TAKEOVER_ALREADY_ACTIVE)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD SENSORRESTORE: blocked, run SD TAKEOVER EXIT first.");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SD SENSORRESTORE: ");
+            Camera_CLI_WriteText(
+                huart,
+                Camera_SDStorage_ErrorToString(result));
+            Camera_CLI_WriteText(huart, ".\r\n");
+        }
+
         return CAMERA_CLI_OK;
     }
 

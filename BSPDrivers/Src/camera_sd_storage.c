@@ -1,6 +1,7 @@
 #include "camera_sd_storage.h"
 
 #include "bsp_log.h"
+#include "bsp_sccb.h"
 #include "camera_rtos.h"
 #include "camera_snapshot_control.h"
 #include "stm32f4xx_hal.h"
@@ -32,6 +33,10 @@ static uint32_t s_atk_1bit_read_buffer_words[128];
 #define CAMERA_SD_ATK_WAIT_TRANSFER_TIMEOUT_MS 1000U
 #define CAMERA_SD_ATK_1BIT_READ_TIMEOUT_MS 1000U
 #define CAMERA_SD_ATK_1BIT_WAIT_POLL_LIMIT 100000U
+#define CAMERA_SD_SENSOR_CTRL_REG 0x3008U
+#define CAMERA_SD_SENSOR_STANDBY_VALUE 0x42U
+#define CAMERA_SD_SENSOR_RUN_VALUE 0x02U
+#define CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN 0xFFFFFFFFU
 
 /* C5G 只读保存 HAL_SD_ReadBlocks 前后的 SDIO 寄存器，不清除任何状态标志。 */
 typedef struct
@@ -1218,6 +1223,26 @@ void Camera_SDStorage_InitState(void)
     s_camera_sd_status.takeover_required = 1U;
     s_camera_sd_status.sdio_ready = 0U;
     s_camera_sd_status.fatfs_ready = 0U;
+    s_camera_sd_status.sensor_stop_supported = 1U;
+    s_camera_sd_status.sensor_stop_attempt_count = 0U;
+    s_camera_sd_status.sensor_stop_success_count = 0U;
+    s_camera_sd_status.sensor_stop_error_count = 0U;
+    s_camera_sd_status.sensor_restore_attempt_count = 0U;
+    s_camera_sd_status.sensor_restore_success_count = 0U;
+    s_camera_sd_status.sensor_restore_error_count = 0U;
+    s_camera_sd_status.sensor_stopped = 0U;
+    s_camera_sd_status.sensor_stop_last_error_code = CAMERA_SD_OK;
+    s_camera_sd_status.sensor_stop_last_error_text = "OK";
+    s_camera_sd_status.sensor_stop_last_reg_3008_before =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.sensor_stop_last_reg_3008_after =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.sensor_restore_last_reg_3008_before =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.sensor_restore_last_reg_3008_after =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.sensor_stop_last_operation_ms = 0U;
+    s_camera_sd_status.sensor_restore_last_operation_ms = 0U;
     s_camera_sd_status.last_operation_ms = 0U;
     s_camera_sd_status.takeover_state = CAMERA_SD_TAKEOVER_STATE_IDLE;
     s_camera_sd_status.takeover_enter_attempt_count = 0U;
@@ -1445,6 +1470,141 @@ void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status)
     }
 
     *status = s_camera_sd_status;
+}
+
+uint32_t Camera_SDStorage_StopSensorOutput(void)
+{
+    uint32_t start_ms = HAL_GetTick();
+    uint32_t result = CAMERA_SD_OK;
+    uint8_t reg_value = 0U;
+
+    ++s_camera_sd_status.sensor_stop_attempt_count;
+    s_camera_sd_status.sensor_stop_last_reg_3008_before =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.sensor_stop_last_reg_3008_after =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+
+    if (Camera_SDStorage_IsTakeoverPreconditionReady() == 0U)
+    {
+        result = CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED;
+    }
+    else if (SCCB_ReadReg(CAMERA_SD_SENSOR_CTRL_REG, &reg_value) != 0U)
+    {
+        result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
+    }
+    else
+    {
+        s_camera_sd_status.sensor_stop_last_reg_3008_before = reg_value;
+
+        if (SCCB_WriteReg(CAMERA_SD_SENSOR_CTRL_REG,
+                          CAMERA_SD_SENSOR_STANDBY_VALUE) != 0U)
+        {
+            result = CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED;
+        }
+        else
+        {
+            HAL_Delay(20U);
+
+            if (SCCB_ReadReg(CAMERA_SD_SENSOR_CTRL_REG, &reg_value) != 0U)
+            {
+                result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
+            }
+            else
+            {
+                s_camera_sd_status.sensor_stop_last_reg_3008_after = reg_value;
+                if (reg_value != CAMERA_SD_SENSOR_STANDBY_VALUE)
+                {
+                    result = CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED;
+                }
+            }
+        }
+    }
+
+    if (result == CAMERA_SD_OK)
+    {
+        ++s_camera_sd_status.sensor_stop_success_count;
+        s_camera_sd_status.sensor_stopped = 1U;
+    }
+    else
+    {
+        ++s_camera_sd_status.sensor_stop_error_count;
+        s_camera_sd_status.sensor_stopped = 0U;
+    }
+
+    s_camera_sd_status.sensor_stop_last_error_code = result;
+    s_camera_sd_status.sensor_stop_last_error_text =
+        Camera_SDStorage_ErrorToString(result);
+    s_camera_sd_status.sensor_stop_last_operation_ms =
+        HAL_GetTick() - start_ms;
+    return result;
+}
+
+uint32_t Camera_SDStorage_RestoreSensorOutput(void)
+{
+    uint32_t start_ms = HAL_GetTick();
+    uint32_t result = CAMERA_SD_OK;
+    uint8_t reg_value = 0U;
+
+    ++s_camera_sd_status.sensor_restore_attempt_count;
+    s_camera_sd_status.sensor_restore_last_reg_3008_before =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.sensor_restore_last_reg_3008_after =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+
+    if ((s_camera_sd_status.takeover_state ==
+         CAMERA_SD_TAKEOVER_STATE_ACTIVE) ||
+        (s_camera_sd_status.sdio_full_gpio_af12_selected != 0U))
+    {
+        result = CAMERA_SD_ERR_TAKEOVER_ALREADY_ACTIVE;
+    }
+    else if (SCCB_ReadReg(CAMERA_SD_SENSOR_CTRL_REG, &reg_value) != 0U)
+    {
+        result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
+    }
+    else
+    {
+        s_camera_sd_status.sensor_restore_last_reg_3008_before = reg_value;
+
+        if (SCCB_WriteReg(CAMERA_SD_SENSOR_CTRL_REG,
+                          CAMERA_SD_SENSOR_RUN_VALUE) != 0U)
+        {
+            result = CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED;
+        }
+        else
+        {
+            HAL_Delay(50U);
+
+            if (SCCB_ReadReg(CAMERA_SD_SENSOR_CTRL_REG, &reg_value) != 0U)
+            {
+                result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
+            }
+            else
+            {
+                s_camera_sd_status.sensor_restore_last_reg_3008_after = reg_value;
+                if (reg_value != CAMERA_SD_SENSOR_RUN_VALUE)
+                {
+                    result = CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED;
+                }
+            }
+        }
+    }
+
+    if (result == CAMERA_SD_OK)
+    {
+        ++s_camera_sd_status.sensor_restore_success_count;
+        s_camera_sd_status.sensor_stopped = 0U;
+    }
+    else
+    {
+        ++s_camera_sd_status.sensor_restore_error_count;
+    }
+
+    s_camera_sd_status.sensor_stop_last_error_code = result;
+    s_camera_sd_status.sensor_stop_last_error_text =
+        Camera_SDStorage_ErrorToString(result);
+    s_camera_sd_status.sensor_restore_last_operation_ms =
+        HAL_GetTick() - start_ms;
+    return result;
 }
 
 uint32_t Camera_SDStorage_RequestSdOnlyVirtualPrepare(void)
@@ -2443,6 +2603,15 @@ const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
 
         case CAMERA_SD_ERR_BUS_WIDTH_CONFIG_FAILED:
             return "BUS_WIDTH_CONFIG_FAILED";
+
+        case CAMERA_SD_ERR_SENSOR_REG_READ_FAILED:
+            return "SENSOR_REG_READ_FAILED";
+
+        case CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED:
+            return "SENSOR_REG_WRITE_FAILED";
+
+        case CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED:
+            return "SENSOR_REG_VERIFY_FAILED";
 
         default:
             return "UNKNOWN_ERROR";
