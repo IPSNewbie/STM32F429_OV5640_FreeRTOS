@@ -44,6 +44,30 @@
 #define CAMERA_SD_TAKEOVER_STATE_EXIT_DEFERRED    3U
 #define CAMERA_SD_TAKEOVER_STATE_ERROR            4U
 
+#define CAMERA_SD_FULL_GPIO_ERROR_PIN_NONE         0U
+#define CAMERA_SD_FULL_GPIO_ERROR_PIN_PC8          8U
+#define CAMERA_SD_FULL_GPIO_ERROR_PIN_PC9          9U
+#define CAMERA_SD_FULL_GPIO_ERROR_PIN_PC10        10U
+#define CAMERA_SD_FULL_GPIO_ERROR_PIN_PC11        11U
+#define CAMERA_SD_FULL_GPIO_ERROR_PIN_PC12        12U
+#define CAMERA_SD_FULL_GPIO_ERROR_PIN_PD2        102U
+
+/* SD-only 启动下不访问 DCMI 的虚拟相机暂停状态。 */
+typedef struct
+{
+    uint32_t prepare_attempt_count;
+    uint32_t restore_attempt_count;
+    uint32_t prepare_success_count;
+    uint32_t restore_success_count;
+    uint32_t control_error_count;
+    uint32_t last_error_code;
+    uint32_t last_operation_ms;
+    uint32_t camera_control_state;
+    uint32_t software_guard_active;
+    uint32_t dump_block_required;
+    uint32_t snapshot_pause_confirmed;
+} CameraSdOnlyVirtualSnapshotStatus_t;
+
 /* SD 卡模块的软件状态，不包含 SDIO 或 FATFS 对象。 */
 typedef struct
 {
@@ -99,6 +123,31 @@ typedef struct
     uint32_t sdio_full_gpio_af12_selected;         /* 六个 SDIO 引脚是否均处于 AF12。 */
     uint32_t last_sdio_full_gpio_error_code;       /* 最近一次完整 SDIO GPIO 操作错误码。 */
     uint32_t last_sdio_full_gpio_operation_ms;     /* 最近一次完整 SDIO GPIO 操作耗时。 */
+    uint32_t sdio_full_gpio_last_error_pin;        /* 首个配置失败 pin：PCx=x，PD2=102。 */
+    uint32_t sdio_full_gpio_pc8_mode;
+    uint32_t sdio_full_gpio_pc8_pull;
+    uint32_t sdio_full_gpio_pc8_speed;
+    uint32_t sdio_full_gpio_pc8_af;
+    uint32_t sdio_full_gpio_pc9_mode;
+    uint32_t sdio_full_gpio_pc9_pull;
+    uint32_t sdio_full_gpio_pc9_speed;
+    uint32_t sdio_full_gpio_pc9_af;
+    uint32_t sdio_full_gpio_pc10_mode;
+    uint32_t sdio_full_gpio_pc10_pull;
+    uint32_t sdio_full_gpio_pc10_speed;
+    uint32_t sdio_full_gpio_pc10_af;
+    uint32_t sdio_full_gpio_pc11_mode;
+    uint32_t sdio_full_gpio_pc11_pull;
+    uint32_t sdio_full_gpio_pc11_speed;
+    uint32_t sdio_full_gpio_pc11_af;
+    uint32_t sdio_full_gpio_pc12_mode;
+    uint32_t sdio_full_gpio_pc12_pull;
+    uint32_t sdio_full_gpio_pc12_speed;
+    uint32_t sdio_full_gpio_pc12_af;
+    uint32_t sdio_full_gpio_pd2_mode;
+    uint32_t sdio_full_gpio_pd2_pull;
+    uint32_t sdio_full_gpio_pd2_speed;
+    uint32_t sdio_full_gpio_pd2_af;
     uint32_t real_hal_sd_init_enabled;              /* 真实 HAL_SD_Init 路径是否启用，Stage 11C-3 固定为 1。 */
     uint32_t sdio_clock_enabled;                    /* SDIO 外设时钟当前是否已打开。 */
     uint32_t sdio_hal_init_attempt_count;           /* 实际调用 HAL_SD_Init 的次数。 */
@@ -241,6 +290,16 @@ void Camera_SDStorage_InitState(void);
 
 /* 将当前软件状态复制到调用者提供的结构体。 */
 void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status);
+
+/* SD-only 启动下建立虚拟相机暂停状态，不访问 DCMI、DMA 或相机电源。 */
+uint32_t Camera_SDStorage_RequestSdOnlyVirtualPrepare(void);
+
+/* SD-only 启动下清除虚拟暂停和 DUMP guard，不恢复任何相机硬件。 */
+uint32_t Camera_SDStorage_RequestSdOnlyVirtualRestore(void);
+
+/* 读取 SD-only 虚拟相机暂停状态。 */
+void Camera_SDStorage_GetSdOnlyVirtualSnapshotStatus(
+    CameraSdOnlyVirtualSnapshotStatus_t *status);
 
 /* 独立调试接口：仅在 SD INIT 成功后显式配置 1-bit 或 4-bit。 */
 uint32_t Camera_SDStorage_DebugSetBusWidth(uint32_t bus_width);

@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include "stm32f4xx_hal.h"
 
+#ifndef CAMERA_SD_DIAG_SD_ONLY_BOOT
+#define CAMERA_SD_DIAG_SD_ONLY_BOOT (0U)
+#endif
+
 //============================================================================
 // @file    camera_rtos.h
 // @brief   摄像头 RTOS 任务模块
@@ -32,6 +36,7 @@ typedef enum
     CAMERA_RTOS_ERR_UART_DMA_RECOVERY = 0x00000006U,   /**< UART DMA 需要恢复 */
     CAMERA_RTOS_ERR_STREAM_OVERFLOW = 0x00000007U,     /**< StreamBuffer 溢出 */
     CAMERA_RTOS_ERR_SNAPSHOT_GUARD_ACTIVE = 0x00000008U, /**< SNAPSHOT 软件保护阻止图像请求 */
+    CAMERA_RTOS_ERR_SD_ONLY_BOOT_NO_CAMERA = 0x00000009U, /**< SD-only 启动模式无相机图像链路 */
     CAMERA_RTOS_ERR_SNAPSHOT_START_BASE = 0x00000100U, /**< 快照启动失败基础码 */
     CAMERA_RTOS_ERR_SNAPSHOT_TIMEOUT = 0x00000200U,    /**< 快照等待超时 */
     CAMERA_RTOS_ERR_CAPTURE_COMMIT_BASE = 0x00000300U, /**< 帧缓冲提交失败基础码 */

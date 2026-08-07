@@ -1,6 +1,7 @@
 #include "camera_sd_storage.h"
 
 #include "bsp_log.h"
+#include "camera_rtos.h"
 #include "camera_snapshot_control.h"
 #include "stm32f4xx_hal.h"
 
@@ -15,6 +16,7 @@
  * 不接入 FATFS，不执行块读写，也不启用 SDIO 中断或 DMA。
  */
 static CameraSdStorageStatus_t s_camera_sd_status;
+static CameraSdOnlyVirtualSnapshotStatus_t s_sd_only_virtual_snapshot_status;
 static SD_HandleTypeDef hsd_snapshot;
 static uint32_t s_atk_official_path_active;
 static uint32_t s_atk_official_hal_initialized;
@@ -102,6 +104,23 @@ typedef struct
 } Camera_SDBusWidthDebug_t;
 
 static Camera_SDBusWidthDebug_t s_bus_width_debug = {1U};
+
+static uint32_t Camera_SDStorage_IsTakeoverPreconditionReady(void)
+{
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U)
+    return ((s_sd_only_virtual_snapshot_status.camera_control_state ==
+             CAMERA_SNAPSHOT_STATE_CAMERA_PAUSED) &&
+            (s_sd_only_virtual_snapshot_status.software_guard_active == 1U) &&
+            (s_sd_only_virtual_snapshot_status.dump_block_required == 1U) &&
+            (s_sd_only_virtual_snapshot_status.snapshot_pause_confirmed == 1U) &&
+            (s_camera_sd_status.snapshot_pause_confirmed == 1U) &&
+            (s_camera_sd_status.conflict_pin_release_ready == 1U))
+        ? 1U
+        : 0U;
+#else
+    return Camera_SnapshotControl_IsTakeoverPreconditionReady();
+#endif
+}
 
 static void Camera_SDStorage_CaptureSdioRegSnapshot(
     Camera_SDSdioRegSnapshot_t *snapshot)
@@ -322,6 +341,85 @@ static uint32_t Camera_SDStorage_GetPinAf(
     }
 
     return (port->AFR[1] >> ((pin_number - 8U) * 4U)) & 0xFU;
+}
+
+static void Camera_SDStorage_CaptureFullGpioReadback(void)
+{
+    s_camera_sd_status.sdio_full_gpio_pc8_mode =
+        Camera_SDStorage_GetPinMode(GPIOC, 8U);
+    s_camera_sd_status.sdio_full_gpio_pc8_pull =
+        Camera_SDStorage_GetPinPull(GPIOC, 8U);
+    s_camera_sd_status.sdio_full_gpio_pc8_speed =
+        Camera_SDStorage_GetPinSpeed(GPIOC, 8U);
+    s_camera_sd_status.sdio_full_gpio_pc8_af =
+        Camera_SDStorage_GetPinAf(GPIOC, 8U);
+    s_camera_sd_status.sdio_full_gpio_pc9_mode =
+        Camera_SDStorage_GetPinMode(GPIOC, 9U);
+    s_camera_sd_status.sdio_full_gpio_pc9_pull =
+        Camera_SDStorage_GetPinPull(GPIOC, 9U);
+    s_camera_sd_status.sdio_full_gpio_pc9_speed =
+        Camera_SDStorage_GetPinSpeed(GPIOC, 9U);
+    s_camera_sd_status.sdio_full_gpio_pc9_af =
+        Camera_SDStorage_GetPinAf(GPIOC, 9U);
+    s_camera_sd_status.sdio_full_gpio_pc10_mode =
+        Camera_SDStorage_GetPinMode(GPIOC, 10U);
+    s_camera_sd_status.sdio_full_gpio_pc10_pull =
+        Camera_SDStorage_GetPinPull(GPIOC, 10U);
+    s_camera_sd_status.sdio_full_gpio_pc10_speed =
+        Camera_SDStorage_GetPinSpeed(GPIOC, 10U);
+    s_camera_sd_status.sdio_full_gpio_pc10_af =
+        Camera_SDStorage_GetPinAf(GPIOC, 10U);
+    s_camera_sd_status.sdio_full_gpio_pc11_mode =
+        Camera_SDStorage_GetPinMode(GPIOC, 11U);
+    s_camera_sd_status.sdio_full_gpio_pc11_pull =
+        Camera_SDStorage_GetPinPull(GPIOC, 11U);
+    s_camera_sd_status.sdio_full_gpio_pc11_speed =
+        Camera_SDStorage_GetPinSpeed(GPIOC, 11U);
+    s_camera_sd_status.sdio_full_gpio_pc11_af =
+        Camera_SDStorage_GetPinAf(GPIOC, 11U);
+    s_camera_sd_status.sdio_full_gpio_pc12_mode =
+        Camera_SDStorage_GetPinMode(GPIOC, 12U);
+    s_camera_sd_status.sdio_full_gpio_pc12_pull =
+        Camera_SDStorage_GetPinPull(GPIOC, 12U);
+    s_camera_sd_status.sdio_full_gpio_pc12_speed =
+        Camera_SDStorage_GetPinSpeed(GPIOC, 12U);
+    s_camera_sd_status.sdio_full_gpio_pc12_af =
+        Camera_SDStorage_GetPinAf(GPIOC, 12U);
+    s_camera_sd_status.sdio_full_gpio_pd2_mode =
+        Camera_SDStorage_GetPinMode(GPIOD, 2U);
+    s_camera_sd_status.sdio_full_gpio_pd2_pull =
+        Camera_SDStorage_GetPinPull(GPIOD, 2U);
+    s_camera_sd_status.sdio_full_gpio_pd2_speed =
+        Camera_SDStorage_GetPinSpeed(GPIOD, 2U);
+    s_camera_sd_status.sdio_full_gpio_pd2_af =
+        Camera_SDStorage_GetPinAf(GPIOD, 2U);
+}
+
+static uint32_t Camera_SDStorage_FindFullGpioErrorPin(void)
+{
+    uint32_t index;
+
+    for (index = 0U;
+         index < (sizeof(s_camera_sd_lines) / sizeof(s_camera_sd_lines[0]));
+         ++index)
+    {
+        const Camera_SDLineDef_t *line = &s_camera_sd_lines[index];
+
+        if ((Camera_SDStorage_GetPinMode(line->port, line->pin_number) != 2U) ||
+            (Camera_SDStorage_GetPinPull(line->port, line->pin_number) !=
+             GPIO_PULLUP) ||
+            (Camera_SDStorage_GetPinSpeed(line->port, line->pin_number) !=
+             GPIO_SPEED_FREQ_VERY_HIGH) ||
+            (Camera_SDStorage_GetPinAf(line->port, line->pin_number) != 12U) ||
+            (((line->port->OTYPER >> line->pin_number) & 0x1U) != 0U))
+        {
+            return (line->port == GPIOC)
+                ? line->pin_number
+                : CAMERA_SD_FULL_GPIO_ERROR_PIN_PD2;
+        }
+    }
+
+    return CAMERA_SD_FULL_GPIO_ERROR_PIN_NONE;
 }
 
 static uint32_t Camera_SDStorage_GetPinIdr(
@@ -964,8 +1062,13 @@ static uint32_t Camera_SDStorage_SwitchFullSdioGpioToAf12(void)
 {
     uint32_t start_ms = HAL_GetTick();
     GPIO_InitTypeDef gpio = {0};
+    uint32_t error_pin;
 
     ++s_camera_sd_status.sdio_full_gpio_switch_attempt_count;
+
+    /* SD-only 不经过 DCMI 初始化，因此 full switch 必须自行保证端口时钟可用。 */
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE();
 
     /* 配置 PC8、PC9、PC10、PC11、PC12 为完整 SDIO GPIO 的 AF12。 */
     gpio.Pin = CAMERA_SD_FULL_GPIOC_PIN_MASK;
@@ -979,24 +1082,11 @@ static uint32_t Camera_SDStorage_SwitchFullSdioGpioToAf12(void)
     gpio.Pin = CAMERA_SD_FULL_GPIOD_PIN_MASK;
     HAL_GPIO_Init(GPIOD, &gpio);
 
-    if (((GPIOC->MODER & CAMERA_SD_FULL_GPIOC_MODE_MASK) !=
-         CAMERA_SD_FULL_GPIOC_AF_MODE) ||
-        ((GPIOC->PUPDR & CAMERA_SD_FULL_GPIOC_MODE_MASK) !=
-         CAMERA_SD_FULL_GPIOC_PULLUP) ||
-        ((GPIOC->OSPEEDR & CAMERA_SD_FULL_GPIOC_MODE_MASK) !=
-         CAMERA_SD_FULL_GPIOC_MODE_MASK) ||
-        ((GPIOC->OTYPER & CAMERA_SD_FULL_GPIOC_PIN_MASK) != 0U) ||
-        ((GPIOC->AFR[1] & CAMERA_SD_FULL_GPIOC_AFRH_MASK) !=
-         CAMERA_SD_FULL_GPIOC_AFRH_AF12) ||
-        ((GPIOD->MODER & CAMERA_SD_FULL_GPIOD_MODE_MASK) !=
-         CAMERA_SD_FULL_GPIOD_AF_MODE) ||
-        ((GPIOD->PUPDR & CAMERA_SD_FULL_GPIOD_MODE_MASK) !=
-         CAMERA_SD_FULL_GPIOD_PULLUP) ||
-        ((GPIOD->OSPEEDR & CAMERA_SD_FULL_GPIOD_MODE_MASK) !=
-         CAMERA_SD_FULL_GPIOD_MODE_MASK) ||
-        ((GPIOD->OTYPER & CAMERA_SD_FULL_GPIOD_PIN_MASK) != 0U) ||
-        ((GPIOD->AFR[0] & CAMERA_SD_FULL_GPIOD_AFRL_MASK) !=
-         CAMERA_SD_FULL_GPIOD_AFRL_AF12))
+    Camera_SDStorage_CaptureFullGpioReadback();
+    error_pin = Camera_SDStorage_FindFullGpioErrorPin();
+    s_camera_sd_status.sdio_full_gpio_last_error_pin = error_pin;
+
+    if (error_pin != CAMERA_SD_FULL_GPIO_ERROR_PIN_NONE)
     {
         ++s_camera_sd_status.sdio_full_gpio_switch_error_count;
         s_camera_sd_status.sdio_full_gpio_af12_selected = 0U;
@@ -1009,6 +1099,9 @@ static uint32_t Camera_SDStorage_SwitchFullSdioGpioToAf12(void)
 
     ++s_camera_sd_status.sdio_full_gpio_switch_success_count;
     s_camera_sd_status.sdio_full_gpio_af12_selected = 1U;
+    s_camera_sd_status.sdio_af12_selected = 1U;
+    s_camera_sd_status.sdio_full_gpio_last_error_pin =
+        CAMERA_SD_FULL_GPIO_ERROR_PIN_NONE;
     s_camera_sd_status.last_sdio_full_gpio_error_code = CAMERA_SD_OK;
     s_camera_sd_status.last_sdio_full_gpio_operation_ms =
         HAL_GetTick() - start_ms;
@@ -1105,6 +1198,18 @@ void Camera_SDStorage_InitState(void)
     s_atk_official_hal_initialized = 0U;
     s_atk_1bit_path_active = 0U;
     s_atk_1bit_hal_initialized = 0U;
+    s_sd_only_virtual_snapshot_status.prepare_attempt_count = 0U;
+    s_sd_only_virtual_snapshot_status.restore_attempt_count = 0U;
+    s_sd_only_virtual_snapshot_status.prepare_success_count = 0U;
+    s_sd_only_virtual_snapshot_status.restore_success_count = 0U;
+    s_sd_only_virtual_snapshot_status.control_error_count = 0U;
+    s_sd_only_virtual_snapshot_status.last_error_code = CAMERA_SNAPSHOT_OK;
+    s_sd_only_virtual_snapshot_status.last_operation_ms = 0U;
+    s_sd_only_virtual_snapshot_status.camera_control_state =
+        CAMERA_SNAPSHOT_STATE_IDLE;
+    s_sd_only_virtual_snapshot_status.software_guard_active = 0U;
+    s_sd_only_virtual_snapshot_status.dump_block_required = 0U;
+    s_sd_only_virtual_snapshot_status.snapshot_pause_confirmed = 0U;
     s_camera_sd_status.init_attempt_count = 0U;
     s_camera_sd_status.init_success_count = 0U;
     s_camera_sd_status.init_error_count = 0U;
@@ -1157,6 +1262,32 @@ void Camera_SDStorage_InitState(void)
     s_camera_sd_status.sdio_full_gpio_af12_selected = 0U;
     s_camera_sd_status.last_sdio_full_gpio_error_code = CAMERA_SD_OK;
     s_camera_sd_status.last_sdio_full_gpio_operation_ms = 0U;
+    s_camera_sd_status.sdio_full_gpio_last_error_pin =
+        CAMERA_SD_FULL_GPIO_ERROR_PIN_NONE;
+    s_camera_sd_status.sdio_full_gpio_pc8_mode = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc8_pull = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc8_speed = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc8_af = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc9_mode = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc9_pull = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc9_speed = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc9_af = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc10_mode = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc10_pull = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc10_speed = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc10_af = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc11_mode = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc11_pull = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc11_speed = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc11_af = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc12_mode = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc12_pull = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc12_speed = 0U;
+    s_camera_sd_status.sdio_full_gpio_pc12_af = 0U;
+    s_camera_sd_status.sdio_full_gpio_pd2_mode = 0U;
+    s_camera_sd_status.sdio_full_gpio_pd2_pull = 0U;
+    s_camera_sd_status.sdio_full_gpio_pd2_speed = 0U;
+    s_camera_sd_status.sdio_full_gpio_pd2_af = 0U;
     s_camera_sd_status.real_hal_sd_init_enabled = 1U;
     s_camera_sd_status.sdio_clock_enabled = 0U;
     s_camera_sd_status.sdio_hal_init_attempt_count = 0U;
@@ -1314,6 +1445,58 @@ void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status)
     }
 
     *status = s_camera_sd_status;
+}
+
+uint32_t Camera_SDStorage_RequestSdOnlyVirtualPrepare(void)
+{
+    uint32_t start_ms = HAL_GetTick();
+
+    ++s_sd_only_virtual_snapshot_status.prepare_attempt_count;
+    ++s_sd_only_virtual_snapshot_status.prepare_success_count;
+    s_sd_only_virtual_snapshot_status.camera_control_state =
+        CAMERA_SNAPSHOT_STATE_CAMERA_PAUSED;
+    s_sd_only_virtual_snapshot_status.software_guard_active = 1U;
+    s_sd_only_virtual_snapshot_status.dump_block_required = 1U;
+    s_sd_only_virtual_snapshot_status.snapshot_pause_confirmed = 1U;
+    s_sd_only_virtual_snapshot_status.last_error_code = CAMERA_SNAPSHOT_OK;
+    s_sd_only_virtual_snapshot_status.last_operation_ms =
+        HAL_GetTick() - start_ms;
+    s_camera_sd_status.snapshot_pause_confirmed = 1U;
+    s_camera_sd_status.conflict_pin_release_ready = 1U;
+    s_camera_sd_status.last_takeover_precheck_error_code = CAMERA_SD_OK;
+
+    return CAMERA_SNAPSHOT_OK;
+}
+
+uint32_t Camera_SDStorage_RequestSdOnlyVirtualRestore(void)
+{
+    uint32_t start_ms = HAL_GetTick();
+
+    ++s_sd_only_virtual_snapshot_status.restore_attempt_count;
+    s_sd_only_virtual_snapshot_status.camera_control_state =
+        CAMERA_SNAPSHOT_STATE_RESTORE_DEFERRED;
+    s_sd_only_virtual_snapshot_status.software_guard_active = 0U;
+    s_sd_only_virtual_snapshot_status.dump_block_required = 0U;
+    s_sd_only_virtual_snapshot_status.snapshot_pause_confirmed = 0U;
+    s_sd_only_virtual_snapshot_status.last_error_code =
+        CAMERA_SNAPSHOT_ERR_CAMERA_RESTORE_NOT_IMPLEMENTED;
+    s_sd_only_virtual_snapshot_status.last_operation_ms =
+        HAL_GetTick() - start_ms;
+    s_camera_sd_status.snapshot_pause_confirmed = 0U;
+    s_camera_sd_status.conflict_pin_release_ready = 0U;
+
+    return CAMERA_SNAPSHOT_ERR_CAMERA_RESTORE_NOT_IMPLEMENTED;
+}
+
+void Camera_SDStorage_GetSdOnlyVirtualSnapshotStatus(
+    CameraSdOnlyVirtualSnapshotStatus_t *status)
+{
+    if (status == NULL)
+    {
+        return;
+    }
+
+    *status = s_sd_only_virtual_snapshot_status;
 }
 
 uint32_t Camera_SDStorage_DebugSetBusWidth(uint32_t bus_width)
@@ -1593,7 +1776,7 @@ uint32_t Camera_SDStorage_AtkOfficialInit(void)
         return CAMERA_SD_ERR_NEED_TAKEOVER;
     }
 
-    if (Camera_SnapshotControl_IsTakeoverPreconditionReady() == 0U)
+    if (Camera_SDStorage_IsTakeoverPreconditionReady() == 0U)
     {
         ++s_camera_sd_status.atk_official_init_error_count;
         s_camera_sd_status.atk_official_init_ready = 0U;
@@ -1691,7 +1874,7 @@ uint32_t Camera_SDStorage_AtkOfficial1BitInit(void)
 
     ++s_camera_sd_status.atk_1bit_init_attempt_count;
 
-    if (Camera_SnapshotControl_IsTakeoverPreconditionReady() == 0U)
+    if (Camera_SDStorage_IsTakeoverPreconditionReady() == 0U)
     {
         ++s_camera_sd_status.atk_1bit_init_error_count;
         s_camera_sd_status.atk_1bit_init_ready = 0U;
@@ -1939,7 +2122,7 @@ uint32_t Camera_SDStorage_RequestTakeoverEnter(void)
     ++s_camera_sd_status.takeover_enter_attempt_count;
     ++s_camera_sd_status.takeover_precheck_attempt_count;
 
-    if (Camera_SnapshotControl_IsTakeoverPreconditionReady() == 0U)
+    if (Camera_SDStorage_IsTakeoverPreconditionReady() == 0U)
     {
         ++s_camera_sd_status.takeover_precheck_fail_count;
         s_camera_sd_status.snapshot_pause_confirmed = 0U;

@@ -327,6 +327,16 @@ static void Camera_CLI_PrintStatus(UART_HandleTypeDef *huart) // 输出当前图
     stats = Camera_RTOS_GetStats();          // 获取 RTOS 运行统计结构体的只读指针
     uart_dma_stats = UART_RxDma_GetStats();  // 获取 UART RX DMA 统计结构体的只读指针
 
+    Camera_CLI_WriteStatLine(huart, "sd_only_boot_supported", 1U);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sd_only_boot",
+        (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U) ? 1U : 0U);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "camera_init_skipped_by_sd_only_boot",
+        (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U) ? 1U : 0U);
+
     Camera_CLI_WriteText(huart, "process mode: ");                             // 输出处理模式字段名称
     Camera_CLI_WriteLine(huart, Camera_CLI_ModeName(s_camera_cli_config.process_mode)); // 将当前模式转换为字符串后输出并换行
 
@@ -1195,6 +1205,34 @@ static void Camera_CLI_PrintSdTakeoverFields(
         status->last_sdio_full_gpio_operation_ms);
     Camera_CLI_WriteStatLine(
         huart,
+        "sdio_full_gpio_last_error_pin",
+        status->sdio_full_gpio_last_error_pin);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc8_mode", status->sdio_full_gpio_pc8_mode);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc8_pull", status->sdio_full_gpio_pc8_pull);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc8_speed", status->sdio_full_gpio_pc8_speed);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc8_af", status->sdio_full_gpio_pc8_af);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc9_mode", status->sdio_full_gpio_pc9_mode);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc9_pull", status->sdio_full_gpio_pc9_pull);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc9_speed", status->sdio_full_gpio_pc9_speed);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc9_af", status->sdio_full_gpio_pc9_af);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc10_mode", status->sdio_full_gpio_pc10_mode);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc10_pull", status->sdio_full_gpio_pc10_pull);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc10_speed", status->sdio_full_gpio_pc10_speed);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc10_af", status->sdio_full_gpio_pc10_af);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc11_mode", status->sdio_full_gpio_pc11_mode);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc11_pull", status->sdio_full_gpio_pc11_pull);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc11_speed", status->sdio_full_gpio_pc11_speed);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc11_af", status->sdio_full_gpio_pc11_af);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc12_mode", status->sdio_full_gpio_pc12_mode);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc12_pull", status->sdio_full_gpio_pc12_pull);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc12_speed", status->sdio_full_gpio_pc12_speed);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pc12_af", status->sdio_full_gpio_pc12_af);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pd2_mode", status->sdio_full_gpio_pd2_mode);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pd2_pull", status->sdio_full_gpio_pd2_pull);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pd2_speed", status->sdio_full_gpio_pd2_speed);
+    Camera_CLI_WriteStatLine(huart, "sdio_full_gpio_pd2_af", status->sdio_full_gpio_pd2_af);
+    Camera_CLI_WriteStatLine(
+        huart,
         "real_hal_sd_init_enabled",
         status->real_hal_sd_init_enabled);
     Camera_CLI_WriteStatLine(
@@ -1257,6 +1295,11 @@ static void Camera_CLI_PrintSdStatus(UART_HandleTypeDef *huart)
     Camera_SDStorage_GetStatus(&status);
 
     Camera_CLI_WriteLine(huart, "SD:");
+    Camera_CLI_WriteStatLine(huart, "sd_only_boot_supported", 1U);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "sd_only_boot",
+        (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U) ? 1U : 0U);
     Camera_CLI_WriteStatLine(huart, "is_initialized", status.is_initialized);
     Camera_CLI_WriteStatLine(huart, "takeover_required", status.takeover_required);
     Camera_CLI_WriteStatLine(huart, "sdio_ready", status.sdio_ready);
@@ -1943,8 +1986,34 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
 static void Camera_CLI_PrintSnapshotStatus(UART_HandleTypeDef *huart)
 {
     CameraSnapshotControlStatus_t status;
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U)
+    CameraSdOnlyVirtualSnapshotStatus_t virtual_status;
+#endif
 
     Camera_SnapshotControl_GetStatus(&status);
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U)
+    Camera_SDStorage_GetSdOnlyVirtualSnapshotStatus(&virtual_status);
+    status.prepare_attempt_count = virtual_status.prepare_attempt_count;
+    status.restore_attempt_count = virtual_status.restore_attempt_count;
+    status.prepare_success_count = virtual_status.prepare_success_count;
+    status.restore_success_count = virtual_status.restore_success_count;
+    status.control_error_count = virtual_status.control_error_count;
+    status.last_error_code = virtual_status.last_error_code;
+    status.last_operation_ms = virtual_status.last_operation_ms;
+    status.real_dcmi_stop_enabled = 0U;
+    status.dcmi_stop_attempt_count = 0U;
+    status.dcmi_stop_success_count = 0U;
+    status.dcmi_stop_error_count = 0U;
+    status.last_dcmi_stop_hal_status = (uint32_t)HAL_OK;
+    status.camera_control_state = virtual_status.camera_control_state;
+    status.dcmi_stop_required = 0U;
+    status.dcmi_dma_stop_required = 0U;
+    status.camera_restore_required = 0U;
+    status.frame_buffer_required = 0U;
+    status.frame_buffer_ready = 0U;
+    status.software_guard_active = virtual_status.software_guard_active;
+    status.dump_block_required = virtual_status.dump_block_required;
+#endif
 
     Camera_CLI_WriteLine(huart, "SNAPSHOT:");
     Camera_CLI_WriteStatLine(
@@ -2061,6 +2130,22 @@ static CameraCliStatus_t Camera_CLI_HandleSnapshot(UART_HandleTypeDef *huart,
 
     if (Camera_CLI_TokenEquals(arg, arg_len, "PREPARE") != 0U)
     {
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U)
+        result = Camera_SDStorage_RequestSdOnlyVirtualPrepare();
+        if (result == CAMERA_SNAPSHOT_OK)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SNAPSHOT PREPARE: SD-only boot, virtual camera pause OK.");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SNAPSHOT PREPARE: ");
+            Camera_CLI_WriteLine(
+                huart,
+                Camera_SnapshotControl_ErrorToString(result));
+        }
+#else
         result = Camera_SnapshotControl_RequestPrepare();
 
         if (result == CAMERA_SNAPSHOT_OK)
@@ -2082,6 +2167,7 @@ static CameraCliStatus_t Camera_CLI_HandleSnapshot(UART_HandleTypeDef *huart,
                 huart,
                 Camera_SnapshotControl_ErrorToString(result));
         }
+#endif
 
         Camera_CLI_PrintSnapshotStatus(huart);
         return CAMERA_CLI_OK;
@@ -2089,7 +2175,11 @@ static CameraCliStatus_t Camera_CLI_HandleSnapshot(UART_HandleTypeDef *huart,
 
     if (Camera_CLI_TokenEquals(arg, arg_len, "RESTORE") != 0U)
     {
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U)
+        result = Camera_SDStorage_RequestSdOnlyVirtualRestore();
+#else
         result = Camera_SnapshotControl_RequestRestore();
+#endif
 
         if (result == CAMERA_SNAPSHOT_ERR_CAMERA_RESTORE_NOT_IMPLEMENTED)
         {

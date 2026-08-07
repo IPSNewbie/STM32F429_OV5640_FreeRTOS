@@ -103,7 +103,11 @@ static uint32_t g_boot_iwdg_reset = 0U;
 void SystemClock_Config(void);
 void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT == 0U)
 static void Camera_Application_Init(void);
+#else
+static void Camera_SDOnly_Application_Init(void);
+#endif
 static void Hook_WriteU32(uint32_t value);
 static void Hook_Stop(void);
 /* USER CODE END PFP */
@@ -154,7 +158,11 @@ int main(void)
   log_set_level(LOG_LEVEL_DEBUG);   // 输出 DEBUG 及以上等级
   LOG_INFO("reset: iwdg=%lu", (unsigned long)g_boot_iwdg_reset);
   Delay_TIM7_Init();
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U)
+  Camera_SDOnly_Application_Init();
+#else
   Camera_Application_Init();
+#endif
   Camera_RTOS_Init(&huart1);
   // 应用初始化完成后、调度器启动前启用IWDG
   if (Camera_RTOS_IwdgInit() != HAL_OK)
@@ -239,6 +247,15 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U)
+static void Camera_SDOnly_Application_Init(void)
+{
+  Camera_CLI_Init();
+  LOG_INFO("SD-only boot active: OV5640 and DCMI initialization skipped");
+}
+#endif
+
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT == 0U)
 static void Camera_Application_Init(void)
 {
   uint16_t ov_id;
@@ -384,6 +401,7 @@ static void Camera_Application_Init(void)
     LOG_INFO("Camera init OK");
   }
 }
+#endif
 
 // 不使用格式化缓冲区输出无符号整数，避免严重错误路径额外占用大量栈
 static void Hook_WriteU32(uint32_t value)

@@ -7211,3 +7211,81 @@ Stage 11C-5N 不修改任何固件代码，只新增 `tools/uart_sd_atk1b_repeat
 - 如果 ATK1B 成功率明显高于当前 READTEST 主路径，说明官方 GPIO HIGH、`ClockDiv=1`、IRQOFF 和读后等待具有改善价值。
 - 如果某个 block 稳定 PASS、另一个 block 不稳定，应继续检查地址、卡内容、读后状态和数据线恢复差异。
 - 如果 `ATK1BINIT` 本身不稳定，应先回到初始化稳定性诊断，再比较连续读块结果。
+
+## Stage 11C-5O SD-only 启动环境隔离验证
+
+### 1. Stage 11C-5N 结果
+
+- `ATK1B_INIT=PASS`，`ATK1B_INIT_READY=1`，官方参数 1-bit 初始化路径成立。
+- ATK1B polling read 成功率很低：block 0 为 1/20（5.00%），block 2048 为 2/20（10.00%）。
+- block 0 的其余 19 次为 `DATA_CRC_FAIL`；block 2048 另有 10 次 `DATA_CRC_FAIL` 和 8 次其他失败。
+- 失败读块的 512B buffer 指纹高度随机；block 0 的 `SUM512_UNIQUE=20`，block 2048 的 `SUM512_UNIQUE=12`。
+
+### 2. 本轮目的
+
+- 复现正点原子官方 SDIO 例程的关键环境：启动时不初始化 OV5640，也不启动 DCMI。
+- 验证相机未驱动 PC8/PC9/PC11 共享数据线时，SDIO 的 ATK1B 初始化和 polling read 是否稳定。
+- `CAMERA_SD_DIAG_SD_ONLY_BOOT=1` 时保留 UART CLI、FreeRTOS 基础任务、SD takeover、`SD ATK1BINIT`、`SD ATK1BREAD` 和 `SD ATK1BSTATUS`，但禁用所有需要相机帧的图像请求。
+
+### 3. 结果判断
+
+- 若 SD-only 模式下 ATK1B repeat 稳定 PASS，根因优先指向 OV5640/DVP 对 PC8/PC9/PC11 共享线的外部驱动或干扰。
+- 若 SD-only 模式下仍随机失败，继续对照官方工程检查工程配置、`HAL_SD_MspInit`、HAL 版本与编译配置差异。
+
+### 4. 默认值与测试方法
+
+- `CAMERA_SD_DIAG_SD_ONLY_BOOT` 默认值为 `0U`，正常固件继续使用既有 OV5640、DCMI 和图像链路。
+- 板测时手动将宏改为 `1U` 后重新编译、烧录，再执行 takeover 和 ATK1B repeat 测试。
+- 测试结束后必须把宏恢复为 `0U`；本轮只完成静态检查和默认配置构建，不执行硬件测试。
+
+## Stage 11C-5O-1 SD-only boot 前置流程修正
+
+### 1. Stage 11C-5O 初测结论
+
+- 初测中 `SNAPSHOT_PREPARE=FAIL`、`TAKEOVER_ENTER=FAIL`、`ATK1B_INIT=FAIL`，因此 `READ_REPEAT=SKIP`，block 0 和 block 2048 均未进入读块阶段。
+- 该结果不能用于判断 SD-only 环境下 SDIO 是否稳定。
+- 原因是 SD-only 启动没有初始化相机/DCMI，但前置流程仍要求 `SNAPSHOT PREPARE` 和 `SD TAKEOVER ENTER` 满足正常相机 pause 状态。
+
+### 2. 前置流程修正
+
+- SD-only 下 `SNAPSHOT PREPARE` 不调用 DCMI/DMA stop，而是建立虚拟 paused 状态、软件 guard、成功计数及 `last_error_code=0`。
+- `SD TAKEOVER ENTER` 只有在 SD-only virtual pause 已建立后才允许切换完整 SDIO GPIO 到 AF12，并继续使用既有 takeover 状态机。
+- takeover 完成后，`SD ATK1BINIT` 可继续执行既有 GPIO HIGH/PULLUP/AF12、`ClockDiv=1U`、1-bit、CardInfo 和 TRANSFER 等待流程。
+- SD-only 下 DUMP 返回 `DUMP blocked: SD_ONLY_BOOT_NO_CAMERA.`，作为预期的无相机图像请求阻止结果。
+- `tools/uart_sd_atk1b_repeat_test.py` 解析 `sd_only_boot`/`sd_only_boot_supported`，并接受 virtual pause 与 `SD_ONLY_BOOT_NO_CAMERA` 文本。
+
+### 3. 保持不变的诊断边界
+
+- 本轮不改变 ATK1B init 的 `ClockDiv=1U`、1-bit 配置，也不改变 ATK1B read 的 `HAL_SD_ReadBlocks` 参数。
+- 不接入 FATFS、不写卡、不启用 SDIO DMA 或 SDIO IRQ。
+- 不触碰摄像头 PWDN、CAMOFF、CAMON，不恢复动态 SD CLOCKDIV CLI。
+
+## Stage 11C-5O-2 SD-only TAKEOVER ENTER 前置条件修正
+
+### 1. Stage 11C-5O-1 板测结论
+
+- `SD_ONLY_BOOT=1`、`SNAPSHOT_PREPARE=PASS`、`DUMP_GUARD=PASS`，说明 SD-only 启动与 virtual camera pause 已生效。
+- `TAKEOVER_ENTER=FAIL`，导致 `ATK1B_INIT=FAIL`、`READ_REPEAT=SKIP`，block 0 和 block 2048 仍未进入读块阶段。
+- 这说明 5O-1 的 virtual prepare 尚未完整建立 takeover precheck 所需的软件状态。
+
+### 2. 本轮修正
+
+- SD-only virtual prepare 同时设置 `snapshot_pause_confirmed=1`、`conflict_pin_release_ready=1`、software guard、`CAMERA_PAUSED` 和成功错误码。
+- SD-only takeover precheck 只检查上述虚拟暂停与冲突引脚释放许可，不依赖 OV5640 初始化、真实 DCMI/DMA stop、frame buffer 或图像处理链路状态。
+- precheck 成功后仍执行 PC8/PC9/PC10/PC11/PC12/PD2 的完整 SDIO AF12 切换，并更新既有 takeover 计数与状态。
+- 自动化 summary 新增 takeover 错误码、错误文本、precheck 成功次数、pause/release 状态和 AF12 选择状态；只有原有成功文本出现时才继续 ATK1BINIT，PARTIAL 不视为 PASS。
+
+### 3. 诊断边界与下一步
+
+- 本轮不改变 ATK1B init/read 的 SDIO 参数或 `HAL_SD_ReadBlocks` 参数。
+- 仍不接 FATFS、不写卡、不启用 SDIO DMA 或 SDIO IRQ，不触碰摄像头电源控制。
+- 下一次板测必须先看到 `TAKEOVER_ENTER=PASS`，才能依据 ATK1BINIT 和 block 0/block 2048 连续读结果判断 SD-only SDIO 稳定性。
+
+## Stage 11C-5O-3 SD-only full SDIO GPIO AF12 switch 失败定位
+
+1. 5O-2 板测已经得到 `SNAPSHOT_PREPARE=PASS`，takeover precheck 也已经 PASS，但 `SD TAKEOVER ENTER` 仍在完整 GPIO 切换阶段返回 `SDIO_FULL_GPIO_SWITCH_FAILED`。
+2. 当时 `sdio_af12_selected=1`、`sdio_full_gpio_af12_selected=0`，说明旧的 PC8/PC9/PC11 conflict-pin switch 状态不能代表 PC8/PC9/PC10/PC11/PC12/PD2 完整六线 switch 成功。
+3. 根因定位为 SD-only 启动跳过相机/DCMI 初始化，而 `MX_GPIO_Init()` 未开启 GPIOD 时钟；原 full switch 对 PD2 调用 `HAL_GPIO_Init` 后寄存器配置未生效。本轮让 full switch 自行开启 GPIOC/GPIOD 时钟，不再依赖真实相机初始化、DCMI stop、frame buffer 或图像处理链路状态。
+4. full switch 仍按现有主路径把 PC8/PC9/PC10/PC11/PC12/PD2 全部配置为 AF12、PULLUP、VERY_HIGH，并在成功时同时设置 `sdio_full_gpio_af12_selected=1` 与 `sdio_af12_selected=1`；失败时保留 `TAKEOVER_ENTER=FAIL`。
+5. 新增 `sdio_full_gpio_last_error_pin`，并为六根线分别记录 MODER 的 mode、PUPDR 的 pull、OSPEEDR 的 speed 和 AFRL/AFRH 的 AF 回读值；`SD TAKEOVER`/`SD STATUS` 在失败时也输出这些字段，自动化脚本同步汇总对应大写字段。
+6. 本轮不改变 ATK1B init/read 参数或 `HAL_SD_ReadBlocks` 参数，不接 FATFS、不写卡、不启用 SDIO DMA/IRQ，也不触碰摄像头 PWDN、CAMOFF、CAMON 或动态 ClockDiv CLI。

@@ -73,6 +73,34 @@ BLOCK_FINGERPRINT_FIELDS = [
     ("FF_COUNT", "ff_count512"),
 ]
 
+FULL_GPIO_READBACK_FIELDS = [
+    ("SDIO_FULL_GPIO_LAST_ERROR_PIN", "sdio_full_gpio_last_error_pin"),
+    ("SDIO_FULL_GPIO_PC8_MODE", "sdio_full_gpio_pc8_mode"),
+    ("SDIO_FULL_GPIO_PC8_PULL", "sdio_full_gpio_pc8_pull"),
+    ("SDIO_FULL_GPIO_PC8_SPEED", "sdio_full_gpio_pc8_speed"),
+    ("SDIO_FULL_GPIO_PC8_AF", "sdio_full_gpio_pc8_af"),
+    ("SDIO_FULL_GPIO_PC9_MODE", "sdio_full_gpio_pc9_mode"),
+    ("SDIO_FULL_GPIO_PC9_PULL", "sdio_full_gpio_pc9_pull"),
+    ("SDIO_FULL_GPIO_PC9_SPEED", "sdio_full_gpio_pc9_speed"),
+    ("SDIO_FULL_GPIO_PC9_AF", "sdio_full_gpio_pc9_af"),
+    ("SDIO_FULL_GPIO_PC10_MODE", "sdio_full_gpio_pc10_mode"),
+    ("SDIO_FULL_GPIO_PC10_PULL", "sdio_full_gpio_pc10_pull"),
+    ("SDIO_FULL_GPIO_PC10_SPEED", "sdio_full_gpio_pc10_speed"),
+    ("SDIO_FULL_GPIO_PC10_AF", "sdio_full_gpio_pc10_af"),
+    ("SDIO_FULL_GPIO_PC11_MODE", "sdio_full_gpio_pc11_mode"),
+    ("SDIO_FULL_GPIO_PC11_PULL", "sdio_full_gpio_pc11_pull"),
+    ("SDIO_FULL_GPIO_PC11_SPEED", "sdio_full_gpio_pc11_speed"),
+    ("SDIO_FULL_GPIO_PC11_AF", "sdio_full_gpio_pc11_af"),
+    ("SDIO_FULL_GPIO_PC12_MODE", "sdio_full_gpio_pc12_mode"),
+    ("SDIO_FULL_GPIO_PC12_PULL", "sdio_full_gpio_pc12_pull"),
+    ("SDIO_FULL_GPIO_PC12_SPEED", "sdio_full_gpio_pc12_speed"),
+    ("SDIO_FULL_GPIO_PC12_AF", "sdio_full_gpio_pc12_af"),
+    ("SDIO_FULL_GPIO_PD2_MODE", "sdio_full_gpio_pd2_mode"),
+    ("SDIO_FULL_GPIO_PD2_PULL", "sdio_full_gpio_pd2_pull"),
+    ("SDIO_FULL_GPIO_PD2_SPEED", "sdio_full_gpio_pd2_speed"),
+    ("SDIO_FULL_GPIO_PD2_AF", "sdio_full_gpio_pd2_af"),
+]
+
 
 def parse_blocks(text: str) -> List[int]:
     values: List[int] = []
@@ -228,9 +256,18 @@ class UartSession:
 
 def make_summary() -> Dict[str, str]:
     summary: Dict[str, str] = {
+        "SD_ONLY_BOOT": "-1",
+        "SD_ONLY_BOOT_SUPPORTED": "-1",
         "PRE_TAKEOVER_SD_INIT_BLOCKED": "UNKNOWN",
         "SNAPSHOT_PREPARE": "UNKNOWN",
         "TAKEOVER_ENTER": "UNKNOWN",
+        "TAKEOVER_ENTER_ERROR_CODE": "-1",
+        "TAKEOVER_ENTER_ERROR_TEXT": "UNKNOWN",
+        "TAKEOVER_PRECHECK_SUCCESS": "-1",
+        "SNAPSHOT_PAUSE_CONFIRMED": "-1",
+        "CONFLICT_PIN_RELEASE_READY": "-1",
+        "SDIO_FULL_GPIO_AF12_SELECTED": "-1",
+        "SDIO_AF12_SELECTED": "-1",
         "ATK1B_INIT": "UNKNOWN",
         "ATK1B_INIT_READY": "-1",
         "ATK1B_CLOCK_DIV": "-1",
@@ -238,6 +275,8 @@ def make_summary() -> Dict[str, str]:
         "ATK1B_LAST_CARD_STATE": "-1",
         "READ_REPEAT": "SKIP",
     }
+    for summary_key, _ in FULL_GPIO_READBACK_FIELDS:
+        summary[summary_key] = "-1"
     for block in (0, 2048):
         add_empty_block_summary(summary, block)
     summary.update(
@@ -388,8 +427,13 @@ def run_cleanup(
     log: List[str],
 ) -> None:
     dump_text = safe_cli(session, "DUMP", log)
+    dump_guard_markers = (
+        "DUMP blocked: snapshot software guard active",
+        "DUMP blocked: SD_ONLY_BOOT_NO_CAMERA",
+        "SD_ONLY_BOOT_NO_CAMERA",
+    )
     summary["DUMP_GUARD"] = (
-        "PASS" if "DUMP blocked" in dump_text else "FAIL"
+        "PASS" if any(marker in dump_text for marker in dump_guard_markers) else "FAIL"
     )
 
     exit_text = safe_cli(session, "SD TAKEOVER EXIT", log)
@@ -421,7 +465,7 @@ def run_cleanup(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Stage 11C-5N ATK1B continuous block-read statistics"
+        description="Stage 11C-5O-3 SD-only full-GPIO ATK1B block-read statistics"
     )
     parser.add_argument("--port", default="COM4")
     parser.add_argument("--baud", type=int, default=115200)
@@ -460,45 +504,98 @@ def main() -> int:
     try:
         session = UartSession(args.port, args.baud, args.timeout, log)
 
+        boot_status_text = session.cli("STATUS")
+        boot_status = parse_kv(boot_status_text)
+        summary["SD_ONLY_BOOT"] = str(get_int(boot_status, "sd_only_boot"))
+        summary["SD_ONLY_BOOT_SUPPORTED"] = str(
+            get_int(boot_status, "sd_only_boot_supported")
+        )
+
         precheck_text = session.cli("SD INIT")
         summary["PRE_TAKEOVER_SD_INIT_BLOCKED"] = (
             "YES" if "need SDIO takeover" in precheck_text else "NO"
         )
 
         prepare_text = session.cli("SNAPSHOT PREPARE")
+        prepare_markers = (
+            "SNAPSHOT PREPARE: DCMI stop OK",
+            "SNAPSHOT PREPARE: SD-only boot, virtual camera pause OK",
+            "virtual camera pause OK",
+        )
         summary["SNAPSHOT_PREPARE"] = (
-            "PASS" if "DCMI stop OK" in prepare_text else "FAIL"
+            "PASS"
+            if any(marker in prepare_text for marker in prepare_markers)
+            else "FAIL"
         )
 
         enter_text = session.cli("SD TAKEOVER ENTER")
-        summary["TAKEOVER_ENTER"] = (
-            "PASS" if "full SDIO GPIO switched to AF12" in enter_text else "FAIL"
+        enter_values = parse_kv(enter_text)
+        enter_success = (
+            "SD TAKEOVER ENTER: full SDIO GPIO switched to AF12" in enter_text
         )
-
-        session.cli("SD ATK1BSTATUS")
-        init_text = session.cli("SD ATK1BINIT")
-        init_status_text = session.cli("SD ATK1BSTATUS")
-        init_values = parse_kv(init_text + "\n" + init_status_text)
-        init_ready = get_int(init_values, "atk_1bit_init_ready", 0)
-        init_ok = "SD ATK1BINIT: HAL_SD_Init OK" in init_text or init_ready == 1
-        summary["ATK1B_INIT"] = "PASS" if init_ok else "FAIL"
-        summary["ATK1B_INIT_READY"] = str(init_ready)
-        summary["ATK1B_CLOCK_DIV"] = str(
-            get_int(init_values, "atk_1bit_clock_div")
+        snapshot_pause_confirmed = get_int(
+            enter_values, "snapshot_pause_confirmed", 0
         )
-        summary["ATK1B_BUS_WIDTH"] = str(
-            get_int(init_values, "atk_1bit_bus_width")
+        full_gpio_af12_selected = get_int(
+            enter_values, "sdio_full_gpio_af12_selected", 0
         )
-        summary["ATK1B_LAST_CARD_STATE"] = str(
-            get_int(init_values, "atk_1bit_last_card_state")
+        summary["TAKEOVER_ENTER_ERROR_CODE"] = str(
+            get_int(enter_values, "last_takeover_error_code")
         )
-
-        if init_ok:
-            summary["READ_REPEAT"] = "RUN"
-            for block in args.blocks:
-                for index in range(1, args.read_count + 1):
-                    rows.append(read_once(session, block, index))
+        summary["TAKEOVER_ENTER_ERROR_TEXT"] = enter_values.get(
+            "last_takeover_error_text", "UNKNOWN"
+        )
+        summary["TAKEOVER_PRECHECK_SUCCESS"] = str(
+            get_int(enter_values, "takeover_precheck_success_count")
+        )
+        summary["SNAPSHOT_PAUSE_CONFIRMED"] = str(snapshot_pause_confirmed)
+        summary["CONFLICT_PIN_RELEASE_READY"] = str(
+            get_int(enter_values, "conflict_pin_release_ready")
+        )
+        summary["SDIO_FULL_GPIO_AF12_SELECTED"] = str(full_gpio_af12_selected)
+        summary["SDIO_AF12_SELECTED"] = str(
+            get_int(enter_values, "sdio_af12_selected")
+        )
+        for summary_key, status_key in FULL_GPIO_READBACK_FIELDS:
+            summary[summary_key] = str(get_int(enter_values, status_key))
+        if enter_success:
+            summary["TAKEOVER_ENTER"] = "PASS"
+        elif full_gpio_af12_selected == 1 and snapshot_pause_confirmed == 1:
+            summary["TAKEOVER_ENTER"] = "PARTIAL"
         else:
+            summary["TAKEOVER_ENTER"] = "FAIL"
+
+        if enter_success:
+            session.cli("SD ATK1BSTATUS")
+            init_text = session.cli("SD ATK1BINIT")
+            init_status_text = session.cli("SD ATK1BSTATUS")
+            init_values = parse_kv(init_text + "\n" + init_status_text)
+            init_ready = get_int(init_values, "atk_1bit_init_ready", 0)
+            init_ok = (
+                "SD ATK1BINIT: HAL_SD_Init OK" in init_text or init_ready == 1
+            )
+            summary["ATK1B_INIT"] = "PASS" if init_ok else "FAIL"
+            summary["ATK1B_INIT_READY"] = str(init_ready)
+            summary["ATK1B_CLOCK_DIV"] = str(
+                get_int(init_values, "atk_1bit_clock_div")
+            )
+            summary["ATK1B_BUS_WIDTH"] = str(
+                get_int(init_values, "atk_1bit_bus_width")
+            )
+            summary["ATK1B_LAST_CARD_STATE"] = str(
+                get_int(init_values, "atk_1bit_last_card_state")
+            )
+
+            if init_ok:
+                summary["READ_REPEAT"] = "RUN"
+                for block in args.blocks:
+                    for index in range(1, args.read_count + 1):
+                        rows.append(read_once(session, block, index))
+            else:
+                summary["READ_REPEAT"] = "SKIP"
+                exit_code = 1
+        else:
+            summary["ATK1B_INIT"] = "FAIL"
             summary["READ_REPEAT"] = "SKIP"
             exit_code = 1
     except Exception as exc:

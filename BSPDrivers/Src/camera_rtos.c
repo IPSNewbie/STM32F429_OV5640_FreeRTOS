@@ -489,6 +489,10 @@ static uint32_t Camera_RTOS_CaptureProcessAndSend(void)
 // 文本和二进制请求共用同一条 DUMP 执行路径，并在入口执行SNAPSHOT软件保护
 static uint8_t Camera_RTOS_ProcessDumpRequest(uint8_t request_source)
 {
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U)
+    static const uint8_t sd_only_text[] =
+        "DUMP blocked: SD_ONLY_BOOT_NO_CAMERA.\r\n";
+#endif
     static const uint8_t blocked_text[] =
         "DUMP blocked: snapshot software guard active.\r\n";
     uint32_t error_code;
@@ -496,6 +500,30 @@ static uint8_t Camera_RTOS_ProcessDumpRequest(uint8_t request_source)
     uint32_t dump_elapsed_ms;
 
     Camera_RTOS_RecordDumpRequest();
+
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U)
+    if (request_source == CAMERA_RTOS_DUMP_SOURCE_BINARY)
+    {
+        Camera_SnapshotControl_RecordBinaryBlocked();
+    }
+    else
+    {
+        Camera_SnapshotControl_RecordDumpBlocked();
+    }
+
+    if (s_camera_rtos_uart != NULL)
+    {
+        (void)HAL_UART_Transmit(
+            s_camera_rtos_uart,
+            (uint8_t *)sd_only_text,
+            (uint16_t)(sizeof(sd_only_text) - 1U),
+            HAL_MAX_DELAY);
+    }
+
+    s_camera_rtos_stats.last_dump_time_ms = 0U;
+    Camera_RTOS_RecordDumpError(CAMERA_RTOS_ERR_SD_ONLY_BOOT_NO_CAMERA);
+    return 0U;
+#endif
 
     if (Camera_SnapshotControl_IsDumpAllowed() == 0U)
     {
