@@ -304,6 +304,7 @@ static void Camera_CLI_PrintSdStatus(UART_HandleTypeDef *huart)
         status.takeover_required);
     Camera_CLI_WriteFieldU32(huart, "sdio_ready", status.sdio_ready);
     Camera_CLI_WriteFieldU32(huart, "fatfs_ready", status.fatfs_ready);
+    Camera_CLI_WriteFieldText(huart, "last_mount", status.last_mount_text);
     Camera_CLI_WriteFieldText(huart, "last_error", status.last_error_text);
     Camera_CLI_WriteFieldText(
         huart,

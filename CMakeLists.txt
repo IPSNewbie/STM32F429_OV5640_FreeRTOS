@@ -49,6 +49,8 @@ add_executable(${CMAKE_PROJECT_NAME}
         BSPDrivers/Src/camera_cli.c
         BSPDrivers/Inc/camera_sd_storage.h
         BSPDrivers/Src/camera_sd_storage.c
+        BSPDrivers/Inc/camera_fatfs_diskio.h
+        BSPDrivers/Src/camera_fatfs_diskio.c
         BSPDrivers/Inc/camera_snapshot_control.h
         BSPDrivers/Src/camera_snapshot_control.c
         BSPDrivers/Inc/camera_frame_buffer.h
@@ -77,6 +79,7 @@ file(GLOB_RECURSE BSPDRIVERS CONFIGURE_DEPENDS "BSPDrivers/Src/*.c")
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         # Add user sources here
         ${BSPDRIVERS}
+        Middlewares/Third_Party/FatFs/src/ff.c
         Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_dcmi.c
         Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_sd.c
         Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_ll_sdmmc.c
@@ -88,6 +91,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
         BSPDrivers/Inc
+        Middlewares/Third_Party/FatFs/src
 )
 
 # Add project symbols (macros)

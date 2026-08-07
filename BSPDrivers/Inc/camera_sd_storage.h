@@ -25,6 +25,15 @@
 #define CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED     28U
 #define CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED    29U
 #define CAMERA_SD_ERR_NO_SAVED_3018               30U
+#define CAMERA_SD_ERR_SNAPSHOT_BUSY                31U
+#define CAMERA_SD_ERR_SNAPSHOT_PREPARE_FAILED      32U
+#define CAMERA_SD_ERR_FATFS_MOUNT_FAILED           33U
+#define CAMERA_SD_ERR_FATFS_UNMOUNT_FAILED         34U
+#define CAMERA_SD_ERR_FATFS_DISK_NOT_READY         35U
+#define CAMERA_SD_ERR_FATFS_DISK_READ_FAILED       36U
+#define CAMERA_SD_ERR_FATFS_DISK_IOCTL_FAILED      37U
+#define CAMERA_SD_ERR_FATFS_CARD_TIMEOUT           38U
+#define CAMERA_SD_ERR_INVALID_ARGUMENT             39U
 
 typedef struct
 {
@@ -33,6 +42,8 @@ typedef struct
     uint32_t takeover_required;
     uint32_t sdio_ready;
     uint32_t fatfs_ready;
+    uint32_t last_mount_result;
+    const char *last_mount_text;
     uint32_t last_error_code;
     const char *last_error_text;
     uint32_t dvp_mask_available;
@@ -47,6 +58,18 @@ typedef struct
 
 void Camera_SDStorage_InitState(void);
 void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status);
+
+/* Execute one complete read-only SD/FatFs mount check and always clean up. */
+uint32_t Camera_SDStorage_CheckFatfsMount(void);
+
+/* Minimal block-device hooks used only while the FatFs SD session is active. */
+uint32_t Camera_SDStorage_FatFsDiskStatus(void);
+uint32_t Camera_SDStorage_FatFsDiskInitialize(void);
+uint32_t Camera_SDStorage_FatFsDiskRead(
+    uint8_t *buffer,
+    uint32_t sector,
+    uint32_t count);
+uint32_t Camera_SDStorage_FatFsDiskIoctl(uint8_t command, void *buffer);
 
 /* Internal snapshot flow primitives; these are no longer exposed through CLI. */
 uint32_t Camera_SDStorage_StopDvpConflictPads(void);
