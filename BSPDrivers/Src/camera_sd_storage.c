@@ -37,6 +37,8 @@ static uint32_t s_atk_1bit_read_buffer_words[128];
 #define CAMERA_SD_SENSOR_STANDBY_VALUE 0x42U
 #define CAMERA_SD_SENSOR_RUN_VALUE 0x02U
 #define CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN 0xFFFFFFFFU
+#define CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG 0x3018U
+#define CAMERA_SD_DVP_CONFLICT_PAD_KEEP_MASK 0x8FU
 
 /* C5G 只读保存 HAL_SD_ReadBlocks 前后的 SDIO 寄存器，不清除任何状态标志。 */
 typedef struct
@@ -1243,6 +1245,32 @@ void Camera_SDStorage_InitState(void)
         CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
     s_camera_sd_status.sensor_stop_last_operation_ms = 0U;
     s_camera_sd_status.sensor_restore_last_operation_ms = 0U;
+    s_camera_sd_status.dvp_mask_supported = 1U;
+    s_camera_sd_status.dvp_mask_attempt_count = 0U;
+    s_camera_sd_status.dvp_mask_success_count = 0U;
+    s_camera_sd_status.dvp_mask_error_count = 0U;
+    s_camera_sd_status.dvp_restore_attempt_count = 0U;
+    s_camera_sd_status.dvp_restore_success_count = 0U;
+    s_camera_sd_status.dvp_restore_error_count = 0U;
+    s_camera_sd_status.dvp_mask_active = 0U;
+    s_camera_sd_status.dvp_mask_last_error_code = CAMERA_SD_OK;
+    s_camera_sd_status.dvp_mask_last_error_text = "OK";
+    s_camera_sd_status.dvp_mask_reg_3018_saved =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.dvp_mask_reg_3018_before =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.dvp_mask_reg_3018_written =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.dvp_mask_reg_3018_after =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.dvp_restore_reg_3018_before =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.dvp_restore_reg_3018_written =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.dvp_restore_reg_3018_after =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.dvp_mask_last_operation_ms = 0U;
+    s_camera_sd_status.dvp_restore_last_operation_ms = 0U;
     s_camera_sd_status.last_operation_ms = 0U;
     s_camera_sd_status.takeover_state = CAMERA_SD_TAKEOVER_STATE_IDLE;
     s_camera_sd_status.takeover_enter_attempt_count = 0U;
@@ -1603,6 +1631,166 @@ uint32_t Camera_SDStorage_RestoreSensorOutput(void)
     s_camera_sd_status.sensor_stop_last_error_text =
         Camera_SDStorage_ErrorToString(result);
     s_camera_sd_status.sensor_restore_last_operation_ms =
+        HAL_GetTick() - start_ms;
+    return result;
+}
+
+uint32_t Camera_SDStorage_StopDvpConflictPads(void)
+{
+    uint32_t start_ms = HAL_GetTick();
+    uint32_t result = CAMERA_SD_OK;
+    uint8_t reg_value = 0U;
+    uint8_t masked_value = 0U;
+
+    ++s_camera_sd_status.dvp_mask_attempt_count;
+    s_camera_sd_status.dvp_mask_reg_3018_before =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.dvp_mask_reg_3018_written =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.dvp_mask_reg_3018_after =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+
+    if (Camera_SDStorage_IsTakeoverPreconditionReady() == 0U)
+    {
+        result = CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED;
+    }
+    else if (SCCB_ReadReg(CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
+                          &reg_value) != 0U)
+    {
+        result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
+    }
+    else
+    {
+        s_camera_sd_status.dvp_mask_reg_3018_before = reg_value;
+        if (s_camera_sd_status.dvp_mask_active == 0U)
+        {
+            s_camera_sd_status.dvp_mask_reg_3018_saved = reg_value;
+        }
+
+        masked_value =
+            (uint8_t)(reg_value & CAMERA_SD_DVP_CONFLICT_PAD_KEEP_MASK);
+        s_camera_sd_status.dvp_mask_reg_3018_written = masked_value;
+
+        if (SCCB_WriteReg(CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
+                          masked_value) != 0U)
+        {
+            result = CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED;
+        }
+        else
+        {
+            HAL_Delay(5U);
+
+            if (SCCB_ReadReg(CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
+                             &reg_value) != 0U)
+            {
+                result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
+            }
+            else
+            {
+                s_camera_sd_status.dvp_mask_reg_3018_after = reg_value;
+                if (reg_value != masked_value)
+                {
+                    result = CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED;
+                }
+            }
+        }
+    }
+
+    if (result == CAMERA_SD_OK)
+    {
+        ++s_camera_sd_status.dvp_mask_success_count;
+        s_camera_sd_status.dvp_mask_active = 1U;
+    }
+    else
+    {
+        ++s_camera_sd_status.dvp_mask_error_count;
+    }
+
+    s_camera_sd_status.dvp_mask_last_error_code = result;
+    s_camera_sd_status.dvp_mask_last_error_text =
+        Camera_SDStorage_ErrorToString(result);
+    s_camera_sd_status.dvp_mask_last_operation_ms =
+        HAL_GetTick() - start_ms;
+    return result;
+}
+
+uint32_t Camera_SDStorage_RestoreDvpConflictPads(void)
+{
+    uint32_t start_ms = HAL_GetTick();
+    uint32_t result = CAMERA_SD_OK;
+    uint8_t reg_value = 0U;
+    uint8_t saved_value = 0U;
+
+    ++s_camera_sd_status.dvp_restore_attempt_count;
+    s_camera_sd_status.dvp_restore_reg_3018_before =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.dvp_restore_reg_3018_written =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+    s_camera_sd_status.dvp_restore_reg_3018_after =
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN;
+
+    if (s_camera_sd_status.dvp_mask_reg_3018_saved ==
+        CAMERA_SD_SENSOR_REG_VALUE_UNKNOWN)
+    {
+        result = CAMERA_SD_ERR_NO_SAVED_3018;
+    }
+    else if ((s_camera_sd_status.takeover_state ==
+              CAMERA_SD_TAKEOVER_STATE_ACTIVE) ||
+             (s_camera_sd_status.sdio_full_gpio_af12_selected != 0U))
+    {
+        result = CAMERA_SD_ERR_TAKEOVER_ALREADY_ACTIVE;
+    }
+    else if (SCCB_ReadReg(CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
+                          &reg_value) != 0U)
+    {
+        result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
+    }
+    else
+    {
+        s_camera_sd_status.dvp_restore_reg_3018_before = reg_value;
+        saved_value =
+            (uint8_t)s_camera_sd_status.dvp_mask_reg_3018_saved;
+        s_camera_sd_status.dvp_restore_reg_3018_written = saved_value;
+
+        if (SCCB_WriteReg(CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
+                          saved_value) != 0U)
+        {
+            result = CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED;
+        }
+        else
+        {
+            HAL_Delay(5U);
+
+            if (SCCB_ReadReg(CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG,
+                             &reg_value) != 0U)
+            {
+                result = CAMERA_SD_ERR_SENSOR_REG_READ_FAILED;
+            }
+            else
+            {
+                s_camera_sd_status.dvp_restore_reg_3018_after = reg_value;
+                if (reg_value != saved_value)
+                {
+                    result = CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED;
+                }
+            }
+        }
+    }
+
+    if (result == CAMERA_SD_OK)
+    {
+        ++s_camera_sd_status.dvp_restore_success_count;
+        s_camera_sd_status.dvp_mask_active = 0U;
+    }
+    else
+    {
+        ++s_camera_sd_status.dvp_restore_error_count;
+    }
+
+    s_camera_sd_status.dvp_mask_last_error_code = result;
+    s_camera_sd_status.dvp_mask_last_error_text =
+        Camera_SDStorage_ErrorToString(result);
+    s_camera_sd_status.dvp_restore_last_operation_ms =
         HAL_GetTick() - start_ms;
     return result;
 }
@@ -2612,6 +2800,9 @@ const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
 
         case CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED:
             return "SENSOR_REG_VERIFY_FAILED";
+
+        case CAMERA_SD_ERR_NO_SAVED_3018:
+            return "NO_SAVED_3018";
 
         default:
             return "UNKNOWN_ERROR";

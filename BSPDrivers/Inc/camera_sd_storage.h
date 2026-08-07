@@ -39,6 +39,7 @@
 #define CAMERA_SD_ERR_SENSOR_REG_READ_FAILED            27U
 #define CAMERA_SD_ERR_SENSOR_REG_WRITE_FAILED           28U
 #define CAMERA_SD_ERR_SENSOR_REG_VERIFY_FAILED          29U
+#define CAMERA_SD_ERR_NO_SAVED_3018                      30U
 
 /* SDIO 接管状态。Stage 11B-2 只会进入请求延后状态，不会进入 ACTIVE。 */
 #define CAMERA_SD_TAKEOVER_STATE_IDLE             0U
@@ -98,6 +99,25 @@ typedef struct
     uint32_t sensor_restore_last_reg_3008_after;
     uint32_t sensor_stop_last_operation_ms;
     uint32_t sensor_restore_last_operation_ms;
+    uint32_t dvp_mask_supported;                /* 是否支持 OV5640 D2/D3/D4 pad mask 诊断。 */
+    uint32_t dvp_mask_attempt_count;
+    uint32_t dvp_mask_success_count;
+    uint32_t dvp_mask_error_count;
+    uint32_t dvp_restore_attempt_count;
+    uint32_t dvp_restore_success_count;
+    uint32_t dvp_restore_error_count;
+    uint32_t dvp_mask_active;                   /* 0x3018[6:4] 已清零并读回确认时为 1。 */
+    uint32_t dvp_mask_last_error_code;
+    const char *dvp_mask_last_error_text;
+    uint32_t dvp_mask_reg_3018_saved;
+    uint32_t dvp_mask_reg_3018_before;
+    uint32_t dvp_mask_reg_3018_written;
+    uint32_t dvp_mask_reg_3018_after;
+    uint32_t dvp_restore_reg_3018_before;
+    uint32_t dvp_restore_reg_3018_written;
+    uint32_t dvp_restore_reg_3018_after;
+    uint32_t dvp_mask_last_operation_ms;
+    uint32_t dvp_restore_last_operation_ms;
     uint32_t last_operation_ms;  /* 最近一次 SD INIT 请求的处理耗时。 */
     uint32_t takeover_state;     /* 当前 SDIO 接管状态。 */
     uint32_t takeover_enter_attempt_count; /* 请求进入接管模式的次数。 */
@@ -315,6 +335,12 @@ uint32_t Camera_SDStorage_StopSensorOutput(void);
 
 /* 将 OV5640 0x3008 写为 0x02 并读回确认，不启动 DCMI/DMA。 */
 uint32_t Camera_SDStorage_RestoreSensorOutput(void);
+
+/* SNAPSHOT PREPARE 后仅清除 OV5640 0x3018[6:4] 并回读确认。 */
+uint32_t Camera_SDStorage_StopDvpConflictPads(void);
+
+/* TAKEOVER EXIT 后写回已保存的 OV5640 0x3018 原值并回读确认。 */
+uint32_t Camera_SDStorage_RestoreDvpConflictPads(void);
 
 /* SD-only 启动下建立虚拟相机暂停状态，不访问 DCMI、DMA 或相机电源。 */
 uint32_t Camera_SDStorage_RequestSdOnlyVirtualPrepare(void);

@@ -7541,3 +7541,143 @@ basic/repeat
 ```
 
 若 C1 下 SDIO 仍不稳定且 DVPRESTORE、`basic/repeat` 均可靠，下一轮才可保持相同流程单独验证 C2。任何 restore 或图像恢复失败都应立即停止扩大测试，不得将 mask 自动并入正式 takeover。
+
+## Stage 11C-5S OV5640 DVP D2/D3/D4 pad output mask 最小诊断
+
+### 1. 5O / 5Q / 5R 结论
+
+- 5O 已证明正常相机环境下 ATK1B block 0 仅 1/20 PASS、block 2048 仅 2/20 PASS，而 SD-only 环境两块合计 40/40 PASS；根因优先指向 OV5640 仍驱动 PC8、PC9、PC11 共享 DVP/SDIO 数据线。
+- 5Q 已证明 `0x3008=0x42` software standby 会使 ATK1BINIT 失败，写回 `0x3008=0x02` 后图像 `basic/repeat` 也不能恢复，因此该方案禁止作为主路线。
+- 5R 已确认 OV_D2、OV_D3、OV_D4 分别由 `0x3018[4]`、`0x3018[5]`、`0x3018[6]` 控制；当前工程与 ATK 初始化表均写入 `0x3018=0xFF`。
+
+### 2. 本轮最小 mask 范围
+
+本轮只验证 C1，不操作其他 DVP pad。`SD DVPSTOP` 先读取并保存 `0x3018` 原值，再执行 read-modify-write：
+
+```text
+new_3018 = old_3018 & 0x8F
+```
+
+该 mask 只清除 `0x3018[6:4]`，即只把 OV_D2/PC8/SDIO_D0、OV_D3/PC9/SDIO_D1、OV_D4/PC11/SDIO_D3 的 OV5640 pad 方向切为 input；D0、D1、D5、GPIO[1:0] 以及 `0x3017` 控制的 D6、D7、PCLK、HREF、VSYNC 等均保持不变。实现不会假定原值一定为 `0xFF`，也不会直接写固定 `0x8F`。
+
+### 3. 新增命令与状态
+
+- `SD DVPSTOP`：要求 `SNAPSHOT PREPARE` 已建立相机暂停和 software guard；读取并保存 `0x3018`，写入 `old & 0x8F`，等待 5 ms 后回读核对。重复调用时若 mask 已 active，不覆盖第一次保存的原值。
+- `SD DVPRESTORE`：要求已有有效保存值，并要求 SD takeover 已退出；读取当前 `0x3018`，写回保存的原值，等待 5 ms 后回读核对。本命令不重新初始化 OV5640，也不启动 DCMI DMA。
+- `SD DVPSTATUS`：输出 mask/restore 尝试、成功、错误计数，active 状态，最近错误码与文本，`0x3018` 保存值、操作前值、写入值、回读值和两类操作耗时。
+- `SD STATUS` 追加 DVP mask 支持、active、mask/restore 成败计数以及保存值、mask 后回读值、restore 后回读值摘要。
+
+`SD TAKEOVER ENTER` 不自动调用 DVPSTOP，`SD TAKEOVER EXIT` 也不自动调用 DVPRESTORE；本阶段保持手动顺序，避免把尚未板测的 sensor pad 操作并入正式 takeover。
+
+### 4. DVPSTOP / DVPRESTORE 行为
+
+`DVPSTOP` 的成功条件是：snapshot guard 前置检查通过、SCCB 读取成功、只以 `old & 0x8F` 写入 `0x3018`，并且回读值与写入值完全相等。成功后才设置 `dvp_mask_active=1`；任一步失败均增加错误计数并保留明确错误信息。
+
+`DVPRESTORE` 的成功条件是：`dvp_mask_reg_3018_saved` 有效、takeover 已退出、SCCB 当前值读取成功、保存原值写回成功，并且回读值与保存值完全相等。成功后才清除 `dvp_mask_active`。没有保存值时返回 `NO_SAVED_3018`，takeover 仍 active 时拒绝恢复。
+
+### 5. 推荐板测流程
+
+```text
+SNAPSHOT PREPARE
+SD DVPSTATUS
+SD DVPSTOP
+SD DVPSTATUS
+SD TAKEOVER ENTER
+SD ATK1BINIT
+SD ATK1BREAD 0
+SD ATK1BREAD 2048
+SD ATK1BSTATUS
+SD TAKEOVER EXIT
+SD DVPRESTORE
+SD DVPSTATUS
+SNAPSHOT RESTORE
+STATUS
+basic/repeat 图像恢复
+```
+
+本轮 Codex 不执行上述硬件测试；该流程用于下一次开发板验证。
+
+### 6. 结果判断
+
+- 如果 DVPSTOP 后 ATK1BINIT/READ 明显改善，并且 DVPRESTORE 后图像 `basic/repeat` 恢复，说明 `0x3018[6:4]` 是有效的最小共享线释放方案，可进入后续大样本稳定性验证。
+- 如果 DVPSTOP 后仍以随机 `DATA_CRC_FAIL` 为主，说明只释放 D2/D3/D4 不足；确认恢复闭环可靠后，再单独规划 C2 或其他方案。
+- 如果 DVPRESTORE 后图像不能恢复，说明该 pad mask 路径恢复风险仍高，不能自动并入 snapshot/takeover 主流程。
+
+### 7. 明确禁止
+
+- 禁止直接写 `0x3018=0x00`，禁止关闭全部 DVP D0-D7。
+- 禁止写 `0x3017`、`0x3008` 或 `0x4202`。
+- 禁止 PWDN、CAMOFF、CAMON、PCF8574_P2 路线。
+- 禁止接入 FATFS、写卡、`HAL_SD_WriteBlocks`、SDIO DMA 或 SDIO IRQ。
+- 禁止修改 ATK1B init/read 参数、SD INIT 主路径或 SD READTEST 主路径。
+- 禁止自动调用 DVPSTOP/DVPRESTORE，禁止执行硬件复位或系统复位。
+
+## Stage 11C-5T DVPSTOP 后 ATK1B 连续读块统计
+
+### 1. Stage 11C-5S 手动验证结果
+
+- `SD DVPSTOP` 成功将 OV5640 `0x3018` 从 `0xFF` 改为 `0x8F`，回读同为 `0x8F`；只清除了控制 OV_D2、OV_D3、OV_D4 的 `0x3018[6:4]`。
+- 完整 SDIO GPIO takeover 成功，PC8、PC9、PC10、PC11、PC12、PD2 均切换为 AF12。
+- `SD ATK1BINIT` 成功，HAL_SD_Init、CardInfo 和 card TRANSFER 等待均通过。
+- 单次 `SD ATK1BREAD 0` 与 `SD ATK1BREAD 2048` 均 PASS。
+- `SD DVPRESTORE` 成功将 `0x3018` 从 `0x8F` 恢复到保存的 `0xFF`，回读为 `0xFF`。
+- 图像 basic PASS，repeat 20/20 PASS，frame_id 连续；C1 同时具备 SDIO 改善与图像恢复的初步正向证据。
+
+### 2. 本轮目的
+
+本轮不修改固件，只把 5S 的每块单次读取扩大为连续统计。默认对 block 0 和 block 2048 各执行 20 次 `SD ATK1BREAD`，记录每次 HAL 状态、错误分类、卡状态、耗时和完整 512B buffer 指纹，验证两块是否均达到 20/20、100% PASS。
+
+### 3. 自动测试脚本
+
+新增：
+
+`tools/uart_sd_dvp_mask_repeat_test.py`
+
+脚本按以下顺序驱动已有 CLI：
+
+```text
+SD INIT
+SNAPSHOT PREPARE
+SD DVPSTATUS
+SD DVPSTOP
+SD DVPSTATUS
+SD TAKEOVER ENTER
+SD ATK1BINIT
+SD ATK1BSTATUS
+循环：SD ATK1BREAD <block> + SD ATK1BSTATUS
+SD TAKEOVER EXIT
+SD DVPRESTORE
+SD DVPSTATUS
+SNAPSHOT RESTORE
+STATUS
+```
+
+若 DVPSTOP、TAKEOVER ENTER 或 ATK1BINIT 任一步失败，读循环标记为 SKIP，但脚本仍尽量执行 TAKEOVER EXIT、DVPRESTORE、SNAPSHOT RESTORE 和 STATUS。DVPRESTORE 以实际保存的 `0x3018` 原值作为恢复校验目标，不硬编码必须恢复为 `0xFF`。
+
+脚本生成 `captures/sd_dvp_mask_repeat_<timestamp>.csv`、对应 `_log.txt` 和 `_summary.txt`。CSV 保存逐次读结果与 buffer 指纹；summary 保存 DVP mask/restore、takeover、ATK1B init、每个 block 的成功率和指纹唯一值统计以及清理结果。
+
+### 4. 运行命令
+
+```text
+python tools/uart_sd_dvp_mask_repeat_test.py --port COM4 --baud 115200 --read-count 20 --blocks 0,2048
+```
+
+默认参数为 COM4、115200、每块 20 次、blocks 0/2048、命令超时 5.0 秒和 tag `dvp_mask_repeat`。
+
+### 5. 测试后图像恢复验证
+
+自动脚本不发送二进制图像请求。脚本完成并确认清理结果后，仍必须手动运行：
+
+```text
+python tools/uart_image_request_basic.py
+python tools/uart_image_request_repeat.py
+```
+
+需要同时检查 basic、repeat 20/20、frame_id 连续性和系统错误计数。
+
+### 6. 结果判断
+
+- 若 block 0 与 block 2048 均为 20/20 PASS，且后续图像 basic/repeat PASS，则 C1 可进入下一阶段主流程集成设计。
+- 若 DVPSTOP 成功但连续读仍出现 `DATA_CRC_FAIL`、NOT_READY 或其他错误，说明只释放 D2/D3/D4 的 C1 方案仍不足，不能直接集成。
+- 若连续读达到 100% PASS 但 DVPRESTORE 或图像恢复失败，说明 C1 的恢复风险不可接受，不能并入主流程。
+- 本轮不执行硬件测试、不修改固件、不接 FATFS、不写卡、不启用 SDIO DMA/IRQ，也不提交 Git commit。

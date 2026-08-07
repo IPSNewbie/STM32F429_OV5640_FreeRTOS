@@ -311,6 +311,9 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart) // 输出当前 CLI 
     Camera_CLI_WriteLine(huart, "SD SENSORSTOP - set OV5640 0x3008 software standby after SNAPSHOT PREPARE");
     Camera_CLI_WriteLine(huart, "SD SENSORRESTORE - clear OV5640 0x3008 software standby after TAKEOVER EXIT");
     Camera_CLI_WriteLine(huart, "SD SENSORSTATUS - show OV5640 software standby diagnostic status");
+    Camera_CLI_WriteLine(huart, "SD DVPSTOP - disable OV5640 D2/D3/D4 pad output after SNAPSHOT PREPARE");
+    Camera_CLI_WriteLine(huart, "SD DVPRESTORE - restore saved OV5640 0x3018 after TAKEOVER EXIT");
+    Camera_CLI_WriteLine(huart, "SD DVPSTATUS - show OV5640 DVP pad mask diagnostic status");
     Camera_CLI_WriteLine(huart, "SD INIT - request SD card init, currently deferred until SDIO takeover"); // 请求初始化，本阶段延后到 SDIO 接管完成后
     Camera_CLI_WriteLine(huart, "SD TAKEOVER STATUS - show SDIO takeover status"); // 查询 SDIO 接管软件状态
     Camera_CLI_WriteLine(huart, "SD TAKEOVER ENTER - request SDIO takeover, currently deferred"); // 请求进入接管模式，本阶段只记录请求
@@ -1338,6 +1341,39 @@ static void Camera_CLI_PrintSdStatus(UART_HandleTypeDef *huart)
         status.sensor_restore_last_reg_3008_after);
     Camera_CLI_WriteStatLine(
         huart,
+        "dvp_mask_supported",
+        status.dvp_mask_supported);
+    Camera_CLI_WriteStatLine(huart, "dvp_mask_active", status.dvp_mask_active);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dvp_mask_success_count",
+        status.dvp_mask_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dvp_mask_error_count",
+        status.dvp_mask_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dvp_restore_success_count",
+        status.dvp_restore_success_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dvp_restore_error_count",
+        status.dvp_restore_error_count);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dvp_mask_reg_3018_saved",
+        status.dvp_mask_reg_3018_saved);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dvp_mask_reg_3018_after",
+        status.dvp_mask_reg_3018_after);
+    Camera_CLI_WriteStatLine(
+        huart,
+        "dvp_restore_reg_3018_after",
+        status.dvp_restore_reg_3018_after);
+    Camera_CLI_WriteStatLine(
+        huart,
         "sd_init_clock_div_configured",
         CAMERA_SD_INIT_CLOCK_DIV);
     Camera_CLI_WriteStatLine(huart, "init_attempt_count", status.init_attempt_count);
@@ -1451,6 +1487,38 @@ static void Camera_CLI_PrintSdSensorStatus(UART_HandleTypeDef *huart)
     Camera_CLI_WriteStatLine(huart, "sensor_restore_last_operation_ms", status.sensor_restore_last_operation_ms);
 }
 
+static void Camera_CLI_PrintSdDvpStatus(UART_HandleTypeDef *huart)
+{
+    CameraSdStorageStatus_t status;
+
+    Camera_SDStorage_GetStatus(&status);
+    Camera_CLI_WriteLine(huart, "SD DVP:");
+    Camera_CLI_WriteStatLine(huart, "dvp_mask_supported", status.dvp_mask_supported);
+    Camera_CLI_WriteStatLine(huart, "dvp_mask_attempt_count", status.dvp_mask_attempt_count);
+    Camera_CLI_WriteStatLine(huart, "dvp_mask_success_count", status.dvp_mask_success_count);
+    Camera_CLI_WriteStatLine(huart, "dvp_mask_error_count", status.dvp_mask_error_count);
+    Camera_CLI_WriteStatLine(huart, "dvp_restore_attempt_count", status.dvp_restore_attempt_count);
+    Camera_CLI_WriteStatLine(huart, "dvp_restore_success_count", status.dvp_restore_success_count);
+    Camera_CLI_WriteStatLine(huart, "dvp_restore_error_count", status.dvp_restore_error_count);
+    Camera_CLI_WriteStatLine(huart, "dvp_mask_active", status.dvp_mask_active);
+    Camera_CLI_WriteStatLine(huart, "dvp_mask_last_error_code", status.dvp_mask_last_error_code);
+    Camera_CLI_WriteText(huart, "  dvp_mask_last_error_text=");
+    Camera_CLI_WriteLine(
+        huart,
+        (status.dvp_mask_last_error_text != NULL)
+            ? status.dvp_mask_last_error_text
+            : "UNKNOWN");
+    Camera_CLI_WriteStatLine(huart, "dvp_mask_reg_3018_saved", status.dvp_mask_reg_3018_saved);
+    Camera_CLI_WriteStatLine(huart, "dvp_mask_reg_3018_before", status.dvp_mask_reg_3018_before);
+    Camera_CLI_WriteStatLine(huart, "dvp_mask_reg_3018_written", status.dvp_mask_reg_3018_written);
+    Camera_CLI_WriteStatLine(huart, "dvp_mask_reg_3018_after", status.dvp_mask_reg_3018_after);
+    Camera_CLI_WriteStatLine(huart, "dvp_restore_reg_3018_before", status.dvp_restore_reg_3018_before);
+    Camera_CLI_WriteStatLine(huart, "dvp_restore_reg_3018_written", status.dvp_restore_reg_3018_written);
+    Camera_CLI_WriteStatLine(huart, "dvp_restore_reg_3018_after", status.dvp_restore_reg_3018_after);
+    Camera_CLI_WriteStatLine(huart, "dvp_mask_last_operation_ms", status.dvp_mask_last_operation_ms);
+    Camera_CLI_WriteStatLine(huart, "dvp_restore_last_operation_ms", status.dvp_restore_last_operation_ms);
+}
+
 /* 单独输出 SDIO 接管状态，不执行任何硬件接管操作。 */
 static void Camera_CLI_PrintSdTakeoverStatus(UART_HandleTypeDef *huart)
 {
@@ -1508,6 +1576,78 @@ static CameraCliStatus_t Camera_CLI_HandleSd(UART_HandleTypeDef *huart,
     if (Camera_CLI_TokenEquals(arg, arg_len, "SENSORSTATUS") != 0U)
     {
         Camera_CLI_PrintSdSensorStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "DVPSTATUS") != 0U)
+    {
+        Camera_CLI_PrintSdDvpStatus(huart);
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "DVPSTOP") != 0U)
+    {
+        CameraSdStorageStatus_t status;
+
+        result = Camera_SDStorage_StopDvpConflictPads();
+        Camera_SDStorage_GetStatus(&status);
+
+        if (result == CAMERA_SD_OK)
+        {
+            Camera_CLI_WriteText(
+                huart,
+                "SD DVPSTOP: OV5640 D2/D3/D4 pad output disabled, reg3018=0x");
+            Camera_CLI_WriteHexU32(huart, status.dvp_mask_reg_3018_after);
+            Camera_CLI_WriteText(huart, ".\r\n");
+        }
+        else if (result == CAMERA_SD_ERR_SNAPSHOT_NOT_PAUSED)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD DVPSTOP: blocked, run SNAPSHOT PREPARE first.");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SD DVPSTOP: ");
+            Camera_CLI_WriteText(
+                huart,
+                Camera_SDStorage_ErrorToString(result));
+            Camera_CLI_WriteText(huart, ".\r\n");
+        }
+
+        return CAMERA_CLI_OK;
+    }
+
+    if (Camera_CLI_TokenEquals(arg, arg_len, "DVPRESTORE") != 0U)
+    {
+        CameraSdStorageStatus_t status;
+
+        result = Camera_SDStorage_RestoreDvpConflictPads();
+        Camera_SDStorage_GetStatus(&status);
+
+        if (result == CAMERA_SD_OK)
+        {
+            Camera_CLI_WriteText(
+                huart,
+                "SD DVPRESTORE: OV5640 DVP pad output restored, reg3018=0x");
+            Camera_CLI_WriteHexU32(huart, status.dvp_restore_reg_3018_after);
+            Camera_CLI_WriteText(huart, ".\r\n");
+        }
+        else if (result == CAMERA_SD_ERR_TAKEOVER_ALREADY_ACTIVE)
+        {
+            Camera_CLI_WriteLine(
+                huart,
+                "SD DVPRESTORE: blocked, run SD TAKEOVER EXIT first.");
+        }
+        else
+        {
+            Camera_CLI_WriteText(huart, "SD DVPRESTORE: ");
+            Camera_CLI_WriteText(
+                huart,
+                Camera_SDStorage_ErrorToString(result));
+            Camera_CLI_WriteText(huart, ".\r\n");
+        }
+
         return CAMERA_CLI_OK;
     }
 
