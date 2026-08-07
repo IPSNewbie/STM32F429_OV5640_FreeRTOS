@@ -7914,3 +7914,47 @@ SD 模块不再包含 ATK official 4-bit、ATK1B、READTEST/READINFO、LINESTATE
 - SD STATUS 仍只输出 `supported`、`card_ready`、`takeover_required`、`sdio_ready`、`fatfs_ready`、`last_error` 和 `dvp_mask_solution=OV5640_3018_6_4`。
 
 Stage 12B 不接 FATFS、不写卡、不启用 SDIO DMA/IRQ，不执行硬件测试，也不提交 Git commit。
+
+## Stage 12C camera_rtos 引用审计与安全瘦身
+
+### 1. 回归边界
+
+Stage 12A 已证明：不能因为字段不再由 STATUS 输出，就直接删除 DUMP、binary request、UART DMA、stream buffer、IWDG 或 heartbeat 链路依赖的内部状态。本轮先逐字段、逐函数搜索读写者和调用者，只删除已确认不参与输出、判断或主流程的代码；图像请求分发、采集、发送及 UART 恢复流程均未改动。
+
+### 2. 已删除的无功能依赖字段
+
+- 只写不读的任务循环统计：`camera_service_loop_count`、`monitor_tick_count`
+- 已无 CLI 调用者的统计：`cli_command_count`、`cli_unknown_count`
+- 与真实 `UartRxDmaStats_t::uart_error_count` 重复且不再被读取的 RTOS 镜像：`CameraRtosStats_t::uart_error_count`
+- 已无 STATUS 调用者的时间记录：`last_status_time_ms`
+- 只写不读的健康采样次数：`health_sample_count`
+- 已不再输出且不参与 IWDG 判断的刷新展示字段：`iwdg_refresh_count`、`iwdg_last_refresh_ms`、`iwdg_last_skip_ms`
+- 仅复制编译期常量且不参与判断的字段：`iwdg_timeout_ms`、`iwdg_camera_age_limit_ms`、`iwdg_monitor_age_limit_ms`
+- 只服务于已删除 `IWDGTEST CAMERA_TIMEOUT` CLI 的字段：`iwdg_test_mode`
+
+IWDG 心跳年龄阈值宏仍由正式刷新判断直接使用；删除的只是未被读取的结构体镜像。
+
+### 3. 已删除的无调用者函数
+
+- `Camera_RTOS_EnableIwdgCameraTimeoutTest`
+- `Camera_RTOS_RecordCliCommand`
+- `Camera_RTOS_RecordCliUnknown`
+- `Camera_RTOS_RecordUartError`
+- `Camera_RTOS_RecordStatus`
+- static `Camera_RTOS_SyncUartErrorCount`
+
+其中 UART DMA 的实际错误计数、恢复函数和 STATUS 读取均继续使用 `uart_rx_dma` 模块，不受 RTOS 重复镜像删除影响。
+
+### 4. 保留与暂缓删除
+
+- 保留当前 STATUS 所需的 `uptime_ms`、stack/heap、`hook_fault_code`、`assert_line`、`iwdg_enabled`、`iwdg_refresh_skip_count`、`iwdg_last_skip_reason`。
+- 保留 Hook 记录接口及 `hook_fault_count`；该字段属于明确冻结的 Hook fault/assert 记录范围。
+- 保留全部 heartbeat count/time/age 字段；它们参与 IWDG 正式刷新判断。
+- 保留真实 UART DMA/stream buffer 的 event、byte、overflow、error、recovery、resync 状态及处理逻辑。
+- 暂缓删除 DUMP request/success/error、`last_dump_time_ms`、`last_error_code` 及其记录接口，避免再次触碰已经发生过回归的 DUMP 链路。
+- 暂缓删除 binary request 成功/错误分类、timeout、last sequence/error 字段及记录函数，避免触碰 binary request 解析与响应链路。
+- 暂缓删除 `uart_none_count`、`uart_pending_count` 及其记录接口；它们位于当前 UART 主循环路径，留待有硬件回归条件时另行处理。
+
+### 5. 范围约束
+
+Stage 12C 不修改 Core、CMake、tools、SD storage、PC dump、UART dispatcher、image request、CRC、OV5640、SCCB 或 LCD 模块；不新增 CLI，不接 FATFS，不写卡，不启用 SDIO DMA/IRQ，不执行硬件测试，也不提交 Git commit。

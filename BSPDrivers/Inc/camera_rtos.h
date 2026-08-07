@@ -57,15 +57,6 @@ typedef enum
     CAMERA_RTOS_IWDG_SKIP_HOOK_FAULT = 5U
 } CameraRtosIwdgSkipReason_t;
 
-/**
- * @brief IWDG故障路径测试模式，仅保存在RAM中
- */
-typedef enum
-{
-    CAMERA_RTOS_IWDG_TEST_NONE = 0U,
-    CAMERA_RTOS_IWDG_TEST_FORCE_CAMERA_TIMEOUT = 1U
-} CameraRtosIwdgTestMode_t;
-
 //============================================================================
 // 结构体：RTOS 运行统计信息
 //============================================================================
@@ -76,16 +67,11 @@ typedef enum
  */
 typedef struct
 {
-    volatile uint32_t camera_service_loop_count; /**< 摄像头服务主循环运行次数 */
-    volatile uint32_t monitor_tick_count;        /**< 监控任务心跳次数 */
-    volatile uint32_t cli_command_count;         /**< 完整 CLI 命令次数 */
-    volatile uint32_t cli_unknown_count;         /**< 未知 CLI 命令次数 */
     volatile uint32_t dump_request_count;        /**< DUMP 请求次数 */
     volatile uint32_t dump_success_count;        /**< DUMP 成功次数 */
     volatile uint32_t dump_error_count;          /**< DUMP 失败次数 */
     volatile uint32_t uart_none_count;           /**< StreamBuffer 读取超时次数 */
     volatile uint32_t uart_pending_count;        /**< 文本行尚未完整的字节次数 */
-    volatile uint32_t uart_error_count;          /**< UART DMA 错误兼容计数 */
     volatile uint32_t binary_request_count;      /**< 合法二进制图像请求次数 */
     volatile uint32_t binary_request_success_count; /**< 二进制请求成功发送图像次数 */
     volatile uint32_t binary_request_error_count;   /**< 二进制请求解析错误总数 */
@@ -99,9 +85,7 @@ typedef struct
     volatile uint32_t last_binary_error_code;   /**< 最近一次二进制解析错误枚举值 */
     volatile uint32_t last_error_code;           /**< 最后一次错误码 */
     volatile uint32_t last_dump_time_ms;         /**< 最近一次 DUMP 耗时 */
-    volatile uint32_t last_status_time_ms;       /**< 最近一次 STATUS 时间 */
     volatile uint32_t uptime_ms;                 /**< MonitorTask 累计运行时间 */
-    volatile uint32_t health_sample_count;       /**< MonitorTask 健康资源采样次数 */
     volatile uint32_t camera_service_stack_min_free_bytes; /**< CameraServiceTask 历史最小栈余量，单位 B */
     volatile uint32_t monitor_stack_min_free_bytes; /**< MonitorTask 历史最小栈余量，单位 B */
     volatile uint32_t free_heap_bytes;            /**< 当前 FreeRTOS Heap 余量，单位 B */
@@ -116,15 +100,8 @@ typedef struct
     volatile uint32_t camera_service_heartbeat_age_ms; /**< CameraServiceTask心跳年龄，单位ms */
     volatile uint32_t monitor_heartbeat_age_ms;    /**< MonitorTask心跳年龄，单位ms */
     volatile uint32_t iwdg_enabled;                /**< IWDG已启用标志 */
-    volatile uint32_t iwdg_refresh_count;          /**< MonitorTask成功刷新IWDG次数 */
     volatile uint32_t iwdg_refresh_skip_count;     /**< 因健康条件不满足而跳过刷新次数 */
-    volatile uint32_t iwdg_last_refresh_ms;        /**< 最近一次成功刷新时间，单位ms */
-    volatile uint32_t iwdg_last_skip_ms;           /**< 最近一次跳过刷新时间，单位ms */
     volatile uint32_t iwdg_last_skip_reason;       /**< 最近一次跳过刷新原因 */
-    volatile uint32_t iwdg_timeout_ms;             /**< IWDG设计超时时间，单位ms */
-    volatile uint32_t iwdg_camera_age_limit_ms;    /**< CameraServiceTask心跳年龄阈值，单位ms */
-    volatile uint32_t iwdg_monitor_age_limit_ms;   /**< MonitorTask心跳年龄阈值，单位ms */
-    volatile uint32_t iwdg_test_mode;              /**< IWDG故障路径测试模式，仅保存在RAM中 */
 } CameraRtosStats_t;
 
 //============================================================================
@@ -144,22 +121,6 @@ void Camera_RTOS_Init(UART_HandleTypeDef *huart);
  * @note   应在应用初始化和任务创建完成后、调度器启动前调用
  */
 HAL_StatusTypeDef Camera_RTOS_IwdgInit(void);
-
-/**
- * @brief  启用CameraServiceTask心跳超时模拟测试
- * @note   仅设置RAM标志，由MonitorTask停止刷新IWDG，不主动复位
- */
-void Camera_RTOS_EnableIwdgCameraTimeoutTest(void);
-
-/**
- * @brief  记录一条完整 CLI 命令
- */
-void Camera_RTOS_RecordCliCommand(void);
-
-/**
- * @brief  记录一条未知 CLI 命令
- */
-void Camera_RTOS_RecordCliUnknown(void);
 
 /**
  * @brief  记录一次 DUMP 请求
@@ -187,17 +148,6 @@ void Camera_RTOS_RecordUartNone(void);
  * @brief  记录一次 UART 命令接收中状态
  */
 void Camera_RTOS_RecordUartPending(void);
-
-/**
- * @brief  记录一次 UART 接收错误
- */
-void Camera_RTOS_RecordUartError(void);
-
-/**
- * @brief  记录 STATUS 命令执行时间
- * @param  time_ms 当前系统时间，单位为毫秒
- */
-void Camera_RTOS_RecordStatus(uint32_t time_ms);
 
 /**
  * @brief  记录FreeRTOS严重错误Hook状态
