@@ -7413,3 +7413,131 @@ basic/repeat 图像恢复
 - 不修改 ATK1B init/read 参数、SD INIT 主路径或 SD READTEST 主路径。
 - 不接 FATFS、不写卡、不启用 SDIO DMA/IRQ。
 - 本轮不执行硬件测试，也不提交 Git commit。
+
+## Stage 11C-5R OV5640 0x3017/0x3018 DVP pad output enable 精确查证
+
+### 1. 5Q 结论回顾
+
+- `SD SENSORSTOP` 已证明可以把 OV5640 `0x3008` 从 `0x02` 写成 `0x42`，寄存器写入与回读路径本身可用。
+- 进入 software standby 后，`SD ATK1BINIT` 在 `HAL_SD_Init` 阶段失败，HAL error 为 `0x00000004`，没有进入稳定读块验证。
+- `SD SENSORRESTORE` 可以把 `0x3008` 从 `0x42` 写回 `0x02`。
+- 写回后图像 `basic/repeat` 均无响应，原图像链路没有恢复。
+- 因此 `0x3008` software standby 方案已经失败，禁止并入主流程；后续转向只改变 DVP pad 方向的 `0x3017/0x3018` 最小诊断路径。
+
+### 2. 当前工程 0x3017/0x3018 使用情况
+
+| 文件名 | 函数名或初始化表位置 | 写入值 | 上下文 | 是否默认写入 |
+| --- | --- | --- | --- | --- |
+| `BSPDrivers/Inc/OV5640cfg.h:209` | `ov5640_init_reg_tbl` | `0x3017=0xFF` | 注释为 FREX、VSYNC、HREF、PCLK、D[9:6] output enable | 是 |
+| `BSPDrivers/Inc/OV5640cfg.h:212` | `ov5640_init_reg_tbl` | `0x3018=0xFF` | 注释为 D[5:0]、GPIO[1:0] output enable | 是 |
+| `BSPDrivers/Src/OV5640.c` | `OV5640_Min_InitRGB565_QVGA_TestBar()`、`OV5640_Min_InitRGB565_480x320_TestBar()`；real-image 与 160x120 路径复用这些初始化函数 | 通过 `OV5640_Min_WriteTable()` 写入上述初始化表 | 当前 QVGA、160x120、480x320 RGB565 初始化族都会经过该表 | 是 |
+
+结论：当前工程正常完成 OV5640 初始化后，预期运行配置为 `0x3017=0xFF`、`0x3018=0xFF`，即这两个寄存器涉及的 pad 全部设为 output。这里的 `0xFF` 是本工程主动写入的运行值，不是芯片手册给出的寄存器默认值。
+
+### 3. ATK 例程 0x3017/0x3018 使用情况
+
+扫描到的正点原子 OV5640 例程路径为：
+
+`D:\MCU+FreeRTOS\STM32_HAL\ISP_Project\实验38 摄像头实验\Drivers\BSP\OV5640`
+
+| 文件名 | 函数名或初始化表位置 | 写入值 | 上下文 | 与当前工程是否一致 |
+| --- | --- | --- | --- | --- |
+| `ov5640cfg.h:141` | `ov5640_init_reg_tbl` | `0x3017=0xFF` | FREX、VSYNC、HREF、PCLK、D[9:6] output enable | 是 |
+| `ov5640cfg.h:142` | `ov5640_init_reg_tbl` | `0x3018=0xFF` | D[5:0]、GPIO[1:0] output enable | 是 |
+| `ov5640.c:103`、`ov5640.c:145-147` | `ov5640_init()` 循环写入 `ov5640_init_reg_tbl` | 写入上述 `0xFF/0xFF` | 完整传感器初始化过程 | 是 |
+
+ATK 例程与当前工程都只给出了全使能写法，没有 DVP data pad disable、保存原值或恢复原值的现成实现；因此下一步只能建立独立、可回滚的最小诊断分支，不能把未验证的固定值直接并入 takeover。
+
+### 4. 0x3017/0x3018 bit 位含义查证
+
+主要证据为 OmniVision `OV5640 color CMOS QSXGA image sensor with OmniBSI technology PRODUCT SPECIFICATION version 2.01` 的 I/O control 表和 system/IO pad control register 表。手册明确说明：I/O control 中 `0=input`、`1=output`；`0x3017[3:0]` 与 `0x3018[7:2]` 依次控制 D[9:0]，两个寄存器的手册默认值均为 `0x00`。Linux 主线驱动也将这两个地址命名为 `OV5640_REG_PAD_OUTPUT_ENABLE01/02`，可作为寄存器用途的实现侧交叉证据。
+
+资料链接：[OV5640 Product Specification PDF](https://files.waveshare.com/upload/d/da/OV5640_DataSheet.pdf)、[Linux mainline OV5640 driver](https://github.com/torvalds/linux/blob/master/drivers/media/i2c/ov5640.c)。
+
+下表“初始值”是芯片手册列出的寄存器默认 bit 值 `0`；当前工程与 ATK 初始化表随后都会主动写成 `1`。
+
+| 寄存器 | bit | 控制对象 | 初始值 | 是否与 DVP 数据线相关 | 是否与 SDIO 冲突线相关 | 证据来源 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `0x3017` | 7 | FREX output enable | 0 | 否 | 否 | OV5640 Product Specification，PAD OUTPUT ENABLE 01 |
+| `0x3017` | 6 | VSYNC output enable | 0 | 否 | 否 | 同上 |
+| `0x3017` | 5 | HREF output enable | 0 | 否 | 否 | 同上 |
+| `0x3017` | 4 | PCLK output enable | 0 | 否 | 否 | 同上 |
+| `0x3017` | 3 | D9 output enable | 0 | 是 | 否，本项目未使用 D9 | 手册的 `Bit[3:0]: D[9:6]` |
+| `0x3017` | 2 | D8 output enable | 0 | 是 | 否，本项目未使用 D8 | 同上 |
+| `0x3017` | 1 | D7 output enable | 0 | 是 | 否 | 同上 |
+| `0x3017` | 0 | D6 output enable | 0 | 是 | 否 | 同上 |
+| `0x3018` | 7 | D5 output enable | 0 | 是 | 否 | OV5640 Product Specification，PAD OUTPUT ENABLE 02 的 `Bit[7:2]: D[5:0]` |
+| `0x3018` | 6 | **D4 output enable** | 0 | 是 | **是：PC11/SDIO_D3** | 同上 |
+| `0x3018` | 5 | **D3 output enable** | 0 | 是 | **是：PC9/SDIO_D1** | 同上 |
+| `0x3018` | 4 | **D2 output enable** | 0 | 是 | **是：PC8/SDIO_D0** | 同上 |
+| `0x3018` | 3 | D1 output enable | 0 | 是 | 否 | 同上 |
+| `0x3018` | 2 | D0 output enable | 0 | 是 | 否 | 同上 |
+| `0x3018` | 1 | GPIO1 output enable | 0 | 否 | 否 | OV5640 Product Specification，PAD OUTPUT ENABLE 02 |
+| `0x3018` | 0 | GPIO0 output enable | 0 | 否 | 否 | 同上 |
+
+精确结论：OV_D2、OV_D3、OV_D4 分别由 `0x3018[4]`、`0x3018[5]`、`0x3018[6]` 控制；三个位的合并 mask 为 `0x70`。手册能确认写 0 将 pad 方向设为 input，因而它是释放输出驱动的直接候选；但手册没有在该表中单独给出板级共享总线下的高阻、电平和无毛刺保证，实际是否彻底消除 SDIO 干扰仍必须由 5S 板测确认。
+
+### 5. DVP / SDIO 冲突线映射表
+
+| OV5640 DVP 线 | STM32 引脚 | SDIO 功能 | 是否冲突 | 可能受控寄存器 bit |
+| --- | --- | --- | --- | --- |
+| OV_D0 | PC6 | 无 | 否 | `0x3018[2]` |
+| OV_D1 | PC7 | 无 | 否 | `0x3018[3]` |
+| OV_D2 | PC8 | SDIO_D0 | 是 | `0x3018[4]` |
+| OV_D3 | PC9 | SDIO_D1 | 是 | `0x3018[5]` |
+| OV_D4 | PC11 | SDIO_D3 | 是 | `0x3018[6]` |
+| OV_D5 | PD3 | 无 | 否 | `0x3018[7]` |
+| OV_D6 | PB8 | 无 | 否 | `0x3017[0]` |
+| OV_D7 | PB9 | 无 | 否 | `0x3017[1]` |
+
+### 6. 候选 mask 方案
+
+本节只记录候选计算，不实现、不写寄存器。所有方案都必须先通过 SCCB 读取并保存两个寄存器原值，不得假定运行时一定为初始化表中的 `0xFF`。
+
+- **方案 C1：只关闭 OV_D2 / OV_D3 / OV_D4 输出。** 保持 `0x3017` 原值不变；将 `0x3018` 写为 `saved_3018 & ~0x70`，等价于 `saved_3018 & 0x8F`。若实读原值为 `0xFF`，候选写入值才是 `0x8F`。该方案只把 D2/D3/D4 pad 设为 input，保留 D0/D1/D5/D6/D7 以及同步信号输出，是 5S 的第一优先级最小 mask。
+- **方案 C2：关闭全部 DVP D0-D7 输出。** 将 `0x3017` 写为 `saved_3017 & ~0x03`，即 `saved_3017 & 0xFC`；将 `0x3018` 写为 `saved_3018 & ~0xFC`，即 `saved_3018 & 0x03`。若两个实读原值均为 `0xFF`，候选值分别为 `0xFC` 与 `0x03`。这会保留 FREX/VSYNC/HREF/PCLK 和 GPIO[1:0] 的原方向，只关闭八根 DVP 数据线；它不是直接写 `0x00`，但影响面仍大于 C1，只应在 C1 不足时单独验证。
+- **方案 C3：保存、mask、严格原值恢复。** `DVPSTOP` 先保存 `saved_3017/saved_3018`，确认读成功后才按 C1 或 C2 做 read-modify-write，并逐寄存器回读核对；SDIO 读取完成且 takeover 已退出后，`DVPRESTORE` 将两个寄存器严格恢复为保存值并回读核对。不得用硬编码 `0xFF` 替代保存值，不得只恢复其中一个寄存器，也不得在恢复失败后继续把图像链路报告为正常。
+
+由于 bit 位已经由原厂寄存器表确认，具备进入 5S 最小硬件诊断的资料条件；但“input”在本开发板共享线上的实际释放效果、写寄存器时序以及图像恢复能力仍是待测项，不能把候选 mask 直接视为已验证修复。
+
+### 7. 风险判断
+
+- `0x3017/0x3018` 直接改变 OV5640 pad 输入/输出方向，不执行 sensor reset、software standby 或硬件 PWDN，影响面低于 `0x3008` 与 PWDN；但写错 bit、写错顺序或恢复不完整仍可能破坏图像输出与恢复。
+- 下一轮若实现，必须先读取并保存原值，再做 read-modify-write；任一 SCCB 读、写或回读失败都必须中止，不得进入 SDIO takeover。
+- 必须提供与 `SENSORRESTORE` 等价的显式 `DVPRESTORE` 命令和状态信息，确保异常路径也能尝试恢复保存值。
+- 必须同时验证 SDIO block 0/block 2048 连续读和图像 `basic/repeat`；只有两边都通过，候选方案才成立。
+- 禁止直接向 `0x3017` 或 `0x3018` 写 `0x00`；禁止用固定 `0x8F/0xFC/0x03/0xFF` 跳过实读与保存。
+- 禁止在 bit 位未确认、寄存器实读失败或保存值无效时操作。
+- 禁止 PWDN、CAMOFF、CAMON、PCF8574_P2 路线；禁止回到已失败的 `0x3008` standby 主路线。
+- 禁止接入 FATFS、写卡、SDIO DMA 或 SDIO IRQ；先完成只读单块/连续读诊断。
+
+### 8. 下一轮 5S 建议
+
+建议下一阶段定义为：**Stage 11C-5S：OV5640 DVP pad output mask 最小诊断**。
+
+建议 CLI：
+
+```text
+SD DVPSTOP
+SD DVPRESTORE
+SD DVPSTATUS
+```
+
+5S 第一轮只实现 C1：保存 `0x3017/0x3018`，仅清除 `0x3018[6:4]`，回读确认后进入既有 SDIO 路径；不同时试 C2，不混写 `0x3008`、`0x4202` 或 PWDN。建议流程：
+
+```text
+SNAPSHOT PREPARE
+SD DVPSTOP
+SD DVPSTATUS
+SD TAKEOVER ENTER
+SD ATK1BINIT
+SD ATK1BREAD 0
+SD ATK1BREAD 2048
+SD TAKEOVER EXIT
+SD DVPRESTORE
+SD DVPSTATUS
+SNAPSHOT RESTORE
+basic/repeat
+```
+
+若 C1 下 SDIO 仍不稳定且 DVPRESTORE、`basic/repeat` 均可靠，下一轮才可保持相同流程单独验证 C2。任何 restore 或图像恢复失败都应立即停止扩大测试，不得将 mask 自动并入正式 takeover。
