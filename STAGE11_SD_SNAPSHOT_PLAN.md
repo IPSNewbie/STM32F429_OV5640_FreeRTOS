@@ -7681,3 +7681,128 @@ python tools/uart_image_request_repeat.py
 - 若 DVPSTOP 成功但连续读仍出现 `DATA_CRC_FAIL`、NOT_READY 或其他错误，说明只释放 D2/D3/D4 的 C1 方案仍不足，不能直接集成。
 - 若连续读达到 100% PASS 但 DVPRESTORE 或图像恢复失败，说明 C1 的恢复风险不可接受，不能并入主流程。
 - 本轮不执行硬件测试、不修改固件、不接 FATFS、不写卡、不启用 SDIO DMA/IRQ，也不提交 Git commit。
+
+## Stage 11C-5U DVP mask + SD takeover + 图像恢复多轮稳定性测试
+
+### 1. Stage 11C-5T 结果
+
+- `SD DVPSTOP` 将 OV5640 `0x3018` 从 `0xFF` 改为 `0x8F`，回读为 `0x8F`。
+- block 0 连续读取 20/20 PASS，PASS_RATE=100.00%。
+- block 2048 连续读取 20/20 PASS，PASS_RATE=100.00%。
+- `SD DVPRESTORE` 将 `0x3018` 从 `0x8F` 恢复到保存的 `0xFF`，回读为 `0xFF`。
+- basic 图像恢复 PASS，repeat 图像恢复 20/20 PASS，frame_id 连续。
+
+因此，OV5640 `0x3018[6:4]` DVP pad mask 已证明能够释放 PC8、PC9、PC11 共享线，使 SDIO 1-bit polling read 稳定通过；恢复原值后相机图像链路也能够恢复。
+
+### 2. 本轮目的
+
+本轮把 5T 的单次完整流程扩展为默认 10 cycles 的多轮稳定性测试。每轮都执行 DVP mask、SD takeover、ATK1B block 0/2048 读取、DVP restore，并在恢复 snapshot 后发送一次 binary image request，同时验证 SD 读块和图像恢复。
+
+某轮失败时脚本不终止后续轮次；下一轮开始前会尽量执行 `SD TAKEOVER EXIT`、`SD DVPRESTORE`、`SNAPSHOT RESTORE` 和 `STATUS` 清理。脚本记录失败轮次以及各环节累计成功/失败次数。
+
+### 3. 自动测试脚本
+
+新增：
+
+`tools/uart_sd_dvp_mask_cycle_stability.py`
+
+每轮按以下顺序执行：
+
+```text
+SD INIT
+SNAPSHOT PREPARE
+SD DVPSTOP
+SD DVPSTATUS
+SD TAKEOVER ENTER
+SD ATK1BINIT
+SD ATK1BREAD 0
+SD ATK1BREAD 2048
+SD TAKEOVER EXIT
+SD DVPRESTORE
+SD DVPSTATUS
+SNAPSHOT RESTORE
+STATUS
+OV56RGB5 binary image request
+```
+
+binary request 沿用现有 14B 请求格式，每轮递增 seq；响应必须为 38426B、magic 为 `OV56RGB5`、payload CRC32 正确且 frame_id 可解析，才记为 IMAGE_PASS。脚本不保存 PNG，只生成 `captures/sd_dvp_mask_cycle_<timestamp>.csv`、对应 `_log.txt` 和 `_summary.txt`。
+
+### 4. 运行命令
+
+```text
+python tools/uart_sd_dvp_mask_cycle_stability.py --port COM4 --baud 115200 --cycles 10 --blocks 0,2048
+```
+
+默认参数为 COM4、115200、10 cycles、blocks 0/2048、CLI 超时 5.0 秒、图像超时 10.0 秒和 tag `dvp_mask_cycle`。
+
+### 5. 结果判断
+
+- 若 10/10 cycles PASS，则 C1 可进入主流程集成设计。
+- 若 SD 读失败，说明 DVP mask 仍有边界问题，不能直接集成。
+- 若图像恢复失败，说明 DVP restore 或整体 restore flow 仍有风险。
+- 若出现 IWDG skip、UART DMA error、hook fault 或 stream overflow，必须先修复稳定性问题。
+
+单轮 PASS 要求 snapshot prepare、DVPSTOP、`0x3018` mask 回读、takeover enter、ATK1B init、block 0/2048 读取、takeover exit、DVPRESTORE、`0x3018` 原值恢复、snapshot restore、系统状态和 binary image request 全部通过，且 IWDG/UART/HOOK/stream overflow 计数均为 0。
+
+本轮只新增主机端自动测试脚本并更新文档，不修改固件；Codex 不执行硬件测试，也不提交 Git commit。
+
+## Stage 11C-5U-1 DVP mask 多轮脚本失败定位
+
+### 1. 现象与结论修正
+
+Stage 11C-5T 的单轮连续读块验证已经成功：DVPSTOP 将 OV5640 `0x3018` 从 `0xFF` 改为 `0x8F`，TAKEOVER ENTER 和 ATK1B INIT 均通过，block 0 与 block 2048 各连续读取 20/20 PASS；DVPRESTORE 将 `0x3018` 从 `0x8F` 恢复到 `0xFF`，basic/repeat 图像恢复也全部 PASS。
+
+Stage 11C-5U 首次多轮测试出现以下异常：
+
+- DVPSTOP 10/10 PASS。
+- TAKEOVER ENTER 10/10 PASS。
+- ATK1BINIT 0/10 PASS，读块因此全部跳过。
+- DVPRESTORE 与 SNAPSHOT RESTORE 10/10 PASS。
+- IMAGE 6/10 PASS，frame_id 不连续。
+- IWDG、HOOK、UART DMA 与 stream overflow 计数均为 0。
+
+失败集中在 5U 自动循环脚本的 ATK1BINIT 阶段。由于 5T 已经证明相同 DVP mask 下 ATK1B 连续读块稳定，当前不能据此判定 C1 方案失败；需要先用更完整的逐轮状态确认 HAL init、CardInfo 或 card transfer wait 的具体失败点。
+
+### 2. 本轮脚本增强
+
+本轮只增强 `tools/uart_sd_dvp_mask_cycle_stability.py`，不修改固件：
+
+- 新增 ATK1BINIT 详细字段，记录 init ready、HAL init status/error、CardInfo status/error、transfer wait 计数、最后卡状态、耗时、ClockDiv 和 BusWidth。
+- 新增 DVPSTOP、TAKEOVER ENTER、DVPRESTORE 的 active、寄存器、错误码、错误文本和关键前置状态字段。
+- 新增 `--cycle-gap 1.0`、`--restore-wait 1.0`、`--image-wait 1.0` 与 `--cleanup-wait 0.5`。
+- 每轮正式流程前无条件执行 `SD TAKEOVER EXIT`、`SD DVPRESTORE`、`SNAPSHOT RESTORE`、`STATUS` 防御性清理；清理命令之间按 cleanup-wait 等待，清理结果只记录为 pre_cleanup，不参与本轮 PASS/FAIL。
+- SNAPSHOT RESTORE 后先等待 restore-wait，STATUS 后再等待 image-wait，然后发送递增 seq 的 binary image request。
+- ATK1BINIT 失败时只跳过 block read，仍继续执行 TAKEOVER EXIT、DVPRESTORE、DVPSTATUS、SNAPSHOT RESTORE、STATUS 和 image request，并记录 `ATK1B_INIT_FAIL`。
+
+### 3. 输出增强
+
+CSV 与逐轮日志记录完整 ATK1B、DVP、takeover、restore 和 image 诊断字段。image 失败时额外记录接收长度、错误文本、是否找到 `OV56RGB5` magic、frame_id 和 CRC 结果。
+
+summary 保留 5U 原字段，并新增以下失败定位统计：
+
+```text
+ATK1B_HAL_ERROR_VALUES
+ATK1B_HAL_STATUS_VALUES
+ATK1B_CARDINFO_STATUS_VALUES
+ATK1B_LAST_CARD_STATE_VALUES
+ATK1B_INIT_READY_VALUES
+ATK1B_FAILED_CYCLES
+DVP_MASK_AFTER_VALUES
+DVP_MASK_SAVED_VALUES
+DVP_MASK_FAILED_CYCLES
+TAKEOVER_ERROR_CODE_VALUES
+TAKEOVER_ERROR_TEXT_VALUES
+SDIO_FULL_GPIO_AF12_SELECTED_VALUES
+DVP_RESTORE_AFTER_VALUES
+DVP_RESTORE_FAILED_CYCLES
+IMAGE_FAILED_CYCLES
+IMAGE_RX_LEN_VALUES
+IMAGE_ERROR_VALUES
+FAIL_REASON_COUNTS
+```
+
+### 4. 下一步判断
+
+下一次开发板测试应首先查看 `ATK1B_HAL_ERROR_VALUES`、`ATK1B_HAL_STATUS_VALUES`、CardInfo 状态、最后卡状态和失败轮次，再判断问题属于 HAL_SD_Init、CardInfo、transfer wait 还是轮间状态残留。在取得这些证据前不修改固件，也不否定 C1 DVP mask 方案。
+
+本轮 Codex 不执行硬件测试，不提交 Git commit。
