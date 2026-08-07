@@ -470,8 +470,8 @@ CameraCliStatus_t Camera_CLI_HandleLine(
             return CAMERA_CLI_OK;
         }
 
-        Camera_CLI_WriteLine(huart, "ERR bad SD arg");
-        return CAMERA_CLI_ERROR_BAD_ARG;
+        Camera_CLI_WriteLine(huart, "ERR unknown command");
+        return CAMERA_CLI_ERROR_UNKNOWN_CMD;
     }
 
     Camera_CLI_WriteLine(huart, "ERR unknown command");

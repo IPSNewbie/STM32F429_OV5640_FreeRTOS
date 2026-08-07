@@ -7859,7 +7859,7 @@ STATUS 仅保留模式与配置、核心健康、关键故障和看门狗关键�
 - `FAULT`: `hook_fault`、`assert_line`、`uart_dma_error`、`stream_overflow`
 - `IWDG`: `enabled`、`refresh_skip`、`last_skip_reason`
 
-RTOS 模块不再维护或输出 CLI、DUMP、UART 空闲、二进制请求分类、心跳年龄、IWDG 刷新时间等细碎计数器。看门狗健康判断需要的任务活性时间只作为模块私有状态存在。
+STATUS 不再输出 CLI、DUMP、UART 空闲、二进制请求分类、心跳年龄、IWDG 刷新时间等细碎计数器。Stage 12A 后续回归验证表明这些 RTOS 内部字段不能随输出一起删除，因此内部统计与 DUMP/binary request/UART DMA/stream buffer 运行链路保持原状。
 
 ### 5. SD STATUS 保留内容
 
@@ -7878,3 +7878,39 @@ SD 状态结构只保留 SD 支持/ready、SDIO/FATFS ready、takeover 需求、
 ### 6. 保留的内部流程能力
 
 OV5640 `0x3018[6:4]` DVP mask 与原值恢复继续保留，供后续 SD snapshot 内部流程使用；SDIO GPIO takeover/restore 和基础 HAL SD 初始化能力也继续保留。串口不再暴露 `DVPSTOP`/`DVPRESTORE`，也不再保留 ATK、READTEST、LINESTATE 等实验命令。本阶段不接 FATFS、不写卡、不启用 SDIO DMA 或 IRQ。
+
+## Stage 12B SD 诊断残留代码删减
+
+### 1. RTOS 回归边界
+
+Stage 12A 曾把 STATUS 输出删减错误地扩大到 `camera_rtos.c/.h` 内部状态删减，导致文本 DUMP 无响应、binary image request 失败。恢复 RTOS 内部统计及请求链路后，DUMP、basic 和 repeat 图像请求恢复通过。因此 Stage 12B 明确冻结 `camera_rtos.c/.h`：STATUS 可以保持简洁，但 DUMP、binary request、UART DMA、stream buffer 与内部统计字段不再删改。
+
+### 2. 已清理的 SD 诊断残留
+
+SD 模块不再包含 ATK official 4-bit、ATK1B、READTEST/READINFO、LINESTATE、BUSWIDTH、SENSORSTOP/SENSORRESTORE/SENSORSTATUS 等实验入口或状态输出代码。读块 buffer 指纹、SDIO register snapshot、GPIO 逐 pin readback，以及 attempt/success/error/operation_ms 细碎计数器均不保留。
+
+### 3. SD 最小状态
+
+`CameraSdStorageStatus_t` 仅保留：
+
+- `supported`
+- `card_ready`
+- `takeover_required`
+- `sdio_ready`
+- `fatfs_ready`
+- `last_error_code` / `last_error_text`
+- `dvp_mask_available` / `dvp_mask_active`
+- `dvp_reg_3018_saved` / `dvp_reg_3018_current_or_restored`
+- `last_sd_init_status` / `last_sd_init_error`
+- `last_sd_rw_status` / `last_sd_rw_error`
+
+当前尚未接入 SD 读写主流程，`last_sd_rw_status/error` 只保留最小未运行占位，不引入诊断逻辑。
+
+### 4. 保留的内部主流程能力
+
+- 保存 OV5640 `0x3018`，写入 `saved_3018 & 0x8F`，并恢复保存原值。
+- 将 PC8/PC9/PC10/PC11/PC12/PD2 切换到 SDIO AF12；退出后把 PC8/PC9/PC11 恢复为 DCMI AF13，并把 PC10/PC12/PD2 退回安全输入态。
+- 保留 SDIO clock enable/disable、`HAL_SD_Init`、`HAL_SD_DeInit` 和必要的 card ready/error 状态。
+- SD STATUS 仍只输出 `supported`、`card_ready`、`takeover_required`、`sdio_ready`、`fatfs_ready`、`last_error` 和 `dvp_mask_solution=OV5640_3018_6_4`。
+
+Stage 12B 不接 FATFS、不写卡、不启用 SDIO DMA/IRQ，不执行硬件测试，也不提交 Git commit。

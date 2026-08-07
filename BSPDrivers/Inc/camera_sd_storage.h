@@ -35,12 +35,14 @@ typedef struct
     uint32_t fatfs_ready;
     uint32_t last_error_code;
     const char *last_error_text;
-    uint32_t dvp_mask_supported;
+    uint32_t dvp_mask_available;
     uint32_t dvp_mask_active;
-    uint32_t dvp_mask_reg_3018_saved;
-    uint32_t dvp_mask_restored;
-    uint32_t last_init_result;
-    uint32_t last_io_result;
+    uint32_t dvp_reg_3018_saved;
+    uint32_t dvp_reg_3018_current_or_restored;
+    uint32_t last_sd_init_status;
+    uint32_t last_sd_init_error;
+    uint32_t last_sd_rw_status;
+    uint32_t last_sd_rw_error;
 } CameraSdStorageStatus_t;
 
 void Camera_SDStorage_InitState(void);
