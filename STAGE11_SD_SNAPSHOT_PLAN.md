@@ -7289,3 +7289,77 @@ Stage 11C-5N 不修改任何固件代码，只新增 `tools/uart_sd_atk1b_repeat
 4. full switch 仍按现有主路径把 PC8/PC9/PC10/PC11/PC12/PD2 全部配置为 AF12、PULLUP、VERY_HIGH，并在成功时同时设置 `sdio_full_gpio_af12_selected=1` 与 `sdio_af12_selected=1`；失败时保留 `TAKEOVER_ENTER=FAIL`。
 5. 新增 `sdio_full_gpio_last_error_pin`，并为六根线分别记录 MODER 的 mode、PUPDR 的 pull、OSPEEDR 的 speed 和 AFRL/AFRH 的 AF 回读值；`SD TAKEOVER`/`SD STATUS` 在失败时也输出这些字段，自动化脚本同步汇总对应大写字段。
 6. 本轮不改变 ATK1B init/read 参数或 `HAL_SD_ReadBlocks` 参数，不接 FATFS、不写卡、不启用 SDIO DMA/IRQ，也不触碰摄像头 PWDN、CAMOFF、CAMON 或动态 ClockDiv CLI。
+
+## Stage 11C-5P OV5640 共享 DVP 数据线释放方案查证
+
+### 1. 5O 结论
+
+- 正常 OV5640 + DCMI + FreeRTOS + SD takeover 环境中，ATK1B 初始化可以通过，但 block 0 连续读仅 1/20 PASS，block 2048 连续读仅 2/20 PASS，失败以随机 `DATA_CRC_FAIL` 为主。
+- SD-only 环境不初始化 OV5640、不启动 DCMI，完整 SDIO 六线回读均为 AF12/PULLUP/VERY_HIGH；block 0 与 block 2048 各 20 次读取全部通过，即合计 40/40 PASS。
+- 因而根因指向正常相机环境下 OV5640/DVP 对 PC8、PC9、PC11 共享数据线的输出未被真正释放，而不是 SDIO 硬件、卡座、SD 卡、`HAL_SD_Init` 或 1-bit polling read 本身。
+- 当前 takeover 只改变 STM32 端 GPIO 复用；停止 STM32 DCMI/DMA 也不等价于让 OV5640 端停止驱动 DVP 数据线。
+
+### 2. 当前工程 OV5640 相关代码扫描结果
+
+| 文件名 | 函数名/上下文 | 相关寄存器 | 当前写入值 | 初步含义 | 是否可能用于停止 DVP 输出 |
+| --- | --- | --- | --- | --- | --- |
+| `BSPDrivers/Inc/OV5640cfg.h` | `ov5640_init_reg_tbl`，由 `OV5640_Min_InitRGB565_QVGA_TestBar()`、`OV5640_Min_InitRGB565_480x320_TestBar()` 及其派生初始化路径写入 | `0x3008` | 表首 `0x42`，表末 `0x02` | 软件掉电/待机后唤醒；当前初始化最终状态是 `0x02` | 是；与 DVP stream stop/on 最直接相关，待验证 |
+| `BSPDrivers/Inc/OV5640cfg.h` | `ov5640_init_reg_tbl` | `0x3017` | `0xFF` | FREX、VSYNC、HREF、PCLK、D[9:6] pad output enable | 是；可作为整组 DVP 输出释放候选，待验证 |
+| `BSPDrivers/Inc/OV5640cfg.h` | `ov5640_init_reg_tbl` | `0x3018` | `0xFF` | D[5:0]、GPIO[1:0] pad output enable；共享的 OV5640 D2/D3/D4 属于该数据组 | 是；最贴近 PC8/PC9/PC11 三根共享数据线，但精确 mask 与三态行为待验证 |
+| `BSPDrivers/Inc/OV5640cfg.h` | 初始化表、JPEG/RGB565 模式表 | `0x3000`、`0x3002`、`0x3004`、`0x3006` | `0x3000=0x00`、`0x3004=0xFF`；JPEG 表 `0x3002=0x00`/`0x3006=0xFF`，RGB565 表 `0x3002=0x1C`/`0x3006=0xC3` | 系统模块 reset/clock enable，现有用法主要控制模块、JFIFO/SFIFO/JPEG 及相关时钟 | 可能间接停止内部数据路径，但不是 pad 三态的直接证据，不作为首选 |
+| `BSPDrivers/Inc/OV5640cfg.h`、`BSPDrivers/Src/OV5640.c`、`BSPDrivers/Src/ov5640_tuning.c` | 全文扫描 | `0x3001`、`0x3003`、`0x3005`、`0x3007`、`0x4202` | 未出现 | 当前工程没有这些寄存器的既有实现 | 无现成路径；只能作为新增诊断候选，待验证 |
+| `BSPDrivers/Src/OV5640.c`、`BSPDrivers/Inc/OV5640.h` | 公开 OV5640 API | `0x4741` 等 | 测试彩条、尺寸、窗口、格式和画质配置 | 未找到 stream off/on、software standby 或 DVP pad disable/restore 函数 | 否；现有 API 不能释放传感器 DVP 输出 |
+| `BSPDrivers/Src/ov5640_tuning.c`、`BSPDrivers/Inc/ov5640_tuning.h` | 曝光、AWB、亮度、对比度、饱和度、锐度 API | AEC/AWB/SDE/CIP 寄存器 | 与输出停止无关 | 只做画质参数读写 | 否 |
+| `BSPDrivers/Src/camera_dcmi_dma.c` | `Camera_DCMI_Stop()` | STM32 DCMI/DMA 寄存器 | 清除 capture、禁用 DMA | 只停止 STM32 接收端 | 否；不会向 OV5640 发送 SCCB 命令 |
+| `BSPDrivers/Src/camera_snapshot_control.c`、`BSPDrivers/Src/camera_sd_storage.c` | `Camera_SnapshotControl_RequestPrepare()`、full SDIO GPIO switch | 无 OV5640 寄存器写入 | 停止 STM32 采集并切换 MCU GPIO AF | 只处理 STM32 端状态与复用 | 否；这正是正常相机环境仍可能发生总线争用的缺口 |
+
+当前工程没有现成的 OV5640 stream-off、software-standby、DVP-output-disable 或对应 restore API。
+
+### 3. ATK / 正点原子 OV5640 例程扫描结果
+
+本机找到的正点原子相机例程为：
+
+`D:\MCU+FreeRTOS\STM32_HAL\ISP_Project\实验38 摄像头实验\Drivers\BSP\OV5640`
+
+`D:\MCU+FreeRTOS\STM32_HAL\ISP_Project\ATK_SDIO_EXAMPLE` 中未找到 OV5640/camera 文件或相关寄存器控制代码。
+
+| 例程路径/文件名 | 函数名/上下文 | 相关寄存器 | 当前写入值 | 初步含义 | 是否可能用于 stream off / standby / DVP disable |
+| --- | --- | --- | --- | --- | --- |
+| `实验38 摄像头实验/Drivers/BSP/OV5640/ov5640.c` | `ov5640_init()` | `0x3008` | 初始化表前先写 `0x82` | OV5640 软件复位 | 可停止当前输出，但会丢失运行配置，恢复风险高 |
+| `实验38 摄像头实验/Drivers/BSP/OV5640/ov5640cfg.h` | `ov5640_init_reg_tbl` | `0x3008` | `0x42` 后最终 `0x02` | software power down/standby 后 wake up | 是；例程只在初始化表中使用，没有独立 stop/restore API |
+| 同上 | `ov5640_init_reg_tbl` | `0x3017`、`0x3018` | 均为 `0xFF` | DVP timing/data pad output enable | 是；存在 enable 配置，但没有 disable/tri-state 写法 |
+| 同上 | JPEG/RGB565/初始化表 | `0x3000`、`0x3002`、`0x3004`、`0x3006` | 与当前工程相同类型的模块/时钟配置 | 模块 reset 与 clock enable | 可能间接影响输出，但未形成 stream-off 路径 |
+| `实验38 摄像头实验/Drivers/BSP/OV5640/ov5640.c` | `ov5640_focus_init()` | `0x3000` | `0x20` 后 `0x00` | reset/release autofocus MCU | 否；只服务 AF 固件初始化，不应当作 DVP 输出控制 |
+| `实验38 摄像头实验/Drivers/BSP/OV5640/ov5640.c` | `ov5640_pwdn_set()` | 外部 PWDN | PCF8574 控制 | 硬件掉电 | 已实测破坏恢复链路，禁止作为后续主路线 |
+| 正点原子 OV5640 源码全文 | 全文扫描 | `0x4202`、`0x3001`、`0x3003`、`0x3005`、`0x3007` | 未出现 | 没有对应实现证据 | 无现成可移植路径 |
+
+作为语义交叉核对，Linux 主线 OV5640 驱动把 `0x3008` 定义为 `SYS_CTRL0`，把 `0x42/0x02/0x82` 分别定义为 software power-down、power-up、software reset，并在 **DVP** stream stop/on 中写 `0x42/0x02`；同一驱动把 `0x3017/0x3018` 命名为 pad output enable 01/02。其 `0x4202=0x0F/0x00` 位于 **MIPI** stream stop/on 路径，因此不能直接当成本项目 DVP 路径的首选依据。参考：[Linux mainline OV5640 driver](https://github.com/torvalds/linux/blob/master/drivers/media/i2c/ov5640.c)。
+
+### 4. 候选方案列表
+
+- **方案 A：OV5640 stream off 寄存器方案（待验证）**。候选为 `0x4202=0x0F` 停止、`0x4202=0x00` 恢复，但本机当前工程与正点原子例程均未出现该寄存器，且 Linux 主线仅在 MIPI stream 路径使用；对本项目 DVP 接口应降为次级候选，不可直接假定能释放 DVP pad。
+- **方案 B：OV5640 software standby 方案（待验证，建议 5Q 第一优先级）**。保存 `0x3008` 原值后，以 `0x42` 停止 DVP stream，再以保存值/已知运行值 `0x02` 恢复。当前工程、正点原子初始化表和 Linux DVP stream 实现三方证据一致，且不同于外部 PWDN；仍必须验证共享线是否真正释放以及图像链路是否完整恢复。
+- **方案 C：DVP 输出管脚 disable / tri-state 方案（待验证）**。保存 `0x3017/0x3018` 后关闭相关 pad output enable，再原值恢复。PC8/PC9/PC11 对应 OV5640 D2/D3/D4，均属于 `0x3018` 描述的 D[5:0] 组；在没有确认 bit 映射、无毛刺时序和三态电气行为前，不硬编码清零值或 mask。若方案 B 不能释放共享线，再优先验证该方案。
+- **方案 D：sensor soft reset 后不重新启动输出（待验证，最低优先级）**。写 `0x3008=0x82` 可复位 sensor 并停止现有输出，但运行配置可能全部丢失，恢复大概率需要重新执行完整初始化、尺寸、格式、画质与 DCMI 配置；风险明显高于 B/C，只适合作为隔离性诊断，不作为首选恢复方案。
+- `0x3000`～`0x3007` 目前只看到模块 reset/clock 控制用法，没有直接证明能够让 DVP pad 三态；暂不单列为主方案，也不通过盲调这些寄存器替代 A～D 的单变量验证。
+
+### 5. 风险判断
+
+- PWDN/CAMOFF 已经验证失败并破坏恢复链路，后续禁止作为主路线，也不以 CAMON 补救该路线。
+- 任何停止 OV5640 输出的方案都必须先保存原寄存器值、检查写入/回读结果，并提供严格对称的恢复操作；不能只确认命令返回成功。
+- 下一轮硬件验证必须执行完整闭环：停止 OV5640 输出 -> 确认 DCMI/DMA 静止并切换 SDIO -> ATK1B read -> 退出 takeover -> 恢复 OV5640 输出 -> basic/repeat 图像恢复验证。
+- 不能直接接 FATFS 或写卡；先用既有只读 ATK1B 单块/连续读确认共享线释放是否消除 CRC 随机失败。
+- 不能只证明 SD 能读，还必须证明相机能够恢复，且 basic/repeat 的图像内容、帧连续性和错误计数均正常。
+- 方案 A～D 每次只验证一种寄存器路径，禁止把 `0x3008`、`0x4202`、`0x3017/0x3018` 或 reset 混合写入后再归因。
+
+### 6. 下一轮建议
+
+建议下一阶段定义为：**Stage 11C-5Q：OV5640 stream-off / standby 最小诊断 CLI**，候选命令为：
+
+```text
+SD SENSORSTOP
+SD SENSORRESTORE
+SD SENSORSTATUS
+```
+
+5Q 只实现最小、可回滚的传感器输出控制与寄存器保存/回读，不接 FATFS、不写卡。建议先单独验证方案 B：在 snapshot prepare 已确认 DCMI/DMA 静止后，保存并回读 `0x3008`，执行 software standby，再进入既有 SD takeover 与 ATK1B read；退出 takeover 后恢复 `0x3008`，等待 sensor 稳定，再执行 basic/repeat 图像验证。若 SD 仍不稳定，再保持相同测试顺序单独验证方案 C；方案 A 与方案 D 分别作为 DVP 适用性较弱和恢复风险较高的后续候选。本轮不实现上述 CLI，也不执行任何 OV5640 寄存器写入或硬件测试。
