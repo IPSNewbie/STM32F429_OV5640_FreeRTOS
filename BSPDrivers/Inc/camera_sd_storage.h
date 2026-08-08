@@ -40,11 +40,15 @@
 #define CAMERA_SD_ERR_FATFS_FILE_CLOSE_FAILED      43U
 #define CAMERA_SD_ERR_SDIO_CLOCK_DISABLE_FAILED    44U
 #define CAMERA_SD_ERR_CAMERA_RESTORE_FAILED        45U
+#define CAMERA_SD_ERR_FRAME_BUFFER_INVALID         46U
 
 typedef struct
 {
     const char *file_name;
     uint32_t bytes_written;
+    const char *format_text;
+    uint32_t width;
+    uint32_t height;
     const char *mount_text;
     const char *write_text;
     const char *cleanup_text;
@@ -86,8 +90,8 @@ void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status);
 /* Execute one complete read-only SD/FatFs mount check and always clean up. */
 uint32_t Camera_SDStorage_CheckFatfsMount(void);
 
-/* Execute one complete SD/FatFs session and overwrite SDTEST.TXT. */
-uint32_t Camera_SDStorage_SaveSnapshotText(
+/* Save the current front RGB565 frame through one complete SD/FatFs session. */
+uint32_t Camera_SDStorage_SaveSnapshotFrame(
     CameraSdSnapshotResult_t *snapshot_result);
 
 /* Minimal block-device hooks used only while the FatFs SD session is active. */

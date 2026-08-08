@@ -330,7 +330,7 @@ static CameraCliStatus_t Camera_CLI_RunSdSnapshot(
     CameraSdSnapshotResult_t snapshot_result;
     uint32_t result;
 
-    result = Camera_SDStorage_SaveSnapshotText(&snapshot_result);
+    result = Camera_SDStorage_SaveSnapshotFrame(&snapshot_result);
     Camera_CLI_WriteLine(huart, "SD SNAPSHOT:");
     Camera_CLI_WriteFieldText(
         huart,
@@ -341,6 +341,9 @@ static CameraCliStatus_t Camera_CLI_RunSdSnapshot(
         huart,
         "bytes",
         snapshot_result.bytes_written);
+    Camera_CLI_WriteFieldText(huart, "format", snapshot_result.format_text);
+    Camera_CLI_WriteFieldU32(huart, "width", snapshot_result.width);
+    Camera_CLI_WriteFieldU32(huart, "height", snapshot_result.height);
     Camera_CLI_WriteFieldText(huart, "mount", snapshot_result.mount_text);
     Camera_CLI_WriteFieldText(huart, "write", snapshot_result.write_text);
     Camera_CLI_WriteFieldText(

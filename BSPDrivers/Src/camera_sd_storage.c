@@ -2,6 +2,7 @@
 
 #include "bsp_sccb.h"
 #include "camera_dcmi_dma.h"
+#include "camera_frame_buffer.h"
 #include "camera_snapshot_control.h"
 #include "ff.h"
 #include "diskio.h"
@@ -20,7 +21,8 @@
 #define CAMERA_SD_RESTORE_LCD_WIDTH            480U
 #define CAMERA_SD_RESTORE_LCD_HEIGHT           320U
 #define CAMERA_SD_CAMERA_RESTORE_DELAY_MS       100U
-#define CAMERA_SD_SNAPSHOT_FILE_NAME           "SDTEST.TXT"
+#define CAMERA_SD_SNAPSHOT_FILE_NAME           "IMAGE.RGB"
+#define CAMERA_SD_SNAPSHOT_FORMAT_TEXT         "RGB565"
 
 #define CAMERA_SD_CONFLICT_PIN_MASK \
     (GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_11)
@@ -64,14 +66,6 @@ static const CameraSdLine_t s_camera_sd_lines[] =
     {GPIOC, 12U},
     {GPIOD, 2U}
 };
-
-static const char s_camera_sd_snapshot_text[] =
-    "ISP_OV5640 SD SNAPSHOT TEST\r\n"
-    "stage=13B\r\n"
-    "mode=text\r\n"
-    "frame=160x120\r\n"
-    "format=not_image_yet\r\n"
-    "result=PASS\r\n";
 
 static CameraSdStorageStatus_t s_camera_sd_status;
 static SD_HandleTypeDef s_camera_sd_handle;
@@ -1016,10 +1010,31 @@ cleanup:
     return result;
 }
 
-uint32_t Camera_SDStorage_SaveSnapshotText(
+static uint32_t Camera_SDStorage_GetValidatedFrontFrame(
+    CameraFrame_t *front_frame)
+{
+    if ((front_frame == NULL) ||
+        (Camera_FrameBuffer_GetFrontFrame(front_frame) != CAMERA_FB_OK) ||
+        (front_frame->data == NULL) ||
+        (front_frame->width != CAMERA_FB_WIDTH) ||
+        (front_frame->height != CAMERA_FB_HEIGHT) ||
+        (front_frame->size_bytes != CAMERA_FB_SIZE_BYTES) ||
+        (front_frame->size_bytes !=
+         ((uint32_t)front_frame->width *
+          (uint32_t)front_frame->height *
+          CAMERA_FB_BYTES_PER_PIXEL)))
+    {
+        return CAMERA_SD_ERR_FRAME_BUFFER_INVALID;
+    }
+
+    return CAMERA_SD_OK;
+}
+
+uint32_t Camera_SDStorage_SaveSnapshotFrame(
     CameraSdSnapshotResult_t *snapshot_result)
 {
     CameraSdSnapshotResult_t result_info;
+    CameraFrame_t front_frame;
     uint32_t result = CAMERA_SD_OK;
     uint32_t cleanup_result = CAMERA_SD_OK;
     uint32_t restore_result = CAMERA_SD_OK;
@@ -1034,7 +1049,11 @@ uint32_t Camera_SDStorage_SaveSnapshotText(
     UINT bytes_written = 0U;
 
     memset(&result_info, 0, sizeof(result_info));
+    memset(&front_frame, 0, sizeof(front_frame));
     result_info.file_name = CAMERA_SD_SNAPSHOT_FILE_NAME;
+    result_info.format_text = CAMERA_SD_SNAPSHOT_FORMAT_TEXT;
+    result_info.width = CAMERA_FB_WIDTH;
+    result_info.height = CAMERA_FB_HEIGHT;
     result_info.mount_text = "NOT_RUN";
     result_info.write_text = "NOT_RUN";
     result_info.cleanup_text = "PASS";
@@ -1073,6 +1092,13 @@ uint32_t Camera_SDStorage_SaveSnapshotText(
         return result;
     }
 
+    step_result = Camera_SDStorage_GetValidatedFrontFrame(&front_frame);
+    if (step_result != CAMERA_SD_OK)
+    {
+        result = step_result;
+        goto cleanup;
+    }
+
     s_camera_sd_status.dvp_reg_3018_saved =
         CAMERA_SD_REG_VALUE_UNKNOWN;
     restore_continuous_capture =
@@ -1083,6 +1109,14 @@ uint32_t Camera_SDStorage_SaveSnapshotText(
     if (step_result != CAMERA_SNAPSHOT_OK)
     {
         result = CAMERA_SD_ERR_SNAPSHOT_PREPARE_FAILED;
+        goto cleanup;
+    }
+
+    /* Re-read after the pause so the selected front buffer remains stable. */
+    step_result = Camera_SDStorage_GetValidatedFrontFrame(&front_frame);
+    if (step_result != CAMERA_SD_OK)
+    {
+        result = step_result;
         goto cleanup;
     }
 
@@ -1143,11 +1177,11 @@ uint32_t Camera_SDStorage_SaveSnapshotText(
 
     fatfs_result = f_write(
         &s_camera_sd_file,
-        s_camera_sd_snapshot_text,
-        (UINT)(sizeof(s_camera_sd_snapshot_text) - 1U),
+        front_frame.data,
+        (UINT)front_frame.size_bytes,
         &bytes_written);
     if ((fatfs_result != FR_OK) ||
-        (bytes_written != (UINT)(sizeof(s_camera_sd_snapshot_text) - 1U)))
+        (bytes_written != (UINT)front_frame.size_bytes))
     {
         result_info.write_text = "FAIL";
         result = (s_camera_sd_fatfs_disk_error != CAMERA_SD_OK) ?
@@ -1313,6 +1347,8 @@ const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
             return "SDIO_CLOCK_DISABLE_FAILED";
         case CAMERA_SD_ERR_CAMERA_RESTORE_FAILED:
             return "CAMERA_RESTORE_FAILED";
+        case CAMERA_SD_ERR_FRAME_BUFFER_INVALID:
+            return "FRAME_BUFFER_INVALID";
         default:
             return "UNKNOWN_ERROR";
     }

@@ -8520,3 +8520,44 @@ Codex 本轮只执行静态检查和 Debug 构建；以上 SD 卡写入、断电
 - 只有失败路径和成功路径的相机恢复均稳定后，才继续调试 FatFs mount/write。
 
 Codex 本轮不执行硬件测试；DUMP、basic/repeat 和真实 SD 初始化结果均待开发板验证。
+
+## Stage 13C SD SNAPSHOT v2 保存 RGB565 原始图像
+
+### 1. Stage 13B 板测基线
+
+Stage 13B 后续板测已经通过：`SD SNAPSHOT` 返回 `result=PASS`、`file=SDTEST.TXT`、`bytes=101`、`mount=PASS`、`write=PASS`、`cleanup=PASS`、`restore=PASS`。写卡后 DUMP、`uart_image_request_basic.py` 和 `uart_image_request_repeat.py` 也均 PASS，说明 ATK1B SDIO 初始化参数、FatFs 写入路径以及相机恢复链路可以作为 Stage 13C 的稳定基线。
+
+### 2. v2 保存内容与固定规格
+
+- `SD SNAPSHOT` 不再写固定测试文本，改为读取 `Camera_FrameBuffer_GetFrontFrame()` 返回的当前前台帧。
+- 保存前校验前台帧指针非空，且规格严格为宽 160、高 120、RGB565 每像素 2 字节、总长度 38400 字节。
+- 固定覆盖 SD 卡根目录中的 `IMAGE.RGB`，文件内容就是前台帧内存中的原始 RGB565 字节流。
+- 不重新采集图像，不调用 UART dump，不执行灰度、二值化或其他图像处理，不转换 BMP，不增加 BMP 头，也不生成递增文件名。
+- 本阶段不修改双缓冲模块；只调用既有前台帧读取接口。
+
+### 3. 内部流程
+
+1. 检查 SD snapshot 会话为空闲，并取得、校验当前前台帧。
+2. pause camera 并激活 software guard；暂停后再次读取前台帧，确保最终写入指针在 SD 会话期间稳定。
+3. 保存 OV5640 `0x3018` 并执行 `saved_3018 & 0x8F` DVP mask。
+4. 按 Stage 13B 已验证的 ATK1B 参数执行 SDIO takeover、polling `HAL_SD_Init` 和 CardInfo/TRANSFER 等待。
+5. 执行 `f_mount`，再以 `FA_CREATE_ALWAYS | FA_WRITE` 打开 `IMAGE.RGB`。
+6. 使用一次 `f_write` 写入前台帧的 38400 字节，并同时校验 FatFs 返回值和实际写入字节数。
+7. 无论成功或失败，均沿用统一的 `f_close`、unmount、HAL deinit、SDIO clock/GPIO、DVP `0x3018`、software guard、DCMI 和图像链路清理恢复流程。
+
+### 4. CLI 与状态边界
+
+- 不新增 CLI；HELP 仍只保留 `HELP`、`STATUS`、`PROC [BYPASS|GRAY|BINARY]`、`THR [0..255]`、`RESET`、`DUMP`、`SD STATUS`、`SD SNAPSHOT`。
+- `SD STATUS` 保持纯只读缓存显示，不触发 DVP mask、SDIO takeover、`HAL_SD_Init`、`f_mount`、`f_open` 或 `f_write`。
+- `SD SNAPSHOT` 成功时输出 `file=IMAGE.RGB`、`bytes=38400`、`format=RGB565`、`width=160`、`height=120`，并继续输出 mount、write、cleanup、restore 结果；失败时还输出具体 `error`。
+- 不调用 `f_read` 或 `f_mkfs`；SD 底层仍只使用 polling block I/O，不启用 SDIO DMA 或 SDIO IRQ。
+
+### 5. 判断标准
+
+- `SD SNAPSHOT` 显示 `result=PASS`、`file=IMAGE.RGB`、`bytes=38400`、`format=RGB565`、`width=160`、`height=120`。
+- `mount=PASS`、`write=PASS`、`cleanup=PASS`、`restore=PASS`。
+- 断电取卡后，电脑可见 `IMAGE.RGB`，且文件大小严格为 38400 字节。
+- 按 RGB565、160×120 解析后图像方向正确、颜色基本正确、内容与保存时前台帧一致。
+- 保存后文本 DUMP、`uart_image_request_basic.py` 和 `uart_image_request_repeat.py` 均 PASS。
+
+Codex 本轮只执行静态检查和 Debug 构建，不执行开发板、SD 卡、DUMP 或图像工具硬件测试。
