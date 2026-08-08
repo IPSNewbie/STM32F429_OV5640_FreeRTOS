@@ -15,15 +15,20 @@
 #define CAMERA_SD_REG_VALUE_UNKNOWN           0xFFFFFFFFU
 #define CAMERA_SD_FATFS_CARD_TIMEOUT_MS       1000U
 #define CAMERA_SD_FATFS_READ_TIMEOUT_MS       1000U
+#define CAMERA_SD_FATFS_WRITE_TIMEOUT_MS      1000U
 #define CAMERA_SD_FATFS_MOUNT_NOT_RUN         0xFFFFFFFFU
 #define CAMERA_SD_RESTORE_LCD_WIDTH            480U
 #define CAMERA_SD_RESTORE_LCD_HEIGHT           320U
+#define CAMERA_SD_CAMERA_RESTORE_DELAY_MS       100U
+#define CAMERA_SD_SNAPSHOT_FILE_NAME           "SDTEST.TXT"
 
 #define CAMERA_SD_CONFLICT_PIN_MASK \
     (GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_11)
 #define CAMERA_SD_CONFLICT_MODE_MASK \
     ((3UL << (8U * 2U)) | (3UL << (9U * 2U)) | (3UL << (11U * 2U)))
 #define CAMERA_SD_CONFLICT_AF_MODE \
+    ((2UL << (8U * 2U)) | (2UL << (9U * 2U)) | (2UL << (11U * 2U)))
+#define CAMERA_SD_CONFLICT_SPEED_HIGH \
     ((2UL << (8U * 2U)) | (2UL << (9U * 2U)) | (2UL << (11U * 2U)))
 #define CAMERA_SD_CONFLICT_SPEED_VERY_HIGH CAMERA_SD_CONFLICT_MODE_MASK
 #define CAMERA_SD_CONFLICT_PULLUP \
@@ -60,20 +65,38 @@ static const CameraSdLine_t s_camera_sd_lines[] =
     {GPIOD, 2U}
 };
 
+static const char s_camera_sd_snapshot_text[] =
+    "ISP_OV5640 SD SNAPSHOT TEST\r\n"
+    "stage=13B\r\n"
+    "mode=text\r\n"
+    "frame=160x120\r\n"
+    "format=not_image_yet\r\n"
+    "result=PASS\r\n";
+
 static CameraSdStorageStatus_t s_camera_sd_status;
 static SD_HandleTypeDef s_camera_sd_handle;
 static HAL_SD_CardInfoTypeDef s_camera_sd_card_info;
 static FATFS s_camera_sd_fatfs;
+static FIL s_camera_sd_file;
 static uint32_t s_camera_sd_full_gpio_af12_selected;
 static uint32_t s_camera_sd_clock_enabled;
+static uint32_t s_camera_sd_hal_init_attempted;
 static uint32_t s_camera_sd_card_info_valid;
 static uint32_t s_camera_sd_fatfs_session_active;
+static uint32_t s_camera_sd_fatfs_write_allowed;
 static uint32_t s_camera_sd_fatfs_disk_error;
 
 static void Camera_SDStorage_SetLastError(uint32_t error_code)
 {
     s_camera_sd_status.last_error_code = error_code;
     s_camera_sd_status.last_error_text =
+        Camera_SDStorage_ErrorToString(error_code);
+}
+
+static void Camera_SDStorage_SetSaveError(uint32_t error_code)
+{
+    s_camera_sd_status.save_error_code = error_code;
+    s_camera_sd_status.save_error_text =
         Camera_SDStorage_ErrorToString(error_code);
 }
 
@@ -178,7 +201,7 @@ static uint32_t Camera_SDStorage_VerifyFullGpioAf12(void)
             (Camera_SDStorage_GetPinPull(line->port, line->pin_number) !=
              GPIO_PULLUP) ||
             (Camera_SDStorage_GetPinSpeed(line->port, line->pin_number) !=
-             GPIO_SPEED_FREQ_VERY_HIGH) ||
+             GPIO_SPEED_FREQ_HIGH) ||
             (Camera_SDStorage_GetPinAf(line->port, line->pin_number) != 12U) ||
             (((line->port->OTYPER >> line->pin_number) & 0x1U) != 0U))
         {
@@ -215,7 +238,7 @@ static uint32_t Camera_SDStorage_SwitchConflictPinsToSdioAf12(void)
     gpio.Pin = CAMERA_SD_CONFLICT_PIN_MASK;
     gpio.Mode = GPIO_MODE_AF_PP;
     gpio.Pull = GPIO_PULLUP;
-    gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
     gpio.Alternate = GPIO_AF12_SDIO;
     HAL_GPIO_Init(GPIOC, &gpio);
 
@@ -224,7 +247,7 @@ static uint32_t Camera_SDStorage_SwitchConflictPinsToSdioAf12(void)
         ((GPIOC->PUPDR & CAMERA_SD_CONFLICT_MODE_MASK) !=
          CAMERA_SD_CONFLICT_PULLUP) ||
         ((GPIOC->OSPEEDR & CAMERA_SD_CONFLICT_MODE_MASK) !=
-         CAMERA_SD_CONFLICT_SPEED_VERY_HIGH) ||
+         CAMERA_SD_CONFLICT_SPEED_HIGH) ||
         ((GPIOC->OTYPER & CAMERA_SD_CONFLICT_PIN_MASK) != 0U) ||
         ((GPIOC->AFR[1] & CAMERA_SD_CONFLICT_AFRH_MASK) !=
          CAMERA_SD_CONFLICT_AFRH_AF12))
@@ -245,7 +268,7 @@ static uint32_t Camera_SDStorage_SwitchFullSdioGpioToAf12(void)
     gpio.Pin = CAMERA_SD_FULL_GPIOC_PIN_MASK;
     gpio.Mode = GPIO_MODE_AF_PP;
     gpio.Pull = GPIO_PULLUP;
-    gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
     gpio.Alternate = GPIO_AF12_SDIO;
     HAL_GPIO_Init(GPIOC, &gpio);
 
@@ -313,6 +336,68 @@ static uint32_t Camera_SDStorage_RestoreConflictPins(void)
     return CAMERA_SD_OK;
 }
 
+static uint32_t Camera_SDStorage_RestoreCameraLink(
+    uint32_t restore_continuous_capture,
+    uint32_t verify_sdio_inputs)
+{
+    uint32_t result = CAMERA_SD_OK;
+
+    (void)Camera_SnapshotControl_RequestRestore();
+    Camera_SDStorage_EnsureDcmiDmaHandle();
+    Camera_DCMI_Init();
+    if (restore_continuous_capture != 0U)
+    {
+        Camera_DCMI_StartToLCD(
+            0U,
+            0U,
+            CAMERA_SD_RESTORE_LCD_WIDTH,
+            CAMERA_SD_RESTORE_LCD_HEIGHT);
+    }
+
+    HAL_Delay(CAMERA_SD_CAMERA_RESTORE_DELAY_MS);
+
+    if ((Camera_SnapshotControl_IsSoftwareGuardActive() != 0U) ||
+        (s_camera_sd_status.dvp_mask_active != 0U) ||
+        (g_camera_dcmi.Instance != DCMI) ||
+        (g_camera_dcmi.DMA_Handle != &g_camera_dma) ||
+        (g_camera_dcmi.State != HAL_DCMI_STATE_READY) ||
+        ((GPIOC->MODER & CAMERA_SD_CONFLICT_MODE_MASK) !=
+         CAMERA_SD_CONFLICT_AF_MODE) ||
+        ((GPIOC->PUPDR & CAMERA_SD_CONFLICT_MODE_MASK) !=
+         CAMERA_SD_CONFLICT_PULLUP) ||
+        ((GPIOC->OSPEEDR & CAMERA_SD_CONFLICT_MODE_MASK) !=
+         CAMERA_SD_CONFLICT_SPEED_VERY_HIGH) ||
+        ((GPIOC->OTYPER & CAMERA_SD_CONFLICT_PIN_MASK) != 0U) ||
+        ((GPIOC->AFR[1] & CAMERA_SD_CONFLICT_AFRH_MASK) !=
+         CAMERA_SD_CONFLICT_AFRH_AF13))
+    {
+        result = CAMERA_SD_ERR_CAMERA_RESTORE_FAILED;
+    }
+    else if ((restore_continuous_capture != 0U) &&
+             (((DCMI->CR & DCMI_CR_CAPTURE) == 0U) ||
+              ((DMA2_Stream1->CR & DMA_SxCR_EN) == 0U)))
+    {
+        result = CAMERA_SD_ERR_CAMERA_RESTORE_FAILED;
+    }
+    else if ((restore_continuous_capture == 0U) &&
+             ((DCMI->CR & DCMI_CR_CAPTURE) != 0U))
+    {
+        result = CAMERA_SD_ERR_CAMERA_RESTORE_FAILED;
+    }
+    else if ((verify_sdio_inputs != 0U) &&
+             ((Camera_SDStorage_GetPinMode(GPIOC, 10U) != 0U) ||
+              (Camera_SDStorage_GetPinPull(GPIOC, 10U) != GPIO_NOPULL) ||
+              (Camera_SDStorage_GetPinMode(GPIOC, 12U) != 0U) ||
+              (Camera_SDStorage_GetPinPull(GPIOC, 12U) != GPIO_NOPULL) ||
+              (Camera_SDStorage_GetPinMode(GPIOD, 2U) != 0U) ||
+              (Camera_SDStorage_GetPinPull(GPIOD, 2U) != GPIO_NOPULL)))
+    {
+        result = CAMERA_SD_ERR_CAMERA_RESTORE_FAILED;
+    }
+
+    return result;
+}
+
 static void Camera_SDStorage_PrepareSdHandle(void)
 {
     s_camera_sd_handle.Instance = SDIO;
@@ -343,6 +428,7 @@ void Camera_SDStorage_InitState(void)
     memset(&s_camera_sd_handle, 0, sizeof(s_camera_sd_handle));
     memset(&s_camera_sd_card_info, 0, sizeof(s_camera_sd_card_info));
     memset(&s_camera_sd_fatfs, 0, sizeof(s_camera_sd_fatfs));
+    memset(&s_camera_sd_file, 0, sizeof(s_camera_sd_file));
 
     s_camera_sd_status.supported = 1U;
     s_camera_sd_status.takeover_required = 1U;
@@ -354,15 +440,22 @@ void Camera_SDStorage_InitState(void)
     s_camera_sd_status.last_mount_result =
         CAMERA_SD_FATFS_MOUNT_NOT_RUN;
     s_camera_sd_status.last_mount_text = "NOT_RUN";
+    s_camera_sd_status.last_snapshot_text = "NOT_RUN";
+    s_camera_sd_status.last_file_name = "NONE";
+    s_camera_sd_status.last_file_size = 0U;
+    s_camera_sd_status.save_count = 0U;
     s_camera_sd_status.last_sd_init_status = CAMERA_SD_REG_VALUE_UNKNOWN;
     s_camera_sd_status.last_sd_init_error = CAMERA_SD_REG_VALUE_UNKNOWN;
     s_camera_sd_status.last_sd_rw_status = CAMERA_SD_REG_VALUE_UNKNOWN;
     s_camera_sd_status.last_sd_rw_error = CAMERA_SD_REG_VALUE_UNKNOWN;
     s_camera_sd_full_gpio_af12_selected = 0U;
     s_camera_sd_clock_enabled = 0U;
+    s_camera_sd_hal_init_attempted = 0U;
     s_camera_sd_card_info_valid = 0U;
     s_camera_sd_fatfs_session_active = 0U;
+    s_camera_sd_fatfs_write_allowed = 0U;
     s_camera_sd_fatfs_disk_error = CAMERA_SD_OK;
+    Camera_SDStorage_SetSaveError(CAMERA_SD_OK);
     Camera_SDStorage_SetLastError(CAMERA_SD_OK);
 }
 
@@ -529,6 +622,7 @@ uint32_t Camera_SDStorage_RequestInit(void)
     {
         Camera_SDStorage_PrepareSdHandle();
         Camera_SDStorage_EnableSdioClock();
+        s_camera_sd_hal_init_attempted = 1U;
         hal_status = HAL_SD_Init(&s_camera_sd_handle);
         s_camera_sd_status.last_sd_init_status = (uint32_t)hal_status;
         s_camera_sd_status.last_sd_init_error =
@@ -547,9 +641,16 @@ uint32_t Camera_SDStorage_RequestInit(void)
                 &s_camera_sd_card_info);
             if (hal_status == HAL_OK)
             {
-                s_camera_sd_status.card_ready = 1U;
-                s_camera_sd_card_info_valid = 1U;
-                result = CAMERA_SD_OK;
+                result = Camera_SDStorage_WaitForCardTransfer();
+                if (result == CAMERA_SD_OK)
+                {
+                    s_camera_sd_status.card_ready = 1U;
+                    s_camera_sd_card_info_valid = 1U;
+                }
+                else
+                {
+                    s_camera_sd_status.card_ready = 0U;
+                }
             }
             else
             {
@@ -569,38 +670,37 @@ uint32_t Camera_SDStorage_RequestTakeoverExit(void)
     uint32_t result = CAMERA_SD_OK;
     uint32_t gpio_result;
 
-    if (s_camera_sd_status.sdio_ready != 0U)
+    if ((s_camera_sd_hal_init_attempted != 0U) ||
+        (s_camera_sd_clock_enabled != 0U))
     {
         if (HAL_SD_DeInit(&s_camera_sd_handle) != HAL_OK)
         {
-            result = CAMERA_SD_ERR_SDIO_HAL_DEINIT_FAILED;
+            Camera_SDStorage_RecordFirstError(
+                &result,
+                CAMERA_SD_ERR_SDIO_HAL_DEINIT_FAILED);
         }
+        s_camera_sd_hal_init_attempted = 0U;
     }
 
-    if (s_camera_sd_clock_enabled != 0U)
+    Camera_SDStorage_DisableSdioClock();
+    if ((RCC->APB2ENR & RCC_APB2ENR_SDIOEN) != 0U)
     {
-        Camera_SDStorage_DisableSdioClock();
+        Camera_SDStorage_RecordFirstError(
+            &result,
+            CAMERA_SD_ERR_SDIO_CLOCK_DISABLE_FAILED);
     }
     s_camera_sd_status.card_ready = 0U;
     s_camera_sd_status.sdio_ready = 0U;
     s_camera_sd_status.fatfs_ready = 0U;
     s_camera_sd_card_info_valid = 0U;
     s_camera_sd_fatfs_session_active = 0U;
+    s_camera_sd_fatfs_write_allowed = 0U;
 
-    if (s_camera_sd_full_gpio_af12_selected != 0U)
-    {
-        gpio_result = Camera_SDStorage_LeaveFullSdioGpioToInput();
-        if (gpio_result != CAMERA_SD_OK)
-        {
-            result = gpio_result;
-        }
-    }
+    gpio_result = Camera_SDStorage_LeaveFullSdioGpioToInput();
+    Camera_SDStorage_RecordFirstError(&result, gpio_result);
 
     gpio_result = Camera_SDStorage_RestoreConflictPins();
-    if (gpio_result != CAMERA_SD_OK)
-    {
-        result = gpio_result;
-    }
+    Camera_SDStorage_RecordFirstError(&result, gpio_result);
 
     Camera_SDStorage_SetLastError(result);
     return result;
@@ -688,6 +788,59 @@ uint32_t Camera_SDStorage_FatFsDiskRead(
     if (result != CAMERA_SD_OK)
     {
         s_camera_sd_fatfs_disk_error = result;
+    }
+    return result;
+}
+
+uint32_t Camera_SDStorage_FatFsDiskWrite(
+    const uint8_t *buffer,
+    uint32_t sector,
+    uint32_t count)
+{
+    HAL_StatusTypeDef hal_status;
+    uint32_t result;
+
+    if ((buffer == NULL) || (count == 0U))
+    {
+        result = CAMERA_SD_ERR_INVALID_ARGUMENT;
+    }
+    else if ((s_camera_sd_fatfs_session_active == 0U) ||
+             (s_camera_sd_fatfs_write_allowed == 0U) ||
+             (s_camera_sd_status.sdio_ready == 0U) ||
+             (s_camera_sd_card_info_valid == 0U))
+    {
+        result = CAMERA_SD_ERR_FATFS_DISK_NOT_READY;
+    }
+    else
+    {
+        result = Camera_SDStorage_WaitForCardTransfer();
+        if (result == CAMERA_SD_OK)
+        {
+            hal_status = HAL_SD_WriteBlocks(
+                &s_camera_sd_handle,
+                (uint8_t *)buffer,
+                sector,
+                count,
+                CAMERA_SD_FATFS_WRITE_TIMEOUT_MS);
+            s_camera_sd_status.last_sd_rw_status = (uint32_t)hal_status;
+            s_camera_sd_status.last_sd_rw_error =
+                HAL_SD_GetError(&s_camera_sd_handle);
+            if (hal_status != HAL_OK)
+            {
+                result = CAMERA_SD_ERR_FATFS_DISK_WRITE_FAILED;
+            }
+            else
+            {
+                result = Camera_SDStorage_WaitForCardTransfer();
+            }
+        }
+    }
+
+    if (result != CAMERA_SD_OK)
+    {
+        s_camera_sd_fatfs_disk_error = result;
+        Camera_SDStorage_SetSaveError(result);
+        Camera_SDStorage_SetLastError(result);
     }
     return result;
 }
@@ -851,20 +1004,242 @@ cleanup:
 
     if (prepare_attempted != 0U)
     {
-        (void)Camera_SnapshotControl_RequestRestore();
-        if (restore_continuous_capture != 0U)
-        {
-            Camera_DCMI_StartToLCD(
-                0U,
-                0U,
-                CAMERA_SD_RESTORE_LCD_WIDTH,
-                CAMERA_SD_RESTORE_LCD_HEIGHT);
-        }
+        step_result = Camera_SDStorage_RestoreCameraLink(
+            restore_continuous_capture,
+            takeover_attempted);
+        Camera_SDStorage_RecordFirstError(&result, step_result);
     }
 
     s_camera_sd_status.card_ready =
         (result == CAMERA_SD_OK) ? 1U : 0U;
     Camera_SDStorage_SetLastError(result);
+    return result;
+}
+
+uint32_t Camera_SDStorage_SaveSnapshotText(
+    CameraSdSnapshotResult_t *snapshot_result)
+{
+    CameraSdSnapshotResult_t result_info;
+    uint32_t result = CAMERA_SD_OK;
+    uint32_t cleanup_result = CAMERA_SD_OK;
+    uint32_t restore_result = CAMERA_SD_OK;
+    uint32_t step_result;
+    uint32_t prepare_attempted = 0U;
+    uint32_t dvp_restore_required = 0U;
+    uint32_t takeover_attempted = 0U;
+    uint32_t mount_attempted = 0U;
+    uint32_t file_opened = 0U;
+    uint32_t restore_continuous_capture = 0U;
+    FRESULT fatfs_result;
+    UINT bytes_written = 0U;
+
+    memset(&result_info, 0, sizeof(result_info));
+    result_info.file_name = CAMERA_SD_SNAPSHOT_FILE_NAME;
+    result_info.mount_text = "NOT_RUN";
+    result_info.write_text = "NOT_RUN";
+    result_info.cleanup_text = "PASS";
+    result_info.restore_text = "PASS";
+    result_info.error_code = CAMERA_SD_OK;
+    result_info.error_text = Camera_SDStorage_ErrorToString(CAMERA_SD_OK);
+
+    s_camera_sd_status.last_snapshot_text = "RUNNING";
+    s_camera_sd_status.last_file_name = CAMERA_SD_SNAPSHOT_FILE_NAME;
+    s_camera_sd_status.last_file_size = 0U;
+    s_camera_sd_status.last_mount_result =
+        CAMERA_SD_FATFS_MOUNT_NOT_RUN;
+    s_camera_sd_status.last_mount_text = "NOT_RUN";
+    s_camera_sd_status.card_ready = 0U;
+    s_camera_sd_status.fatfs_ready = 0U;
+    s_camera_sd_fatfs_disk_error = CAMERA_SD_OK;
+    Camera_SDStorage_SetSaveError(CAMERA_SD_OK);
+    Camera_SDStorage_SetLastError(CAMERA_SD_OK);
+
+    if ((Camera_SnapshotControl_IsSoftwareGuardActive() != 0U) ||
+        (s_camera_sd_fatfs_session_active != 0U) ||
+        (s_camera_sd_full_gpio_af12_selected != 0U) ||
+        (s_camera_sd_clock_enabled != 0U) ||
+        (s_camera_sd_status.dvp_mask_active != 0U))
+    {
+        result = CAMERA_SD_ERR_SNAPSHOT_BUSY;
+        s_camera_sd_status.last_snapshot_text = "FAIL";
+        Camera_SDStorage_SetSaveError(result);
+        Camera_SDStorage_SetLastError(result);
+        result_info.error_code = result;
+        result_info.error_text = Camera_SDStorage_ErrorToString(result);
+        if (snapshot_result != NULL)
+        {
+            *snapshot_result = result_info;
+        }
+        return result;
+    }
+
+    s_camera_sd_status.dvp_reg_3018_saved =
+        CAMERA_SD_REG_VALUE_UNKNOWN;
+    restore_continuous_capture =
+        ((DCMI->CR & DCMI_CR_CAPTURE) != 0U) ? 1U : 0U;
+    Camera_SDStorage_EnsureDcmiDmaHandle();
+    prepare_attempted = 1U;
+    step_result = Camera_SnapshotControl_RequestPrepare();
+    if (step_result != CAMERA_SNAPSHOT_OK)
+    {
+        result = CAMERA_SD_ERR_SNAPSHOT_PREPARE_FAILED;
+        goto cleanup;
+    }
+
+    step_result = Camera_SDStorage_StopDvpConflictPads();
+    if (s_camera_sd_status.dvp_reg_3018_saved !=
+        CAMERA_SD_REG_VALUE_UNKNOWN)
+    {
+        dvp_restore_required = 1U;
+    }
+    if (step_result != CAMERA_SD_OK)
+    {
+        result = step_result;
+        goto cleanup;
+    }
+
+    takeover_attempted = 1U;
+    step_result = Camera_SDStorage_RequestTakeoverEnter();
+    if (step_result != CAMERA_SD_OK)
+    {
+        result = step_result;
+        goto cleanup;
+    }
+
+    step_result = Camera_SDStorage_RequestInit();
+    if (step_result != CAMERA_SD_OK)
+    {
+        result = step_result;
+        goto cleanup;
+    }
+
+    s_camera_sd_fatfs_session_active = 1U;
+    mount_attempted = 1U;
+    fatfs_result = f_mount(&s_camera_sd_fatfs, "", 1U);
+    Camera_SDStorage_SetMountResult(fatfs_result);
+    result_info.mount_text = s_camera_sd_status.last_mount_text;
+    if (fatfs_result != FR_OK)
+    {
+        result = (s_camera_sd_fatfs_disk_error != CAMERA_SD_OK) ?
+            s_camera_sd_fatfs_disk_error :
+            CAMERA_SD_ERR_FATFS_MOUNT_FAILED;
+        goto cleanup;
+    }
+
+    s_camera_sd_status.fatfs_ready = 1U;
+    s_camera_sd_fatfs_write_allowed = 1U;
+    fatfs_result = f_open(
+        &s_camera_sd_file,
+        CAMERA_SD_SNAPSHOT_FILE_NAME,
+        FA_CREATE_ALWAYS | FA_WRITE);
+    if (fatfs_result != FR_OK)
+    {
+        result = (s_camera_sd_fatfs_disk_error != CAMERA_SD_OK) ?
+            s_camera_sd_fatfs_disk_error :
+            CAMERA_SD_ERR_FATFS_FILE_OPEN_FAILED;
+        goto cleanup;
+    }
+    file_opened = 1U;
+
+    fatfs_result = f_write(
+        &s_camera_sd_file,
+        s_camera_sd_snapshot_text,
+        (UINT)(sizeof(s_camera_sd_snapshot_text) - 1U),
+        &bytes_written);
+    if ((fatfs_result != FR_OK) ||
+        (bytes_written != (UINT)(sizeof(s_camera_sd_snapshot_text) - 1U)))
+    {
+        result_info.write_text = "FAIL";
+        result = (s_camera_sd_fatfs_disk_error != CAMERA_SD_OK) ?
+            s_camera_sd_fatfs_disk_error :
+            CAMERA_SD_ERR_FATFS_FILE_WRITE_FAILED;
+        goto cleanup;
+    }
+    result_info.write_text = "PASS";
+
+cleanup:
+    if (file_opened != 0U)
+    {
+        fatfs_result = f_close(&s_camera_sd_file);
+        file_opened = 0U;
+        if (fatfs_result != FR_OK)
+        {
+            result_info.write_text = "FAIL";
+            step_result = (s_camera_sd_fatfs_disk_error != CAMERA_SD_OK) ?
+                s_camera_sd_fatfs_disk_error :
+                CAMERA_SD_ERR_FATFS_FILE_CLOSE_FAILED;
+            Camera_SDStorage_RecordFirstError(&cleanup_result, step_result);
+            Camera_SDStorage_RecordFirstError(&result, step_result);
+        }
+    }
+    s_camera_sd_fatfs_write_allowed = 0U;
+
+    if (mount_attempted != 0U)
+    {
+        fatfs_result = f_mount(NULL, "", 0U);
+        if (fatfs_result != FR_OK)
+        {
+            step_result = CAMERA_SD_ERR_FATFS_UNMOUNT_FAILED;
+            Camera_SDStorage_RecordFirstError(&cleanup_result, step_result);
+            Camera_SDStorage_RecordFirstError(&result, step_result);
+        }
+        s_camera_sd_status.fatfs_ready = 0U;
+    }
+    s_camera_sd_fatfs_session_active = 0U;
+
+    if (takeover_attempted != 0U)
+    {
+        step_result = Camera_SDStorage_RequestTakeoverExit();
+        Camera_SDStorage_RecordFirstError(&restore_result, step_result);
+        Camera_SDStorage_RecordFirstError(&cleanup_result, step_result);
+        Camera_SDStorage_RecordFirstError(&result, step_result);
+    }
+
+    if (dvp_restore_required != 0U)
+    {
+        step_result = Camera_SDStorage_RestoreDvpConflictPads();
+        Camera_SDStorage_RecordFirstError(&restore_result, step_result);
+        Camera_SDStorage_RecordFirstError(&cleanup_result, step_result);
+        Camera_SDStorage_RecordFirstError(&result, step_result);
+    }
+
+    if (prepare_attempted != 0U)
+    {
+        step_result = Camera_SDStorage_RestoreCameraLink(
+            restore_continuous_capture,
+            takeover_attempted);
+        Camera_SDStorage_RecordFirstError(&restore_result, step_result);
+        Camera_SDStorage_RecordFirstError(&cleanup_result, step_result);
+        Camera_SDStorage_RecordFirstError(&result, step_result);
+    }
+
+    result_info.restore_text =
+        (restore_result == CAMERA_SD_OK) ? "PASS" : "FAIL";
+    result_info.cleanup_text =
+        (cleanup_result == CAMERA_SD_OK) ? "PASS" : "FAIL";
+    if (result == CAMERA_SD_OK)
+    {
+        s_camera_sd_status.last_snapshot_text = "PASS";
+        s_camera_sd_status.last_file_size = (uint32_t)bytes_written;
+        ++s_camera_sd_status.save_count;
+    }
+    else
+    {
+        s_camera_sd_status.last_snapshot_text = "FAIL";
+        s_camera_sd_status.last_file_size = 0U;
+    }
+
+    s_camera_sd_status.card_ready =
+        (result == CAMERA_SD_OK) ? 1U : 0U;
+    Camera_SDStorage_SetSaveError(result);
+    Camera_SDStorage_SetLastError(result);
+    result_info.bytes_written = s_camera_sd_status.last_file_size;
+    result_info.error_code = result;
+    result_info.error_text = Camera_SDStorage_ErrorToString(result);
+    if (snapshot_result != NULL)
+    {
+        *snapshot_result = result_info;
+    }
     return result;
 }
 
@@ -926,6 +1301,18 @@ const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
             return "FATFS_CARD_TIMEOUT";
         case CAMERA_SD_ERR_INVALID_ARGUMENT:
             return "INVALID_ARGUMENT";
+        case CAMERA_SD_ERR_FATFS_DISK_WRITE_FAILED:
+            return "FATFS_DISK_WRITE_FAILED";
+        case CAMERA_SD_ERR_FATFS_FILE_OPEN_FAILED:
+            return "FATFS_FILE_OPEN_FAILED";
+        case CAMERA_SD_ERR_FATFS_FILE_WRITE_FAILED:
+            return "FATFS_FILE_WRITE_FAILED";
+        case CAMERA_SD_ERR_FATFS_FILE_CLOSE_FAILED:
+            return "FATFS_FILE_CLOSE_FAILED";
+        case CAMERA_SD_ERR_SDIO_CLOCK_DISABLE_FAILED:
+            return "SDIO_CLOCK_DISABLE_FAILED";
+        case CAMERA_SD_ERR_CAMERA_RESTORE_FAILED:
+            return "CAMERA_RESTORE_FAILED";
         default:
             return "UNKNOWN_ERROR";
     }

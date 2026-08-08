@@ -209,6 +209,7 @@ static void Camera_CLI_PrintHelp(UART_HandleTypeDef *huart)
     Camera_CLI_WriteLine(huart, "RESET");
     Camera_CLI_WriteLine(huart, "DUMP");
     Camera_CLI_WriteLine(huart, "SD STATUS");
+    Camera_CLI_WriteLine(huart, "SD SNAPSHOT");
 }
 
 static void Camera_CLI_PrintStatus(UART_HandleTypeDef *huart)
@@ -305,11 +306,61 @@ static void Camera_CLI_PrintSdStatus(UART_HandleTypeDef *huart)
     Camera_CLI_WriteFieldU32(huart, "sdio_ready", status.sdio_ready);
     Camera_CLI_WriteFieldU32(huart, "fatfs_ready", status.fatfs_ready);
     Camera_CLI_WriteFieldText(huart, "last_mount", status.last_mount_text);
+    Camera_CLI_WriteFieldText(
+        huart,
+        "last_snapshot",
+        status.last_snapshot_text);
+    Camera_CLI_WriteFieldText(huart, "last_file", status.last_file_name);
+    Camera_CLI_WriteFieldU32(
+        huart,
+        "last_file_size",
+        status.last_file_size);
+    Camera_CLI_WriteFieldU32(huart, "save_count", status.save_count);
+    Camera_CLI_WriteFieldText(huart, "save_error", status.save_error_text);
     Camera_CLI_WriteFieldText(huart, "last_error", status.last_error_text);
     Camera_CLI_WriteFieldText(
         huart,
         "dvp_mask_solution",
         "OV5640_3018_6_4");
+}
+
+static CameraCliStatus_t Camera_CLI_RunSdSnapshot(
+    UART_HandleTypeDef *huart)
+{
+    CameraSdSnapshotResult_t snapshot_result;
+    uint32_t result;
+
+    result = Camera_SDStorage_SaveSnapshotText(&snapshot_result);
+    Camera_CLI_WriteLine(huart, "SD SNAPSHOT:");
+    Camera_CLI_WriteFieldText(
+        huart,
+        "result",
+        (result == CAMERA_SD_OK) ? "PASS" : "FAIL");
+    Camera_CLI_WriteFieldText(huart, "file", snapshot_result.file_name);
+    Camera_CLI_WriteFieldU32(
+        huart,
+        "bytes",
+        snapshot_result.bytes_written);
+    Camera_CLI_WriteFieldText(huart, "mount", snapshot_result.mount_text);
+    Camera_CLI_WriteFieldText(huart, "write", snapshot_result.write_text);
+    Camera_CLI_WriteFieldText(
+        huart,
+        "cleanup",
+        snapshot_result.cleanup_text);
+    Camera_CLI_WriteFieldText(
+        huart,
+        "restore",
+        snapshot_result.restore_text);
+    if (result != CAMERA_SD_OK)
+    {
+        Camera_CLI_WriteFieldText(
+            huart,
+            "error",
+            snapshot_result.error_text);
+        return CAMERA_CLI_ERROR;
+    }
+
+    return CAMERA_CLI_OK;
 }
 
 static CameraCliStatus_t Camera_CLI_HandleProc(
@@ -469,6 +520,13 @@ CameraCliStatus_t Camera_CLI_HandleLine(
         {
             Camera_CLI_PrintSdStatus(huart);
             return CAMERA_CLI_OK;
+        }
+        if (Camera_CLI_TokenEquals(
+                argument,
+                argument_length,
+                "SNAPSHOT") != 0U)
+        {
+            return Camera_CLI_RunSdSnapshot(huart);
         }
 
         Camera_CLI_WriteLine(huart, "ERR unknown command");

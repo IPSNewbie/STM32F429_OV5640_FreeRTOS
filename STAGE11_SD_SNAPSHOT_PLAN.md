@@ -8134,3 +8134,389 @@ save_error=
 - 不触碰 PWDN / `CAMOFF` / `CAMON`。
 - 不写 OV5640 `0x3008`。
 - 不写 OV5640 `0x4202`。
+
+## Stage 13A FATFS 最小挂载检查
+
+### 1. 本轮目的
+
+- 计划复用现有 `SD STATUS`，由该命令触发一次完整的内部 SD + FATFS mount 检查。
+- 不新增临时 CLI，不恢复 Stage 11C 的分步骤诊断命令。
+- 本阶段只检查 `f_mount`，不写卡、不创建文件、不保存图像。
+
+### 2. FatFs 源码扫描与阶段结论
+
+已扫描当前工程中的以下文件和目录：
+
+- `ff.c`
+- `ff.h`
+- `ffconf.h`
+- `diskio.c`
+- `diskio.h`
+- `ffsystem.c`
+- `ffunicode.c`
+- `FATFS/`
+- `Middlewares/Third_Party/FatFs/`
+
+扫描结果：当前仓库没有 FatFs 源码、头文件、配置文件或 disk I/O 适配层。工程中现有的 `fatfs_ready` 字段和相关注释只是状态占位，不是可调用的 FatFs 实现。
+
+根据 Stage 13A 的来源约束，本阶段暂停代码实现：不从网络下载、不手写简化版 `ff.c`、不复制未知来源代码、不修改 `CMakeLists.txt`，也不执行构建。待项目提供可确认来源且许可证明确的完整 FatFs 源码后，再继续接入。
+
+### 3. 源码到位后的内部流程
+
+FatFs 源码到位后，`Camera_SDStorage_CheckFatfsMount()` 应一次性执行以下安全流程，外部不得通过临时 CLI 分步骤调用：
+
+1. pause camera，获取 software guard 并暂停 DCMI/相机输出链路。
+2. 保存 OV5640 `0x3018` 原值，写入 `saved_3018 & 0x8F` 完成 DVP mask。
+3. takeover SDIO GPIO，使能 SDIO clock。
+4. 执行 `HAL_SD_Init`。
+5. 执行只读优先的 `f_mount` 检查，并记录 mount 结果。
+6. 如果挂载成功，执行 `f_mount(NULL)` 卸载；不调用 `f_open`、`f_write` 或 `f_read`。
+7. 执行 `HAL_SD_DeInit`，关闭 SDIO clock。
+8. 恢复 SDIO/DCMI GPIO，写回 OV5640 `0x3018` 保存值。
+9. 解除 software guard，恢复图像链路。
+10. 更新 `last_mount` 和 `last_error`。
+
+无论在哪一步失败，都必须继续尽力执行 unmount、SD HAL deinit、clock disable、GPIO restore、`0x3018` restore、guard release 和图像链路恢复。不得调用 `HAL_SD_WriteBlocks`，不得启用 SDIO DMA/IRQ。
+
+### 4. 判断标准
+
+完成后应满足：
+
+- `SD STATUS` 显示 `last_mount=PASS`。
+- `SD STATUS` 显示 `last_error=OK`。
+- 检查结束后 DUMP 正常。
+- `tools/uart_image_request_basic.py` PASS。
+- `tools/uart_image_request_repeat.py` PASS。
+
+由于当前缺少 FatFs 源码，本轮未实现挂载检查，以上标准尚未执行。现有 `SD STATUS`、HELP 7 命令、DVP mask 内部能力和错误清理基础流程均保持原状。
+
+## Stage 13A-0 FatFs 源码补齐与接入方案确认
+
+### 1. 当前问题
+
+- 当前 `ISP_OV5640` 工程目录内没有 FatFs 源码、头文件、配置文件或 disk I/O 适配层。
+- 因缺少 `ff.c`、`ff.h`、`ffconf.h` 和 `diskio.h`，Stage 13A 当前无法实现或验证 `f_mount`。
+- 当前正式分支已经删除 `SD READTEST`、`SD ATK1BREAD` 等 Stage 11C 诊断 CLI，因此不能依赖旧串口诊断命令直接测试 SD 卡文件系统；后续仍应复用简洁的 `SD STATUS` 触发完整内部检查。
+
+### 2. FatFs 源码查找结果
+
+| 搜索路径 | 是否找到 | 关键文件 |
+|---|---|---|
+| `D:\MCU+FreeRTOS\STM32_HAL\ISP_Project\ISP_OV5640` | 否 | 未找到 FatFs 文件或目录 |
+| `D:\MCU+FreeRTOS\STM32_HAL\ISP_Project` | 是 | `ff14b\source\ff.c`、`ff.h`、`ffconf.h`、`diskio.c`、`diskio.h`、`ffsystem.c`、`ffunicode.c` |
+| `D:\MCU+FreeRTOS\STM32_HAL` 下的其他工程 | 无额外结果 | 仅找到上述 `ff14b\source` 候选包 |
+| `C:\Users\FAKE\STM32Cube\Repository` | 否 | 未找到 `STM32Cube_FW_F4_*` 固件包或 FatFs 源码 |
+
+找到的候选源码位于：
+
+```text
+D:\MCU+FreeRTOS\STM32_HAL\ISP_Project\ff14b\source
+```
+
+文件头确认该候选包是 ChaN FatFs R0.14b（2021），上级目录包含 `LICENSE.txt`。它是本地独立 FatFs 发布包，不是 STM32CubeF4 固件包。R0.14b 的 `ff.h` 已直接定义所需整数类型，该包没有 `integer.h`，因此不能把旧版本的 `integer.h` 作为强制依赖混入。
+
+### 3. 推荐接入文件
+
+待用户确认采用本地 R0.14b 及其许可证后，建议把第三方源码按原始版权声明纳入项目的独立 vendor 目录，例如 `Middlewares/Third_Party/FatFs/src/`：
+
+- 必需：`ff.c`
+- 必需：`ff.h`
+- 必需并按项目审查配置：`ffconf.h`
+- 必需：`diskio.h`
+- 建议随包保留：`LICENSE.txt`
+- 条件文件：`ffsystem.c`
+- 条件文件：`ffunicode.c`
+
+不建议复制候选包的 `diskio.c` 作为项目实现：该文件头明确标注为 generic skeleton，内部引用未实现的 RAM/MMC/USB 示例函数，不能直接编译为本项目 SDIO 适配层。
+
+当前候选 `ffconf.h` 的关键配置为 `FF_FS_READONLY=0`、`FF_USE_LFN=0`、`FF_FS_REENTRANT=0`、`FF_FS_EXFAT=0`、扇区大小固定 512 字节。Stage 13A 接入时应优先将 `FF_FS_READONLY` 配置为 `1`，并继续禁用 LFN、exFAT 和 FatFs 内部重入支持，以保持最小只读挂载范围。
+
+`ffsystem.c` 仅在 `FF_USE_LFN == 3` 或 `FF_FS_REENTRANT != 0` 时提供有效实现；`ffunicode.c` 仅在 `FF_USE_LFN != 0` 时需要。以 Stage 13A 的 `FF_USE_LFN=0`、`FF_FS_REENTRANT=0` 配置，两者不需要加入构建，但是否纳入必须以最终 `ffconf.h` 为准。
+
+### 4. `diskio.c` 接入策略
+
+- 不直接复用本地候选包或其他未知工程中的 `diskio.c`。
+- 本项目应新增一个最小、可审查的 disk I/O 适配层，只把 FatFs 标准接口映射到已有 SD storage 和 SDIO 安全会话能力。
+- `Camera_SDStorage_CheckFatfsMount()` 负责完整会话生命周期：camera pause、DVP mask、SDIO takeover、`HAL_SD_Init`、`f_mount`、unmount、deinit 和 restore。
+- disk I/O 适配层的 `disk_initialize`、`disk_read` 和 `disk_ioctl` 只调用本项目受控的 SD storage API，并且只允许在上述安全会话已经激活时访问 SDIO；不得在每次扇区读取时重复切换 DVP/SDIO GPIO。
+- Stage 13A 只实现 `disk_status`、`disk_initialize`、`disk_read`、`disk_ioctl`。`disk_read` 底层使用已经验证的 `HAL_SD_ReadBlocks` polling 路径。
+- Stage 13A 的只读配置不实现实际写入；如果接口兼容需要保留 `disk_write` 符号，只能返回 `RES_WRPRT`，不得调用 `HAL_SD_WriteBlocks`。Stage 13B 经单独审查后再启用写入。
+
+### 5. Stage 13A 实现边界
+
+- 只执行立即挂载检查，例如 `f_mount(..., opt=1)`，并在检查后卸载。
+- 不调用 `f_open`。
+- 不调用 `f_write`。
+- 不调用 `f_read`。
+- 不调用 `HAL_SD_WriteBlocks`。
+- 不新增临时 CLI，不恢复 Stage 11C 诊断命令。
+- 仍复用 `SD STATUS` 触发最小挂载检查，并输出简洁的 `last_mount`、`last_error` 结果。
+- 不启用 SDIO DMA 或 SDIO IRQ，继续使用 polling 读路径。
+
+### 6. 源码缺失时的处理
+
+如果最终不采用本地 R0.14b 候选包，且仍未找到官方 STM32CubeF4 FatFs：
+
+- 不继续实现 Stage 13A。
+- 先安装官方 STM32CubeF4 固件包，或使用 CubeMX 生成一个带 FatFs 的 STM32F4 参考工程，再审查并把对应 FatFs 源码纳入当前工程。
+- 不从非官方来源、来源不明的旧工程或网络片段复制实现。
+- 未获得完整、版本一致的 `ff.c`、`ff.h`、`ffconf.h`、`diskio.h` 和许可证前，不修改 CMake，也不编写替代版 FatFs。
+
+Stage 13A-0 只完成本地查找与方案确认：本轮不复制文件、不修改代码、不接入 CMake、不构建、不执行硬件测试，也不提交 Git commit。
+
+## Stage 13A-1 FatFs R0.14b 接入与最小 f_mount 检查
+
+### 1. FatFs 来源与复制文件
+
+FatFs 来源：
+
+```text
+D:\MCU+FreeRTOS\STM32_HAL\ISP_Project\ff14b
+```
+
+已复制到 `Middlewares/Third_Party/FatFs/src/`：
+
+- `ff.c`
+- `ff.h`
+- `ffconf.h`
+- `diskio.h`
+- `LICENSE.txt`
+
+没有复制 `ffsystem.c` 或 `ffunicode.c`：当前 `FF_USE_LFN=0`、`FF_FS_REENTRANT=0`，R0.14b 在该配置下不需要这两个条件源码。没有复制 generic `diskio.c`。
+
+### 2. 不使用 generic `diskio.c` 的原因
+
+R0.14b 自带的 `diskio.c` 是 generic skeleton，引用未实现的 RAM/MMC/USB 示例函数，不包含本项目的 OV5640 DVP mask、SDIO GPIO takeover、HAL SD 句柄或错误清理约束。直接复制既不能形成可用块设备，也可能绕过共享引脚保护，因此本项目使用独立的 `camera_fatfs_diskio.c/.h`。
+
+### 3. 本项目 diskio 适配策略
+
+- FatFs 物理驱动号固定为 0。
+- 实现 `disk_status`、`disk_initialize`、`disk_read`、`disk_ioctl`。
+- diskio 本身不操作 GPIO、不写 OV5640 寄存器、不执行重复 takeover。
+- 外层 `Camera_SDStorage_CheckFatfsMount()` 统一拥有 camera pause、guard、DVP mask、SDIO takeover、`HAL_SD_Init`、mount 和 cleanup 生命周期。
+- `disk_initialize` 只确认外层会话和 SD 卡 transfer 状态，不重复执行 `HAL_SD_Init`。
+- `disk_read` 调用 `HAL_SD_ReadBlocks` polling，并在读前、读后等待 `HAL_SD_CARD_TRANSFER`；不使用 DMA 或 IRQ。
+- `disk_ioctl` 最小支持 `CTRL_SYNC`、`GET_SECTOR_COUNT`、`GET_SECTOR_SIZE`、`GET_BLOCK_SIZE`。
+- 只读配置下不实现 `disk_write`，也不调用 `HAL_SD_WriteBlocks`。
+
+### 4. `ffconf.h` 最小只读配置
+
+```text
+FF_FS_READONLY  = 1
+FF_USE_MKFS     = 0
+FF_USE_LFN      = 0
+FF_FS_REENTRANT = 0
+FF_VOLUMES      = 1
+FF_MIN_SS       = 512
+FF_MAX_SS       = 512
+FF_CODE_PAGE    = 437
+FF_FS_EXFAT     = 0
+```
+
+CMake 仅加入 `ff.c` 和 FatFs include 路径；`ffsystem.c`、`ffunicode.c` 不参与当前构建。
+
+### 5. `SD STATUS` 最小挂载检查
+
+现有 `SD STATUS` 命令现在先调用 `Camera_SDStorage_CheckFatfsMount()`，再输出结果。没有增加新 CLI。内部顺序为：
+
+1. 激活 snapshot guard，并通过现有 snapshot control 暂停 DCMI。
+2. 保存 OV5640 `0x3018`，写入 `saved_3018 & 0x8F`。
+3. 将 PC8/PC9/PC10/PC11/PC12/PD2 切换为 SDIO AF12。
+4. 使能 SDIO clock，执行 `HAL_SD_Init` 和 card info 检查。
+5. 激活只读 diskio 会话，执行 `f_mount(..., opt=1)`。
+6. 记录 `last_mount=PASS/FAIL`。
+7. 执行 `f_mount(NULL, "", 0)`，随后 deinit SD、关闭 clock、恢复 GPIO、恢复 `0x3018`、解除 guard。
+8. 最终更新 `card_ready` 和 `last_error`。
+
+挂载检查结束后已卸载并 deinit，所以 `sdio_ready=0`、`fatfs_ready=0` 是预期值；`card_ready=1` 表示最近一次完整 SD + FatFs 检查成功。
+如果进入检查前 DCMI 正在连续向 LCD 输出，cleanup 会记录该状态并恢复默认 `480x320` 显示链路；PC dump 模式保持按请求启动下一帧采集。
+
+最终简洁输出字段：
+
+```text
+SD STATUS:
+  supported=
+  card_ready=
+  takeover_required=
+  sdio_ready=
+  fatfs_ready=
+  last_mount=
+  last_error=
+  dvp_mask_solution=OV5640_3018_6_4
+```
+
+### 6. 错误清理与禁止写入
+
+任一步失败均保留首个错误，并继续尽力执行 unmount、`HAL_SD_DeInit`、SDIO clock disable、GPIO restore、`0x3018` restore 和 guard release。完整 GPIO takeover 在验证前即标记为需要恢复，避免 AF12 部分切换失败时遗漏 PC10/PC12/PD2 清理。
+
+本阶段不调用 `f_open`、`f_write`、`f_read` 或 `HAL_SD_WriteBlocks`，不创建文件，不启用 SDIO DMA/IRQ，不恢复任何 Stage 11C 诊断 CLI。
+
+### 7. 判断标准与当前结果
+
+- Debug 构建：PASS。
+- `SD STATUS` 显示 `last_mount=PASS`：待硬件验证。
+- `last_error=OK`：待硬件验证。
+- 检查后 DUMP 正常：待硬件验证。
+- basic/repeat 图像工具 PASS：待硬件验证。
+
+Stage 13A-1 不执行硬件测试，也不提交 Git commit。
+
+## Stage 13A-2 SD STATUS 自动挂载回归修复
+
+### 1. 13A-1 板测结果
+
+- `SD STATUS` 显示 `last_error=SDIO_HAL_INIT_FAILED`。
+- `last_mount=NOT_RUN`，说明失败发生在 `HAL_SD_Init` 阶段，尚未执行 `f_mount`。
+- 执行 `SD STATUS` 后，`DUMP` 和 binary 图像工具失败。
+
+### 2. 判断
+
+- 本次失败发生在 SD 初始化阶段，还未进入 FatFs 挂载流程。
+- `SD STATUS` 自动触发硬件状态切换的设计不合理；板测已表明失败清理流程尚不能可靠恢复图像链路。
+- `STATUS` 类命令必须保持只读，不应改变相机、GPIO、SDIO 或 FatFs 状态。
+
+### 3. 修正
+
+- `SD STATUS` 恢复为只读缓存状态显示，只调用 `Camera_SDStorage_GetStatus` 获取当前缓存值。
+- `SD STATUS` 不再调用 `Camera_SDStorage_CheckFatfsMount`，因此不会触发停止 DCMI、DVP mask、SDIO takeover、`HAL_SD_Init` 或 `f_mount`。
+- 保留已经接入并构建通过的 FatFs 源码、CMake 配置和内部 mount 函数，但该函数暂不从 CLI 启用；在清理与图像链路恢复经过板测验证前，不作为状态查询的一部分执行。
+- 不新增 CLI，不恢复旧诊断 CLI，不写卡，不启用 SDIO DMA 或 IRQ。
+
+### 4. 后续
+
+- FATFS mount 测试应由最终功能流程触发，或在后续 SD snapshot 命令阶段统一处理。
+- 在重新启用 mount 流程前，必须先完成失败路径清理与 DUMP/binary 图像链路恢复的板测验证。
+- `STATUS` 类命令继续坚持只读原则。
+
+## Stage 13B SD SNAPSHOT v1 固定文本文件写入测试
+
+### 1. 本轮目的
+
+- 新增最终功能命令 `SD SNAPSHOT`，由该命令执行第一次真实的 FatFs 文件写入。
+- 本轮不保存图像，只创建或覆盖 FAT/FAT32 卡根目录中的 `SDTEST.TXT`。
+- 文件内容是固定 ASCII 文本，用于先验证完整 SD 安全会话、FatFs 元数据更新和 polling 块写路径。
+
+### 2. 为什么不使用 `SD STATUS`
+
+- `STATUS` 类命令必须只读，不能因为查询状态而改变相机或存储硬件状态。
+- `SD STATUS` 继续只调用 `Camera_SDStorage_GetStatus()` 读取缓存，不触发 DVP mask、SDIO takeover、`HAL_SD_Init`、`f_mount`、`f_open`、`f_write` 或 `HAL_SD_WriteBlocks`。
+- 最近一次 `SD SNAPSHOT` 的 `last_snapshot`、`last_file`、`last_file_size`、`save_count` 和 `save_error` 仅作为缓存字段由 `SD STATUS` 显示。
+
+### 3. FatFs 与 diskio 写配置
+
+- `FF_FS_READONLY=0`，启用 FatFs 写 API。
+- 保持 `FF_USE_MKFS=0`、`FF_USE_LFN=0`、`FF_FS_REENTRANT=0`、`FF_VOLUMES=1`、`FF_MIN_SS=512`、`FF_MAX_SS=512`、`FF_CODE_PAGE=437`、`FF_FS_EXFAT=0`。
+- `FF_FS_NORTC=1`，文件时间戳使用 `ffconf.h` 的固定值，不依赖 RTC。
+- `camera_fatfs_diskio.c` 实现标准 `disk_write`，映射到 `Camera_SDStorage_FatFsDiskWrite()`。
+- 块写仅使用 polling `HAL_SD_WriteBlocks`，写前和写后都等待 `HAL_SD_CARD_TRANSFER`，超时或 HAL 失败会更新 `save_error` 和 `last_error`。
+- `disk_write` 不切换 GPIO、不写 OV5640 寄存器、不执行 takeover，并受独立的 snapshot 写会话 guard 限制。
+
+### 4. 内部流程
+
+`Camera_SDStorage_SaveSnapshotText()` 按以下顺序执行：
+
+1. 检查 software guard、SDIO GPIO、clock、FatFs session 和 DVP mask 均为空闲。
+2. pause camera，激活 snapshot guard，并记录是否需要恢复连续 LCD capture。
+3. 保存 OV5640 `0x3018`，写入 `saved_3018 & 0x8F` 完成 DVP mask。
+4. 将 PC8/PC9/PC10/PC11/PC12/PD2 takeover 为 SDIO AF12。
+5. 使能 SDIO clock，执行 polling 模式的 `HAL_SD_Init`。
+6. 激活 FatFs disk session，执行 `f_mount(..., opt=1)`。
+7. 激活仅限本次 snapshot 的 disk write guard。
+8. 使用 `FA_CREATE_ALWAYS | FA_WRITE` 执行 `f_open("SDTEST.TXT")`。
+9. 执行一次 `f_write`，检查 FatFs 返回值和完整写入字节数。
+10. 进入统一 cleanup：`f_close`、关闭 write guard、`f_mount(NULL)`、`HAL_SD_DeInit`、关闭 SDIO clock、恢复 GPIO、恢复 `0x3018`、解除 snapshot guard，并按进入前状态恢复连续 LCD capture。
+
+即使 prepare、DVP mask、takeover、SD init、mount、open、write 或 close 中任一步失败，也继续按已完成步骤尽力 cleanup。HAL init 已尝试但失败时也执行 `HAL_SD_DeInit`，避免残留 SDIO/HAL 状态影响后续 DUMP。
+
+### 5. 固定文件内容与输出
+
+`SDTEST.TXT` 使用 CRLF 行尾，内容为：
+
+```text
+ISP_OV5640 SD SNAPSHOT TEST
+stage=13B
+mode=text
+frame=160x120
+format=not_image_yet
+result=PASS
+```
+
+成功时 `SD SNAPSHOT` 输出 `result=PASS`、`file=SDTEST.TXT`、实际字节数、`mount=PASS`、`write=PASS`、`cleanup=PASS`。失败时输出 `result=FAIL`、各阶段状态和具体 `error`；无论成功或失败都不会把该命令拆成临时诊断 CLI。
+
+### 6. 判断标准
+
+- `SD SNAPSHOT` 显示 `result=PASS`。
+- `file=SDTEST.TXT`、`write=PASS`、`cleanup=PASS`。
+- 执行后 `SD STATUS` 只读显示最近一次保存结果。
+- 随后的 DUMP 正常。
+- `tools/uart_image_request_basic.py` PASS。
+- `tools/uart_image_request_repeat.py` PASS。
+- 断电取卡后，电脑可看到并读取 `SDTEST.TXT` 的固定 ASCII 内容。
+
+Codex 本轮只执行静态检查和 Debug 构建；以上 SD 卡写入、断电取卡、DUMP 和图像工具标准均待硬件验证。
+
+### 7. 失败判断
+
+- mount 失败时，优先确认 SD 卡已格式化为 FAT/FAT32；当前不支持 exFAT，也不调用 `f_mkfs`。
+- write 失败时，检查 `disk_write`、polling `HAL_SD_WriteBlocks`、写前/写后 card-transfer 等待和超时结果。
+- cleanup 失败时，根据 `error` 检查 `f_close`、unmount、HAL deinit、GPIO、OV5640 `0x3018` 和 snapshot guard 恢复步骤。
+- cleanup 后 DUMP 或 binary 图像工具失败，说明相机恢复链路仍有问题，必须先修复恢复流程再继续图像保存。
+- 本阶段不调用 `f_read`，不启用 SDIO DMA/IRQ，不触碰 PWDN/CAMOFF/CAMON，不写 OV5640 `0x3008` 或 `0x4202`，不修改图像协议或 Python 工具。
+
+## Stage 13B-1 SD SNAPSHOT 初始化失败与恢复链路修复
+
+### 1. 板测现象
+
+- `SD SNAPSHOT` 返回 `result=FAIL`、`error=SDIO_HAL_INIT_FAILED`。
+- `mount=NOT_RUN`、`write=NOT_RUN`，说明失败发生在 `HAL_SD_Init`，尚未进入 FatFs。
+- 原输出显示 `cleanup=PASS`，但随后文本 `DUMP` 无响应，`uart_image_request_basic.py` 和 `uart_image_request_repeat.py` 均失败。
+- `hook_fault`、UART DMA、stream overflow 和 IWDG 状态正常，因此原 `cleanup=PASS` 只是代码路径执行完成，不代表相机硬件链路真正恢复。
+
+### 2. 判断
+
+- 当前问题与 SD 卡是否为 FAT/FAT32 无关；mount、文件创建和写入都没有执行。
+- Stage 13B 初版使用 `ClockDiv=118U` 和 SDIO GPIO `VERY_HIGH`，没有复用 Stage 11C-5T/5U 已经板测成功的 ATK1B 参数。
+- 5T/5U 的有效路径是先完成 OV5640 `0x3018[6:4]` mask，再使用 SDIO `HIGH/PULLUP/AF12`、`ClockDiv=1U`、`SDIO_BUS_WIDE_1B` 执行 `HAL_SD_Init`、CardInfo 和 card TRANSFER 等待。
+- 原 cleanup 只检查各清理函数的返回值，没有重新初始化并验证 DCMI，也没有提供独立的 restore 结果，因此不能作为 DUMP/图像恢复的充分证据。
+
+### 3. SD 初始化修复
+
+- `CAMERA_SD_INIT_CLOCK_DIV` 改为 `1U`。
+- PC8/PC9/PC10/PC11/PC12/PD2 的 SDIO takeover 使用 `GPIO_MODE_AF_PP`、`GPIO_PULLUP`、`GPIO_SPEED_FREQ_HIGH`、`GPIO_AF12_SDIO`，与 ATK1B init 一致。
+- 保持 `SDIO_BUS_WIDE_1B`，不调用 `HAL_SD_ConfigWideBusOperation`，不切换 4-bit。
+- 保持 polling `HAL_SD_Init` 和 polling block I/O，不启用 SDIO DMA 或 SDIO IRQ。
+- `HAL_SD_GetCardInfo` 成功后新增 `HAL_SD_CARD_TRANSFER` 等待；只有等待成功才设置 card info valid。
+- DVP mask 仍只执行 `saved_3018 & 0x8F`，不写 `0x3008`、`0x4202`，不触碰 PWDN/CAMOFF/CAMON。
+
+### 4. cleanup 与 restore 修复
+
+统一 cleanup 按已进入的阶段尽力执行：
+
+1. 文件已打开时执行 `f_close`。
+2. 已尝试 mount 时执行 `f_mount(NULL, "", 0)`。
+3. `HAL_SD_Init` 已尝试或 SDIO clock 已打开时执行 `HAL_SD_DeInit`。
+4. 无条件关闭 SDIO clock，并核对 RCC 中的 SDIO enable bit 已清除。
+5. 强制将 PC10/PC12/PD2 恢复为无上下拉输入，再把 PC8/PC9/PC11 恢复为 DCMI AF13。
+6. 已保存 OV5640 `0x3018` 时写回原值并回读验证。
+7. 调用 snapshot restore 解除 software guard。
+8. 重新执行 `Camera_DCMI_Init()`；如果进入会话前是连续 LCD capture，则重新启动该链路。
+9. 等待 100 ms，使 DCMI 和图像任务稳定。
+10. 验证 guard 已解除、DVP mask 已清除、DCMI handle/DMA link 为 READY、PC8/PC9/PC11 为 AF13；发生过 takeover 时还验证 PC10/PC12/PD2 为安全输入。连续 capture 模式另外验证 DCMI CAPTURE 和 DMA stream 已重新使能。
+
+`cleanup=PASS` 现在要求文件/FatFs 清理和全部硬件恢复检查均成功。`SD SNAPSHOT` 新增 `restore=PASS|FAIL`；即使原始错误是 `SDIO_HAL_INIT_FAILED`，恢复失败也会通过 `restore=FAIL` 和 `cleanup=FAIL` 单独暴露，不覆盖原始失败原因。
+
+### 5. 命令边界
+
+- `SD STATUS` 继续只调用 `Camera_SDStorage_GetStatus()` 显示缓存，不触发 DVP mask、takeover、`HAL_SD_Init`、`f_mount`、`f_open` 或 `f_write`。
+- `SD SNAPSHOT` 继续作为唯一最终功能入口，不恢复 `SD ATK*`、`SD DVP*`、`SD READTEST`、`SD READINFO`、`SD LINESTATE`、`SD BUSWIDTH`、`SNAPSHOT PREPARE`、`SNAPSHOT RESTORE` 或 `IWDGTEST`。
+- 本轮不修改 `camera_rtos.c/h`、Core、Python 工具或图像协议。
+
+### 6. 判断标准
+
+- 如果 SD 初始化仍失败，输出必须保持 `result=FAIL`、`error=SDIO_HAL_INIT_FAILED`，同时 `restore=PASS`、`cleanup=PASS`。
+- 初始化失败或成功后，文本 DUMP 必须恢复正常。
+- `tools/uart_image_request_basic.py` 必须 PASS。
+- `tools/uart_image_request_repeat.py` 必须 PASS。
+- 只有失败路径和成功路径的相机恢复均稳定后，才继续调试 FatFs mount/write。
+
+Codex 本轮不执行硬件测试；DUMP、basic/repeat 和真实 SD 初始化结果均待开发板验证。

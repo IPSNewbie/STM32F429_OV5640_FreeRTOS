@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #ifndef CAMERA_SD_INIT_CLOCK_DIV
-#define CAMERA_SD_INIT_CLOCK_DIV (118U)
+#define CAMERA_SD_INIT_CLOCK_DIV (1U)
 #endif
 
 #define CAMERA_SD_OK                              0U
@@ -34,6 +34,24 @@
 #define CAMERA_SD_ERR_FATFS_DISK_IOCTL_FAILED      37U
 #define CAMERA_SD_ERR_FATFS_CARD_TIMEOUT           38U
 #define CAMERA_SD_ERR_INVALID_ARGUMENT             39U
+#define CAMERA_SD_ERR_FATFS_DISK_WRITE_FAILED      40U
+#define CAMERA_SD_ERR_FATFS_FILE_OPEN_FAILED       41U
+#define CAMERA_SD_ERR_FATFS_FILE_WRITE_FAILED      42U
+#define CAMERA_SD_ERR_FATFS_FILE_CLOSE_FAILED      43U
+#define CAMERA_SD_ERR_SDIO_CLOCK_DISABLE_FAILED    44U
+#define CAMERA_SD_ERR_CAMERA_RESTORE_FAILED        45U
+
+typedef struct
+{
+    const char *file_name;
+    uint32_t bytes_written;
+    const char *mount_text;
+    const char *write_text;
+    const char *cleanup_text;
+    const char *restore_text;
+    uint32_t error_code;
+    const char *error_text;
+} CameraSdSnapshotResult_t;
 
 typedef struct
 {
@@ -44,6 +62,12 @@ typedef struct
     uint32_t fatfs_ready;
     uint32_t last_mount_result;
     const char *last_mount_text;
+    const char *last_snapshot_text;
+    const char *last_file_name;
+    uint32_t last_file_size;
+    uint32_t save_count;
+    uint32_t save_error_code;
+    const char *save_error_text;
     uint32_t last_error_code;
     const char *last_error_text;
     uint32_t dvp_mask_available;
@@ -62,11 +86,19 @@ void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status);
 /* Execute one complete read-only SD/FatFs mount check and always clean up. */
 uint32_t Camera_SDStorage_CheckFatfsMount(void);
 
+/* Execute one complete SD/FatFs session and overwrite SDTEST.TXT. */
+uint32_t Camera_SDStorage_SaveSnapshotText(
+    CameraSdSnapshotResult_t *snapshot_result);
+
 /* Minimal block-device hooks used only while the FatFs SD session is active. */
 uint32_t Camera_SDStorage_FatFsDiskStatus(void);
 uint32_t Camera_SDStorage_FatFsDiskInitialize(void);
 uint32_t Camera_SDStorage_FatFsDiskRead(
     uint8_t *buffer,
+    uint32_t sector,
+    uint32_t count);
+uint32_t Camera_SDStorage_FatFsDiskWrite(
+    const uint8_t *buffer,
     uint32_t sector,
     uint32_t count);
 uint32_t Camera_SDStorage_FatFsDiskIoctl(uint8_t command, void *buffer);

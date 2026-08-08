@@ -63,6 +63,41 @@ DRESULT disk_read(
     return RES_ERROR;
 }
 
+DRESULT disk_write(
+    BYTE physical_drive,
+    const BYTE *buffer,
+    LBA_t sector,
+    UINT count)
+{
+    uint32_t result;
+
+    if ((physical_drive != CAMERA_FATFS_PHYSICAL_DRIVE) ||
+        (buffer == NULL) ||
+        (count == 0U))
+    {
+        return RES_PARERR;
+    }
+
+    result = Camera_SDStorage_FatFsDiskWrite(
+        buffer,
+        (uint32_t)sector,
+        (uint32_t)count);
+    if (result == CAMERA_SD_OK)
+    {
+        return RES_OK;
+    }
+    if (result == CAMERA_SD_ERR_FATFS_DISK_NOT_READY)
+    {
+        return RES_NOTRDY;
+    }
+    if (result == CAMERA_SD_ERR_INVALID_ARGUMENT)
+    {
+        return RES_PARERR;
+    }
+
+    return RES_ERROR;
+}
+
 DRESULT disk_ioctl(BYTE physical_drive, BYTE command, void *buffer)
 {
     uint32_t result;
