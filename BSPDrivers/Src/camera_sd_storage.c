@@ -22,7 +22,10 @@
 #define CAMERA_SD_RESTORE_LCD_WIDTH            480U
 #define CAMERA_SD_RESTORE_LCD_HEIGHT           320U
 #define CAMERA_SD_CAMERA_RESTORE_DELAY_MS       100U
-#define CAMERA_SD_SNAPSHOT_FILE_NAME           "IMAGE.BMP"
+#define CAMERA_SD_SNAPSHOT_FILE_NAME_SIZE           12U
+#define CAMERA_SD_SNAPSHOT_FILE_INDEX_MIN             1U
+#define CAMERA_SD_SNAPSHOT_FILE_INDEX_MAX          9999U
+#define CAMERA_SD_NO_FILE_NAME_TEXT               "NONE"
 #define CAMERA_SD_SNAPSHOT_FORMAT_TEXT         "BMP24"
 #define CAMERA_SD_SNAPSHOT_SOURCE_TEXT         "FRONT"
 #define CAMERA_SD_FRAME_PREPARE_MAX_RETRIES      3U
@@ -90,6 +93,10 @@ static uint8_t s_camera_sd_bmp_header[CAMERA_SD_BMP_HEADER_SIZE]
     __attribute__((aligned(4)));
 static uint8_t s_camera_sd_bmp_row_buffer[CAMERA_SD_BMP_ROW_STRIDE]
     __attribute__((aligned(4)));
+static char s_camera_sd_candidate_file_name[
+    CAMERA_SD_SNAPSHOT_FILE_NAME_SIZE];
+static char s_camera_sd_last_file_name[
+    CAMERA_SD_SNAPSHOT_FILE_NAME_SIZE];
 static CameraSdStorageStatus_t s_camera_sd_status;
 static SD_HandleTypeDef s_camera_sd_handle;
 static HAL_SD_CardInfoTypeDef s_camera_sd_card_info;
@@ -115,6 +122,55 @@ static void Camera_SDStorage_SetSaveError(uint32_t error_code)
     s_camera_sd_status.save_error_code = error_code;
     s_camera_sd_status.save_error_text =
         Camera_SDStorage_ErrorToString(error_code);
+}
+
+static void Camera_SDStorage_FormatSnapshotFileName(uint32_t file_index)
+{
+    s_camera_sd_candidate_file_name[0] = 'I';
+    s_camera_sd_candidate_file_name[1] = 'M';
+    s_camera_sd_candidate_file_name[2] = 'G';
+    s_camera_sd_candidate_file_name[3] =
+        (char)('0' + ((file_index / 1000U) % 10U));
+    s_camera_sd_candidate_file_name[4] =
+        (char)('0' + ((file_index / 100U) % 10U));
+    s_camera_sd_candidate_file_name[5] =
+        (char)('0' + ((file_index / 10U) % 10U));
+    s_camera_sd_candidate_file_name[6] =
+        (char)('0' + (file_index % 10U));
+    s_camera_sd_candidate_file_name[7] = '.';
+    s_camera_sd_candidate_file_name[8] = 'B';
+    s_camera_sd_candidate_file_name[9] = 'M';
+    s_camera_sd_candidate_file_name[10] = 'P';
+    s_camera_sd_candidate_file_name[11] = '\0';
+}
+
+static uint32_t Camera_SDStorage_FindNextSnapshotFileName(void)
+{
+    FILINFO file_info;
+    FRESULT fatfs_result;
+    uint32_t file_index;
+
+    for (file_index = CAMERA_SD_SNAPSHOT_FILE_INDEX_MIN;
+         file_index <= CAMERA_SD_SNAPSHOT_FILE_INDEX_MAX;
+         ++file_index)
+    {
+        Camera_SDStorage_FormatSnapshotFileName(file_index);
+        fatfs_result = f_stat(
+            s_camera_sd_candidate_file_name,
+            &file_info);
+        if (fatfs_result == FR_NO_FILE)
+        {
+            return CAMERA_SD_OK;
+        }
+        if (fatfs_result != FR_OK)
+        {
+            s_camera_sd_candidate_file_name[0] = '\0';
+            return CAMERA_SD_ERR_FILE_SCAN_FAILED;
+        }
+    }
+
+    s_camera_sd_candidate_file_name[0] = '\0';
+    return CAMERA_SD_ERR_FILE_INDEX_FULL;
 }
 
 static void Camera_SDStorage_WriteU16LE(uint8_t *destination, uint16_t value)
@@ -568,6 +624,18 @@ void Camera_SDStorage_InitState(void)
     memset(&s_camera_sd_card_info, 0, sizeof(s_camera_sd_card_info));
     memset(&s_camera_sd_fatfs, 0, sizeof(s_camera_sd_fatfs));
     memset(&s_camera_sd_file, 0, sizeof(s_camera_sd_file));
+    memset(
+        s_camera_sd_candidate_file_name,
+        0,
+        sizeof(s_camera_sd_candidate_file_name));
+    memset(
+        s_camera_sd_last_file_name,
+        0,
+        sizeof(s_camera_sd_last_file_name));
+    (void)memcpy(
+        s_camera_sd_last_file_name,
+        CAMERA_SD_NO_FILE_NAME_TEXT,
+        sizeof(CAMERA_SD_NO_FILE_NAME_TEXT));
 
     s_camera_sd_status.supported = 1U;
     s_camera_sd_status.takeover_required = 1U;
@@ -580,7 +648,7 @@ void Camera_SDStorage_InitState(void)
         CAMERA_SD_FATFS_MOUNT_NOT_RUN;
     s_camera_sd_status.last_mount_text = "NOT_RUN";
     s_camera_sd_status.last_snapshot_text = "NOT_RUN";
-    s_camera_sd_status.last_file_name = "NONE";
+    s_camera_sd_status.last_file_name = s_camera_sd_last_file_name;
     s_camera_sd_status.last_file_size = 0U;
     s_camera_sd_status.save_count = 0U;
     s_camera_sd_status.last_total_ms = 0U;
@@ -1297,7 +1365,7 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
     FRESULT fatfs_result;
 
     memset(&result_info, 0, sizeof(result_info));
-    result_info.file_name = CAMERA_SD_SNAPSHOT_FILE_NAME;
+    result_info.file_name = CAMERA_SD_NO_FILE_NAME_TEXT;
     result_info.source_text = CAMERA_SD_SNAPSHOT_SOURCE_TEXT;
     result_info.source_bytes = CAMERA_FB_SIZE_BYTES;
     result_info.prepare_text = "NOT_RUN";
@@ -1312,8 +1380,6 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
     result_info.error_text = Camera_SDStorage_ErrorToString(CAMERA_SD_OK);
 
     s_camera_sd_status.last_snapshot_text = "RUNNING";
-    s_camera_sd_status.last_file_name = CAMERA_SD_SNAPSHOT_FILE_NAME;
-    s_camera_sd_status.last_file_size = 0U;
     s_camera_sd_status.last_mount_result =
         CAMERA_SD_FATFS_MOUNT_NOT_RUN;
     s_camera_sd_status.last_mount_text = "NOT_RUN";
@@ -1408,11 +1474,19 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
     }
 
     s_camera_sd_status.fatfs_ready = 1U;
+    step_result = Camera_SDStorage_FindNextSnapshotFileName();
+    if (step_result != CAMERA_SD_OK)
+    {
+        result = step_result;
+        goto cleanup;
+    }
+
+    result_info.file_name = s_camera_sd_candidate_file_name;
     s_camera_sd_fatfs_write_allowed = 1U;
     fatfs_result = f_open(
         &s_camera_sd_file,
-        CAMERA_SD_SNAPSHOT_FILE_NAME,
-        FA_CREATE_ALWAYS | FA_WRITE);
+        s_camera_sd_candidate_file_name,
+        FA_CREATE_NEW | FA_WRITE);
     if (fatfs_result != FR_OK)
     {
         result = (s_camera_sd_fatfs_disk_error != CAMERA_SD_OK) ?
@@ -1502,21 +1576,27 @@ cleanup:
     s_camera_sd_status.last_write_ms = result_info.write_ms;
     if (result == CAMERA_SD_OK)
     {
+        (void)memcpy(
+            s_camera_sd_last_file_name,
+            s_camera_sd_candidate_file_name,
+            sizeof(s_camera_sd_last_file_name));
         s_camera_sd_status.last_snapshot_text = "PASS";
+        s_camera_sd_status.last_file_name = s_camera_sd_last_file_name;
         s_camera_sd_status.last_file_size = file_bytes_written;
+        result_info.file_name = s_camera_sd_last_file_name;
         ++s_camera_sd_status.save_count;
     }
     else
     {
         s_camera_sd_status.last_snapshot_text = "FAIL";
-        s_camera_sd_status.last_file_size = 0U;
     }
 
     s_camera_sd_status.card_ready =
         (result == CAMERA_SD_OK) ? 1U : 0U;
     Camera_SDStorage_SetSaveError(result);
     Camera_SDStorage_SetLastError(result);
-    result_info.bytes_written = s_camera_sd_status.last_file_size;
+    result_info.bytes_written =
+        (result == CAMERA_SD_OK) ? file_bytes_written : 0U;
     result_info.error_code = result;
     result_info.error_text = Camera_SDStorage_ErrorToString(result);
     if (snapshot_result != NULL)
@@ -1604,6 +1684,10 @@ const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
             return "FRAME_PREPARE_FAILED";
         case CAMERA_SD_ERR_FRAME_PREPARE_TIMEOUT:
             return "FRAME_PREPARE_TIMEOUT";
+        case CAMERA_SD_ERR_FILE_SCAN_FAILED:
+            return "FILE_SCAN_FAILED";
+        case CAMERA_SD_ERR_FILE_INDEX_FULL:
+            return "FILE_INDEX_FULL";
         default:
             return "UNKNOWN_ERROR";
     }

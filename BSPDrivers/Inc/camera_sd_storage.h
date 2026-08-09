@@ -44,6 +44,8 @@
 #define CAMERA_SD_ERR_FRAME_EMPTY                  47U
 #define CAMERA_SD_ERR_FRAME_PREPARE_FAILED         48U
 #define CAMERA_SD_ERR_FRAME_PREPARE_TIMEOUT        49U
+#define CAMERA_SD_ERR_FILE_SCAN_FAILED             50U
+#define CAMERA_SD_ERR_FILE_INDEX_FULL              51U
 
 typedef struct
 {

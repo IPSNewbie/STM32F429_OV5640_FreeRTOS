@@ -8712,3 +8712,31 @@ Codex 本轮只执行静态检查与 Debug 构建；实际 SD 卡 BMP 打开、�
 - 本轮不调用 `f_read`、`f_mkfs`，不启用 SDIO DMA/IRQ，不修改 DUMP/OV56RGB5 或 binary image request 协议。
 
 Codex 本轮只执行静态检查与 Debug 构建；连续 snapshot、实际耗时分布、保存后 DUMP/basic/repeat 和健康状态仍需开发板验证。
+
+## Stage 13F SD SNAPSHOT BMP 文件递增命名
+
+### 1. 基线与目标
+
+- Stage 13D/13E 已验证固定覆盖 `IMAGE.BMP` 的 BMP24 保存、耗时统计以及保存后的相机链路恢复稳定。
+- Stage 13F 只把输出文件名改为根目录短文件名 `IMG0001.BMP` 至 `IMG9999.BMP`；BMP24 内容、160×120 尺寸、57654 字节大小、公共 prepare 路径、DVP mask、SDIO/FatFs 会话和 cleanup/restore 流程均保持不变。
+- 每次 snapshot 会话都从编号 0001 开始检查 SD 卡现有文件，不依赖 RAM 中保存的编号，因此重新上电后仍能继续选择第一个未占用名称。
+
+### 2. 文件名选择流程
+
+1. `f_mount` 成功后、`f_open` 之前，依次生成大写 8.3 文件名 `IMG0001.BMP` 至 `IMG9999.BMP`。
+2. 对每个候选名称调用 `f_stat`：返回 `FR_OK` 表示已存在并继续检查；返回 `FR_NO_FILE` 表示选中该名称；其他返回值以 `FILE_SCAN_FAILED` 结束且不写卡。
+3. 如果 0001 至 9999 全部存在，则返回 `FILE_INDEX_FULL`，不打开或覆盖任何文件。
+4. 选中候选名称后使用 `FA_CREATE_NEW | FA_WRITE` 打开，进一步保证现有文件不会被覆盖。
+
+### 3. 边界与状态
+
+- 不启用 LFN，不创建目录，不使用 RTC 或时间戳；不调用 `f_read`、`f_mkfs`，不增加 SDIO DMA/IRQ，也不增加大图像缓冲区。
+- 不新增 CLI；`SD STATUS` 继续只读显示缓存状态，`last_file` 和 `last_file_size` 保留最近一次成功保存的文件名与大小，失败检查不会抹掉该成功记录。
+- DUMP/OV56RGB5、binary image request、公共 RGB565 prepare 路径以及 BMP header/逐行 RGB565 转 BGR888 写入逻辑均不改变。
+
+### 4. 判断标准
+
+- 空卡首次执行 `SD SNAPSHOT` 成功保存 `IMG0001.BMP`，再次执行成功保存 `IMG0002.BMP`，原文件保持不变。
+- 卡中已有编号文件时选择第一个不存在的候选名称；扫描异常显示 `FILE_SCAN_FAILED`，编号耗尽显示 `FILE_INDEX_FULL`，两种失败均不写卡。
+- 成功结果继续显示 `format=BMP24`、`bytes=57654`，prepare、mount、write、cleanup、restore 均为 PASS，耗时字段继续有效。
+- 保存后文本 DUMP 正常，binary basic/repeat 工具 PASS；上述 SD 卡、图像和连续保存行为仍需开发板验证。
