@@ -583,6 +583,8 @@ void Camera_SDStorage_InitState(void)
     s_camera_sd_status.last_file_name = "NONE";
     s_camera_sd_status.last_file_size = 0U;
     s_camera_sd_status.save_count = 0U;
+    s_camera_sd_status.last_total_ms = 0U;
+    s_camera_sd_status.last_write_ms = 0U;
     s_camera_sd_status.last_sd_init_status = CAMERA_SD_REG_VALUE_UNKNOWN;
     s_camera_sd_status.last_sd_init_error = CAMERA_SD_REG_VALUE_UNKNOWN;
     s_camera_sd_status.last_sd_rw_status = CAMERA_SD_REG_VALUE_UNKNOWN;
@@ -1288,6 +1290,10 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
     uint32_t file_opened = 0U;
     uint32_t restore_continuous_capture = 0U;
     uint32_t file_bytes_written = 0U;
+    uint32_t total_start_tick = HAL_GetTick();
+    uint32_t prepare_start_tick;
+    uint32_t write_start_tick;
+    uint32_t cleanup_start_tick;
     FRESULT fatfs_result;
 
     memset(&result_info, 0, sizeof(result_info));
@@ -1329,6 +1335,9 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
         Camera_SDStorage_SetLastError(result);
         result_info.error_code = result;
         result_info.error_text = Camera_SDStorage_ErrorToString(result);
+        result_info.total_ms = HAL_GetTick() - total_start_tick;
+        s_camera_sd_status.last_total_ms = result_info.total_ms;
+        s_camera_sd_status.last_write_ms = result_info.write_ms;
         if (snapshot_result != NULL)
         {
             *snapshot_result = result_info;
@@ -1342,7 +1351,9 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
         ((DCMI->CR & DCMI_CR_CAPTURE) != 0U) ? 1U : 0U;
     Camera_SDStorage_EnsureDcmiDmaHandle();
     camera_restore_required = 1U;
+    prepare_start_tick = HAL_GetTick();
     step_result = Camera_SDStorage_PrepareAndStageFrontFrame(&result_info);
+    result_info.prepare_ms = HAL_GetTick() - prepare_start_tick;
     if (step_result != CAMERA_SD_OK)
     {
         result = step_result;
@@ -1411,9 +1422,11 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
     }
     file_opened = 1U;
 
+    write_start_tick = HAL_GetTick();
     step_result = Camera_SDStorage_WriteBmp24(
         &s_camera_sd_file,
         &file_bytes_written);
+    result_info.write_ms = HAL_GetTick() - write_start_tick;
     if (step_result != CAMERA_SD_OK)
     {
         result_info.write_text = "FAIL";
@@ -1423,6 +1436,7 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
     result_info.write_text = "PASS";
 
 cleanup:
+    cleanup_start_tick = HAL_GetTick();
     if (file_opened != 0U)
     {
         fatfs_result = f_close(&s_camera_sd_file);
@@ -1482,6 +1496,10 @@ cleanup:
         (restore_result == CAMERA_SD_OK) ? "PASS" : "FAIL";
     result_info.cleanup_text =
         (cleanup_result == CAMERA_SD_OK) ? "PASS" : "FAIL";
+    result_info.cleanup_ms = HAL_GetTick() - cleanup_start_tick;
+    result_info.total_ms = HAL_GetTick() - total_start_tick;
+    s_camera_sd_status.last_total_ms = result_info.total_ms;
+    s_camera_sd_status.last_write_ms = result_info.write_ms;
     if (result == CAMERA_SD_OK)
     {
         s_camera_sd_status.last_snapshot_text = "PASS";

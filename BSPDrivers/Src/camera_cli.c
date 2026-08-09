@@ -318,6 +318,8 @@ static void Camera_CLI_PrintSdStatus(UART_HandleTypeDef *huart)
     Camera_CLI_WriteFieldU32(huart, "save_count", status.save_count);
     Camera_CLI_WriteFieldText(huart, "save_error", status.save_error_text);
     Camera_CLI_WriteFieldText(huart, "last_error", status.last_error_text);
+    Camera_CLI_WriteFieldU32(huart, "last_total_ms", status.last_total_ms);
+    Camera_CLI_WriteFieldU32(huart, "last_write_ms", status.last_write_ms);
     Camera_CLI_WriteFieldText(
         huart,
         "dvp_mask_solution",
@@ -375,6 +377,10 @@ static CameraCliStatus_t Camera_CLI_RunSdSnapshot(
         huart,
         "restore",
         snapshot_result.restore_text);
+    Camera_CLI_WriteFieldU32(huart, "total_ms", snapshot_result.total_ms);
+    Camera_CLI_WriteFieldU32(huart, "prepare_ms", snapshot_result.prepare_ms);
+    Camera_CLI_WriteFieldU32(huart, "write_ms", snapshot_result.write_ms);
+    Camera_CLI_WriteFieldU32(huart, "cleanup_ms", snapshot_result.cleanup_ms);
     if (result != CAMERA_SD_OK)
     {
         Camera_CLI_WriteFieldText(

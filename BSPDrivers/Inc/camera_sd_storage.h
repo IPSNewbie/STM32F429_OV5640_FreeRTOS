@@ -62,6 +62,10 @@ typedef struct
     const char *write_text;
     const char *cleanup_text;
     const char *restore_text;
+    uint32_t total_ms;
+    uint32_t prepare_ms;
+    uint32_t write_ms;
+    uint32_t cleanup_ms;
     uint32_t error_code;
     const char *error_text;
 } CameraSdSnapshotResult_t;
@@ -83,6 +87,8 @@ typedef struct
     const char *save_error_text;
     uint32_t last_error_code;
     const char *last_error_text;
+    uint32_t last_total_ms;
+    uint32_t last_write_ms;
     uint32_t dvp_mask_available;
     uint32_t dvp_mask_active;
     uint32_t dvp_reg_3018_saved;

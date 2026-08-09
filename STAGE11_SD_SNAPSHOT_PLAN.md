@@ -8679,3 +8679,36 @@ Codex 本轮只执行静态检查与 Debug 构建；上电直达 SD SNAPSHOT、S
 - 保存后文本 DUMP 和 binary basic/repeat 工具仍 PASS。
 
 Codex 本轮只执行静态检查与 Debug 构建；实际 SD 卡 BMP 打开、方向、颜色以及保存后 DUMP/basic/repeat 仍需开发板验证。
+
+## Stage 13E SD SNAPSHOT 稳定性与耗时统计
+
+### 1. Stage 13D 基线与本轮边界
+
+- Stage 13D 已通过板测：`SD SNAPSHOT` 成功保存 160×120、BMP24、57654 字节的 `IMAGE.BMP`，电脑可直接打开。
+- 最近一次状态显示 mount、write、cleanup、restore 均 PASS，保存后的 SD STATUS 缓存正确。
+- Stage 13E 只增加最小耗时统计，不改变图像准备、BMP 转换、DVP mask、SDIO/FatFs、cleanup/restore 或固定文件覆盖行为，也不新增 CLI。
+
+### 2. 耗时字段定义
+
+- `total_ms`：从 `Camera_SDStorage_SaveSnapshotFrame()` 入口开始，到统一 cleanup 和相机链路 restore 完成。
+- `prepare_ms`：调用公共 `Camera_RTOS_PrepareRgb565Frame()`、必要重试、front frame staging 复制及源数据统计所用时间。
+- `write_ms`：从开始写 BMP 起，到 54 字节 header 和 120 个 480 字节 BGR888 行全部写入或发生写错误为止。
+- `cleanup_ms`：从统一 cleanup 入口开始，包含必要的 file close、unmount、HAL SD deinit、SDIO clock/GPIO、DVP `0x3018` 和相机链路 restore。
+- 全部字段使用 `HAL_GetTick()` 的无符号差值计算；失败时也输出已经执行阶段的耗时，未进入的阶段保持 0。
+
+### 3. CLI 与缓存状态
+
+- `SD SNAPSHOT` 在原输出末尾增加 `total_ms`、`prepare_ms`、`write_ms`、`cleanup_ms`，成功和失败路径均输出。
+- `SD STATUS` 增加只读缓存字段 `last_total_ms` 和 `last_write_ms`，对应最近一次 snapshot 的 total/write 结果。
+- 初始化时最近耗时字段为 0；每次 snapshot 完成或被 busy 条件拒绝时更新缓存。
+- `SD STATUS` 仍只调用 `Camera_SDStorage_GetStatus()`，不触发 prepare、DVP mask、SDIO takeover、HAL SD、FatFs 或块写入。
+
+### 4. 稳定性判断标准
+
+- `SD SNAPSHOT` 持续返回 `result=PASS`，`IMAGE.BMP` 可正常打开且 `total_ms`、`prepare_ms`、`write_ms`、`cleanup_ms` 数值合理。
+- 连续多次执行后，`save_count` 正确递增，`last_total_ms`、`last_write_ms` 更新为最近一次结果。
+- 每次保存后文本 DUMP 正常，binary basic/repeat 工具 PASS。
+- STATUS 中无新增 `hook_fault`、`uart_dma_error`、`stream_overflow` 或 IWDG `refresh_skip`。
+- 本轮不调用 `f_read`、`f_mkfs`，不启用 SDIO DMA/IRQ，不修改 DUMP/OV56RGB5 或 binary image request 协议。
+
+Codex 本轮只执行静态检查与 Debug 构建；连续 snapshot、实际耗时分布、保存后 DUMP/basic/repeat 和健康状态仍需开发板验证。
