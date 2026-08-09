@@ -8632,3 +8632,50 @@ Codex 本轮只执行静态检查与 Debug 构建；开发板、SD 卡内容、P
 - 保存后的文本 DUMP、binary basic/repeat 工具仍 PASS，OV56RGB5 和 binary image request 协议均无变化。
 
 Codex 本轮只执行静态检查与 Debug 构建；上电直达 SD SNAPSHOT、SD 卡内容及 DUMP/basic/repeat 仍需开发板验证。
+
+## Stage 13D SD SNAPSHOT v3 保存 BMP 图像
+
+### 1. Stage 13C-3 基线与本轮目标
+
+- Stage 13C-3 已实现 `SD SNAPSHOT` 自主调用 `Camera_RTOS_PrepareRgb565Frame()`，无需先执行 DUMP 即可准备有效图像并保存 `IMAGE.RGB`。
+- 板测确认 `IMAGE.RGB` 不再全零，转换为 PNG 后图像正常；保存后的 DUMP 和 binary basic/repeat 工具均 PASS。
+- Stage 13D 将固定输出升级为电脑可直接打开的 `IMAGE.BMP`，不再创建或覆盖 `IMAGE.RGB`。
+
+### 2. BMP 文件格式
+
+- 图像尺寸固定为 160×120，输出格式为未压缩 24-bit BMP，像素顺序为 BGR888。
+- BITMAPFILEHEADER 为 14 字节，BITMAPINFOHEADER 为 40 字节，像素数据偏移为 54 字节。
+- height 写为 `-120`，使用 top-down BMP，因此 staging buffer 的第 0 行直接写为 BMP 的第 0 行，不需要倒序遍历。
+- 每行有效数据为 `160×3=480` 字节；480 已经是 4 字节对齐值，所以 row stride 也是 480 字节且没有额外 padding。
+- 像素数据长度为 `480×120=57600` 字节，最终文件大小固定为 `54+57600=57654` 字节。
+- BMP header 使用 54 字节 `uint8_t` 缓冲手工按 little-endian 填充，不直接写入可能含结构体 padding 的 C struct。
+
+### 3. RGB565 转 BGR888
+
+- 输入仍为 DUMP 同源的 160×120 RGB565 little-endian front frame，并在 SD 会话前复制到现有 38400 字节 static staging buffer。
+- 每个像素按 `src[0] | (src[1] << 8)` 组成 RGB565，再分别提取 R5、G6、B5。
+- 颜色扩展使用 `r8=(r5<<3)|(r5>>2)`、`g8=(g6<<2)|(g6>>4)`、`b8=(b5<<3)|(b5>>2)`，按 B、G、R 顺序写入 BMP 行缓冲。
+- 保留现有 `source_nonzero`、`source_sum32`、prepare/retry 检查；源图像无效时不进入 SDIO/FatFs 会话。
+
+### 4. RAM 与写入策略
+
+- 保留现有文件作用域、4 字节对齐的 38400 字节 RGB565 staging buffer，保证 SD 会话期间图像源稳定。
+- 新增文件作用域、4 字节对齐的 480 字节 BMP row buffer；另有 54 字节 BMP header buffer。
+- 不分配 57600 字节 BMP 全图缓冲，不使用 `malloc`，也不在函数栈上放置 480、38400 或 57600 字节数组。
+- 文件打开后先 `f_write` 54 字节 header，再逐行转换并分别 `f_write` 120 个 480 字节行；每次均核对 FatFs 返回值和实际写入长度。
+- 只有累计写入严格等于 57654 字节时 write 才能 PASS；随后继续执行既有 close、unmount、deinit、DVP/GPIO/相机链路 cleanup/restore。
+
+### 5. CLI 与状态边界
+
+- HELP 命令列表不变，不新增 CLI；`SD SNAPSHOT` 输出更新为 `file=IMAGE.BMP`、`format=BMP24`、`bytes=57654`。
+- `SD STATUS` 继续只读取缓存，不触发 prepare、DVP mask、SDIO takeover、HAL SD、FatFs 或块写入。
+- 不调用 `f_read`、`f_mkfs`，不启用 SDIO DMA/IRQ，不修改 DUMP/OV56RGB5 或 binary image request 协议。
+
+### 6. 判断标准
+
+- `SD SNAPSHOT` 返回 `result=PASS`、`file=IMAGE.BMP`、`bytes=57654`、`format=BMP24`。
+- prepare、mount、write、cleanup、restore 均 PASS，且 `source_nonzero>0`、`source_sum32>0`。
+- 断电取卡后电脑可直接打开 `IMAGE.BMP`，图像尺寸为 160×120、方向正确、颜色基本正确。
+- 保存后文本 DUMP 和 binary basic/repeat 工具仍 PASS。
+
+Codex 本轮只执行静态检查与 Debug 构建；实际 SD 卡 BMP 打开、方向、颜色以及保存后 DUMP/basic/repeat 仍需开发板验证。
