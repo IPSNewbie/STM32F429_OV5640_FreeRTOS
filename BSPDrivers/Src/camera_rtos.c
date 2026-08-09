@@ -21,9 +21,6 @@
 //          和 MonitorTask（定期统计监控）两个 FreeRTOS 任务。
 //============================================================================
 
-// 等待 DCMI 快照完成的最大超时时间（毫秒）
-#define CAMERA_RTOS_SNAPSHOT_TIMEOUT_MS          3000U
-
 // CameraServiceTask 每次从 StreamBuffer 读取的最大字节数
 #define CAMERA_RTOS_UART_RX_CHUNK_SIZE             32U
 
@@ -323,16 +320,19 @@ static uint8_t Camera_RTOS_DiscardOverflowedInput(void)
     return 1U;
 }
 
-// 执行完整的“捕获 → 图像处理 → 发送”流程，返回错误码（0 表示成功）
-static uint32_t Camera_RTOS_CaptureProcessAndSend(void)
+uint32_t Camera_RTOS_PrepareRgb565Frame(uint32_t timeout_ms)
 {
     uint8_t snapshot_ret;                      // DCMI 快照启动返回值（0 成功）
-    uint8_t dump_ret;                          // PC Dump 发送返回值（0 成功）
     uint32_t snapshot_start_tick;              // 快照启动时的时间戳（毫秒）
     CameraFrameBufferStatus_t commit_ret;      // 帧缓冲区提交结果
     CameraImageProcessStatus_t process_ret;    // 图像处理结果
     CameraProcessMode_t process_mode;          // 当前 CLI 配置的处理模式
     uint8_t binary_threshold;                  // 当前 CLI 配置的二值化阈值
+
+    if (timeout_ms == 0U)
+    {
+        return CAMERA_RTOS_ERR_BAD_STATE;
+    }
 
     // 清除之前可能残留的快照完成标志，确保本次快照状态干净
     Camera_DCMI_ClearSnapshotDone();
@@ -354,7 +354,7 @@ static uint32_t Camera_RTOS_CaptureProcessAndSend(void)
     while (Camera_DCMI_IsSnapshotDone() == 0U)
     {
         // 检查是否超过设定的超时时间（通常 3000ms）
-        if ((HAL_GetTick() - snapshot_start_tick) > CAMERA_RTOS_SNAPSHOT_TIMEOUT_MS)
+        if ((HAL_GetTick() - snapshot_start_tick) > timeout_ms)
         {
             Camera_DCMI_Stop();   // 超时强制停止 DCMI
             return CAMERA_RTOS_ERR_SNAPSHOT_TIMEOUT;
@@ -394,9 +394,25 @@ static uint32_t Camera_RTOS_CaptureProcessAndSend(void)
         // 注意：若旁路模式成功，则不会返回错误，继续执行发送流程
     }
 
-    // 将当前前台帧（已经过处理或旁路）通过 UART 打包发送给 PC
-    // 帧序号 s_camera_rtos_frame_id 会随每次成功发送递增，便于 PC 端识别
-    dump_ret = Camera_PC_Dump_SendFrame(s_camera_rtos_uart, s_camera_rtos_frame_id);
+    return CAMERA_RTOS_ERR_NONE;
+}
+
+// 文本和二进制 DUMP 共用公共准备接口，再按原协议发送当前前台帧。
+static uint32_t Camera_RTOS_PrepareAndSend(void)
+{
+    uint8_t dump_ret;
+    uint32_t prepare_result;
+
+    prepare_result = Camera_RTOS_PrepareRgb565Frame(
+        CAMERA_RTOS_RGB565_PREPARE_TIMEOUT_MS);
+    if (prepare_result != CAMERA_RTOS_ERR_NONE)
+    {
+        return prepare_result;
+    }
+
+    dump_ret = Camera_PC_Dump_SendFrame(
+        s_camera_rtos_uart,
+        s_camera_rtos_frame_id);
     if (dump_ret != 0U)
     {
         // 发送失败（可能因为 UART 错误、帧头/CRC 错误等），返回对应的发送错误码
@@ -472,7 +488,7 @@ static uint8_t Camera_RTOS_ProcessDumpRequest(uint8_t request_source)
     }
 
     dump_start_tick = HAL_GetTick();
-    error_code = Camera_RTOS_CaptureProcessAndSend();
+    error_code = Camera_RTOS_PrepareAndSend();
     dump_elapsed_ms = HAL_GetTick() - dump_start_tick;
     Camera_RTOS_UpdateCameraServiceStackStats();
     if (error_code == CAMERA_RTOS_ERR_NONE)

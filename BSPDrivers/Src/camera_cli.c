@@ -341,6 +341,27 @@ static CameraCliStatus_t Camera_CLI_RunSdSnapshot(
         huart,
         "bytes",
         snapshot_result.bytes_written);
+    Camera_CLI_WriteFieldText(huart, "source", snapshot_result.source_text);
+    Camera_CLI_WriteFieldU32(
+        huart,
+        "source_bytes",
+        snapshot_result.source_bytes);
+    Camera_CLI_WriteFieldU32(
+        huart,
+        "source_nonzero",
+        snapshot_result.source_nonzero);
+    Camera_CLI_WriteFieldU32(
+        huart,
+        "source_sum32",
+        snapshot_result.source_sum32);
+    Camera_CLI_WriteFieldText(
+        huart,
+        "prepare",
+        snapshot_result.prepare_text);
+    Camera_CLI_WriteFieldU32(
+        huart,
+        "prepare_retry",
+        snapshot_result.prepare_retry);
     Camera_CLI_WriteFieldText(huart, "format", snapshot_result.format_text);
     Camera_CLI_WriteFieldU32(huart, "width", snapshot_result.width);
     Camera_CLI_WriteFieldU32(huart, "height", snapshot_result.height);

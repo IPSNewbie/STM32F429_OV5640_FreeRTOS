@@ -3,6 +3,7 @@
 #include "bsp_sccb.h"
 #include "camera_dcmi_dma.h"
 #include "camera_frame_buffer.h"
+#include "camera_rtos.h"
 #include "camera_snapshot_control.h"
 #include "ff.h"
 #include "diskio.h"
@@ -23,6 +24,9 @@
 #define CAMERA_SD_CAMERA_RESTORE_DELAY_MS       100U
 #define CAMERA_SD_SNAPSHOT_FILE_NAME           "IMAGE.RGB"
 #define CAMERA_SD_SNAPSHOT_FORMAT_TEXT         "RGB565"
+#define CAMERA_SD_SNAPSHOT_SOURCE_TEXT         "FRONT"
+#define CAMERA_SD_FRAME_PREPARE_MAX_RETRIES      3U
+#define CAMERA_SD_FRAME_PREPARE_RETRY_DELAY_MS  75U
 
 #define CAMERA_SD_CONFLICT_PIN_MASK \
     (GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_11)
@@ -67,6 +71,8 @@ static const CameraSdLine_t s_camera_sd_lines[] =
     {GPIOD, 2U}
 };
 
+static uint8_t s_camera_sd_snapshot_image_buffer[CAMERA_FB_SIZE_BYTES]
+    __attribute__((aligned(4)));
 static CameraSdStorageStatus_t s_camera_sd_status;
 static SD_HandleTypeDef s_camera_sd_handle;
 static HAL_SD_CardInfoTypeDef s_camera_sd_card_info;
@@ -1030,16 +1036,113 @@ static uint32_t Camera_SDStorage_GetValidatedFrontFrame(
     return CAMERA_SD_OK;
 }
 
+static uint32_t Camera_SDStorage_StageFrontFrame(
+    uint32_t *source_nonzero,
+    uint32_t *source_sum32)
+{
+    CameraFrame_t front_frame;
+    uint32_t nonzero_count = 0U;
+    uint32_t sum32 = 0U;
+    uint32_t index;
+    uint32_t result;
+
+    if ((source_nonzero == NULL) || (source_sum32 == NULL))
+    {
+        return CAMERA_SD_ERR_INVALID_ARGUMENT;
+    }
+
+    result = Camera_SDStorage_GetValidatedFrontFrame(&front_frame);
+    if (result != CAMERA_SD_OK)
+    {
+        return result;
+    }
+
+    (void)memcpy(
+        s_camera_sd_snapshot_image_buffer,
+        front_frame.data,
+        CAMERA_FB_SIZE_BYTES);
+
+    for (index = 0U; index < CAMERA_FB_SIZE_BYTES; ++index)
+    {
+        uint8_t value = s_camera_sd_snapshot_image_buffer[index];
+
+        sum32 += (uint32_t)value;
+        if (value != 0U)
+        {
+            ++nonzero_count;
+        }
+    }
+
+    *source_nonzero = nonzero_count;
+    *source_sum32 = sum32;
+    if ((nonzero_count == 0U) || (sum32 == 0U))
+    {
+        return CAMERA_SD_ERR_FRAME_EMPTY;
+    }
+
+    return CAMERA_SD_OK;
+}
+
+static uint32_t Camera_SDStorage_PrepareAndStageFrontFrame(
+    CameraSdSnapshotResult_t *result_info)
+{
+    uint32_t prepare_result;
+    uint32_t stage_result;
+    uint32_t retry_count;
+
+    if (result_info == NULL)
+    {
+        return CAMERA_SD_ERR_INVALID_ARGUMENT;
+    }
+
+    result_info->prepare_text = "FAIL";
+    for (retry_count = 0U;
+         retry_count <= CAMERA_SD_FRAME_PREPARE_MAX_RETRIES;
+         ++retry_count)
+    {
+        result_info->prepare_retry = retry_count;
+        result_info->source_nonzero = 0U;
+        result_info->source_sum32 = 0U;
+        prepare_result = Camera_RTOS_PrepareRgb565Frame(
+            CAMERA_RTOS_RGB565_PREPARE_TIMEOUT_MS);
+        if (prepare_result != CAMERA_RTOS_ERR_NONE)
+        {
+            return (prepare_result == CAMERA_RTOS_ERR_SNAPSHOT_TIMEOUT) ?
+                CAMERA_SD_ERR_FRAME_PREPARE_TIMEOUT :
+                CAMERA_SD_ERR_FRAME_PREPARE_FAILED;
+        }
+
+        stage_result = Camera_SDStorage_StageFrontFrame(
+            &result_info->source_nonzero,
+            &result_info->source_sum32);
+        if (stage_result == CAMERA_SD_OK)
+        {
+            result_info->prepare_text = "PASS";
+            return CAMERA_SD_OK;
+        }
+        if (stage_result != CAMERA_SD_ERR_FRAME_EMPTY)
+        {
+            return stage_result;
+        }
+
+        if (retry_count < CAMERA_SD_FRAME_PREPARE_MAX_RETRIES)
+        {
+            HAL_Delay(CAMERA_SD_FRAME_PREPARE_RETRY_DELAY_MS);
+        }
+    }
+
+    return CAMERA_SD_ERR_FRAME_EMPTY;
+}
+
 uint32_t Camera_SDStorage_SaveSnapshotFrame(
     CameraSdSnapshotResult_t *snapshot_result)
 {
     CameraSdSnapshotResult_t result_info;
-    CameraFrame_t front_frame;
     uint32_t result = CAMERA_SD_OK;
     uint32_t cleanup_result = CAMERA_SD_OK;
     uint32_t restore_result = CAMERA_SD_OK;
     uint32_t step_result;
-    uint32_t prepare_attempted = 0U;
+    uint32_t camera_restore_required = 0U;
     uint32_t dvp_restore_required = 0U;
     uint32_t takeover_attempted = 0U;
     uint32_t mount_attempted = 0U;
@@ -1049,8 +1152,10 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
     UINT bytes_written = 0U;
 
     memset(&result_info, 0, sizeof(result_info));
-    memset(&front_frame, 0, sizeof(front_frame));
     result_info.file_name = CAMERA_SD_SNAPSHOT_FILE_NAME;
+    result_info.source_text = CAMERA_SD_SNAPSHOT_SOURCE_TEXT;
+    result_info.source_bytes = CAMERA_FB_SIZE_BYTES;
+    result_info.prepare_text = "NOT_RUN";
     result_info.format_text = CAMERA_SD_SNAPSHOT_FORMAT_TEXT;
     result_info.width = CAMERA_FB_WIDTH;
     result_info.height = CAMERA_FB_HEIGHT;
@@ -1092,31 +1197,23 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
         return result;
     }
 
-    step_result = Camera_SDStorage_GetValidatedFrontFrame(&front_frame);
-    if (step_result != CAMERA_SD_OK)
-    {
-        result = step_result;
-        goto cleanup;
-    }
-
     s_camera_sd_status.dvp_reg_3018_saved =
         CAMERA_SD_REG_VALUE_UNKNOWN;
     restore_continuous_capture =
         ((DCMI->CR & DCMI_CR_CAPTURE) != 0U) ? 1U : 0U;
     Camera_SDStorage_EnsureDcmiDmaHandle();
-    prepare_attempted = 1U;
+    camera_restore_required = 1U;
+    step_result = Camera_SDStorage_PrepareAndStageFrontFrame(&result_info);
+    if (step_result != CAMERA_SD_OK)
+    {
+        result = step_result;
+        goto cleanup;
+    }
+
     step_result = Camera_SnapshotControl_RequestPrepare();
     if (step_result != CAMERA_SNAPSHOT_OK)
     {
         result = CAMERA_SD_ERR_SNAPSHOT_PREPARE_FAILED;
-        goto cleanup;
-    }
-
-    /* Re-read after the pause so the selected front buffer remains stable. */
-    step_result = Camera_SDStorage_GetValidatedFrontFrame(&front_frame);
-    if (step_result != CAMERA_SD_OK)
-    {
-        result = step_result;
         goto cleanup;
     }
 
@@ -1177,11 +1274,11 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
 
     fatfs_result = f_write(
         &s_camera_sd_file,
-        front_frame.data,
-        (UINT)front_frame.size_bytes,
+        s_camera_sd_snapshot_image_buffer,
+        (UINT)CAMERA_FB_SIZE_BYTES,
         &bytes_written);
     if ((fatfs_result != FR_OK) ||
-        (bytes_written != (UINT)front_frame.size_bytes))
+        (bytes_written != (UINT)CAMERA_FB_SIZE_BYTES))
     {
         result_info.write_text = "FAIL";
         result = (s_camera_sd_fatfs_disk_error != CAMERA_SD_OK) ?
@@ -1237,7 +1334,7 @@ cleanup:
         Camera_SDStorage_RecordFirstError(&result, step_result);
     }
 
-    if (prepare_attempted != 0U)
+    if (camera_restore_required != 0U)
     {
         step_result = Camera_SDStorage_RestoreCameraLink(
             restore_continuous_capture,
@@ -1349,6 +1446,12 @@ const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
             return "CAMERA_RESTORE_FAILED";
         case CAMERA_SD_ERR_FRAME_BUFFER_INVALID:
             return "FRAME_BUFFER_INVALID";
+        case CAMERA_SD_ERR_FRAME_EMPTY:
+            return "FRAME_EMPTY";
+        case CAMERA_SD_ERR_FRAME_PREPARE_FAILED:
+            return "FRAME_PREPARE_FAILED";
+        case CAMERA_SD_ERR_FRAME_PREPARE_TIMEOUT:
+            return "FRAME_PREPARE_TIMEOUT";
         default:
             return "UNKNOWN_ERROR";
     }

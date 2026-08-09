@@ -8561,3 +8561,74 @@ Stage 13B 后续板测已经通过：`SD SNAPSHOT` 返回 `result=PASS`、`file=
 - 保存后文本 DUMP、`uart_image_request_basic.py` 和 `uart_image_request_repeat.py` 均 PASS。
 
 Codex 本轮只执行静态检查和 Debug 构建，不执行开发板、SD 卡、DUMP 或图像工具硬件测试。
+
+## Stage 13C-1 IMAGE.RGB 全 0 修复
+
+### 1. 板测现象与判断
+
+- Stage 13C 初版 `SD SNAPSHOT` 返回 PASS，`IMAGE.RGB` 文件大小为 38400 字节，mount、write、cleanup、restore 以及保存后的 DUMP/basic/repeat 均正常。
+- 断电取卡后发现 `IMAGE.RGB` 内容全为 `0x00`。这说明 FatFs、SDIO 写入和恢复链路已经成功，问题位于写卡前的图像数据源，而不能只用文件大小或 `bytes=38400` 判断保存成功。
+- 初版在暂停相机后再次取得 front frame 并直接把该指针交给 `f_write`，没有验证源图像是否包含有效数据，也没有隔离 SD 会话期间的 buffer 生命周期。
+
+### 2. 修复策略
+
+- 与 DUMP 保持同源：继续使用已经由 `camera_pc_dump.c` 验证的 `Camera_FrameBuffer_GetFrontFrame()`，校验指针、160×120 尺寸和 38400 字节长度。
+- 在 pause camera、DVP mask 和 SDIO takeover 之前，把当前 front frame 完整复制到文件作用域、4 字节对齐的 38400 字节 staging buffer；不在函数栈上分配大数组，也不使用 `malloc`。
+- SD 会话中的 `f_write` 只读取 staging buffer，不再在暂停后重新获取 front frame，也不直接依赖可能变化的 frame-buffer 指针。
+- 复制完成后逐字节计算 `source_nonzero` 和 `source_sum32`。由于 38400 个字节的最大和小于 `UINT32_MAX`，该统计不会发生 32 位溢出。
+- 如果 front frame 无效则返回 `FRAME_BUFFER_INVALID`；如果 `source_nonzero==0` 或 `source_sum32==0`，返回 `FRAME_EMPTY`，保持 `mount=NOT_RUN`、`write=NOT_RUN`、`bytes=0`，且不进入相机暂停或 SD 写卡流程。
+- `SD SNAPSHOT` 增加 `source=FRONT`、`source_bytes=38400`、`source_nonzero` 和 `source_sum32` 输出；`SD STATUS` 继续仅显示缓存状态，不触发任何硬件或 FatFs 流程。
+
+### 3. 判断标准
+
+- `SD SNAPSHOT` 返回 `result=PASS`、`file=IMAGE.RGB`、`bytes=38400`、`source=FRONT`、`source_bytes=38400`。
+- `source_nonzero>0`、`source_sum32>0`，同时 `mount=PASS`、`write=PASS`、`cleanup=PASS`、`restore=PASS`。
+- 断电取卡后 `IMAGE.RGB` 大小严格为 38400 字节，内容不是全 `0x00`。
+- 按 160×120 RGB565 raw 转换后能够看到与保存时 front frame 对应的图像。
+- 保存后文本 DUMP、`uart_image_request_basic.py` 和 `uart_image_request_repeat.py` 均 PASS。
+
+Codex 本轮只执行静态检查与 Debug 构建；开发板、SD 卡内容、Python 转换以及 DUMP/basic/repeat 验证仍需板测完成。
+
+## Stage 13C-3 抽取 DUMP 共用图像准备路径并供 SD SNAPSHOT 复用
+
+### 1. Stage 13C-2 板测结果与审计结论
+
+- 先执行 DUMP 再执行 `SD SNAPSHOT` 时，`source_nonzero=38400`、`source_sum32=5410716`，`IMAGE.RGB` 保存成功。
+- 上电后不先执行 DUMP，直接执行 `SD SNAPSHOT` 时，front buffer 仍为空，`source_nonzero=0`。
+- 审计确认文本 DUMP 和 binary image request 均由 `CameraServiceTask` 调用同一个内部请求入口；原入口在 `camera_rtos.c` 中依次执行 DCMI snapshot、等待完成、停止、front/back commit、当前 PROC 模式处理，最后才调用 `Camera_PC_Dump_SendFrame()` 发送 OV56RGB5。
+- Stage 13C-2 的 SD SNAPSHOT 只读取已有 front buffer，没有执行上述图像准备步骤，因此依赖用户先运行 DUMP。
+
+### 2. 公共图像准备接口
+
+- 将原 DUMP 已验证的 capture、wait、stop、front/back commit 和 image process 逻辑抽取为 `Camera_RTOS_PrepareRgb565Frame(uint32_t timeout_ms)`。
+- 公共函数保留原 DUMP 的 DCMI 启动错误、超时、commit 错误、图像处理错误和 BYPASS fallback 行为；成功返回后，现有 `Camera_FrameBuffer_GetFrontFrame()` 指向准备完成的 160×120 RGB565 数据。
+- 公共函数不发送 UART、不操作 SD、不改变当前 PROC 模式，也不修改任务、优先级、栈或调度结构。
+- `SD SNAPSHOT` 的 CLI 处理本来就在 `CameraServiceTask` 上下文中同步执行，因此直接调用公共 prepare，不新增任务、队列或跨任务 DCMI 访问。
+
+### 3. DUMP 与 binary request 路径
+
+- 原 DUMP 私有 capture/process/send 函数拆分为公共 prepare 和保留的内部 send wrapper。
+- 文本 DUMP 与 binary image request 继续复用同一个请求入口：先调用 `Camera_RTOS_PrepareRgb565Frame()`，成功后再调用原 `Camera_PC_Dump_SendFrame()`。
+- OV56RGB5 magic、version、pixel format、160×120 尺寸、38400 字节 payload、frame ID、CRC32、UART 分块发送和错误映射均保持不变。
+- binary image request 的解析、seq、统计和响应协议保持不变。
+
+### 4. SD SNAPSHOT 路径
+
+1. 在 software guard、DVP mask、SDIO takeover 和 FatFs 会话之前调用 `Camera_RTOS_PrepareRgb565Frame()`。
+2. 通过与 DUMP 相同的 `Camera_FrameBuffer_GetFrontFrame()` 获取准备后的 front buffer。
+3. 校验指针、160×120 尺寸和 38400 字节长度，再复制到文件作用域、4 字节对齐的 static staging buffer。
+4. 统计 staging buffer 的 `source_nonzero` 和 `source_sum32`。
+5. 如果捕获或处理失败，返回 `FRAME_PREPARE_FAILED`；如果等待超时，返回 `FRAME_PREPARE_TIMEOUT`，均不进入 SD 写卡流程。
+6. 如果准备成功但源仍为空，间隔 75 ms 重新执行同一公共 prepare，最多重试 3 次；仍为空则返回 `FRAME_EMPTY`，保持 mount/write 为 `NOT_RUN`。
+7. 图像有效后才进入原有 DVP mask、ATK1B SDIO takeover、FatFs mount/write 和完整 cleanup/restore 流程。
+
+`SD SNAPSHOT` 新增 `prepare=PASS|FAIL|NOT_RUN` 和 `prepare_retry=0..3` 输出。SD storage 不调用 DUMP 命令处理函数、`Camera_PC_Dump_SendFrame()` 或任何 UART 图像发送函数。
+
+### 5. 判断标准
+
+- 上电后不执行 DUMP，直接执行 `SD SNAPSHOT` 也应返回 `result=PASS`、`prepare=PASS`。
+- `source_nonzero>0`、`source_sum32>0`、`bytes=38400`、mount/write/cleanup/restore 均 PASS。
+- 断电取卡后 `IMAGE.RGB` 严格为 38400 字节且内容非全零，按 160×120 RGB565 raw 转换后图像可见。
+- 保存后的文本 DUMP、binary basic/repeat 工具仍 PASS，OV56RGB5 和 binary image request 协议均无变化。
+
+Codex 本轮只执行静态检查与 Debug 构建；上电直达 SD SNAPSHOT、SD 卡内容及 DUMP/basic/repeat 仍需开发板验证。

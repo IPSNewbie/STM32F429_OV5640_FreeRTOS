@@ -41,11 +41,20 @@
 #define CAMERA_SD_ERR_SDIO_CLOCK_DISABLE_FAILED    44U
 #define CAMERA_SD_ERR_CAMERA_RESTORE_FAILED        45U
 #define CAMERA_SD_ERR_FRAME_BUFFER_INVALID         46U
+#define CAMERA_SD_ERR_FRAME_EMPTY                  47U
+#define CAMERA_SD_ERR_FRAME_PREPARE_FAILED         48U
+#define CAMERA_SD_ERR_FRAME_PREPARE_TIMEOUT        49U
 
 typedef struct
 {
     const char *file_name;
     uint32_t bytes_written;
+    const char *source_text;
+    uint32_t source_bytes;
+    uint32_t source_nonzero;
+    uint32_t source_sum32;
+    const char *prepare_text;
+    uint32_t prepare_retry;
     const char *format_text;
     uint32_t width;
     uint32_t height;

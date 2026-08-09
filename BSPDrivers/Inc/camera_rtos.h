@@ -8,6 +8,8 @@
 #define CAMERA_SD_DIAG_SD_ONLY_BOOT (0U)
 #endif
 
+#define CAMERA_RTOS_RGB565_PREPARE_TIMEOUT_MS (3000U)
+
 //============================================================================
 // @file    camera_rtos.h
 // @brief   摄像头 RTOS 任务模块
@@ -121,6 +123,15 @@ void Camera_RTOS_Init(UART_HandleTypeDef *huart);
  * @note   应在应用初始化和任务创建完成后、调度器启动前调用
  */
 HAL_StatusTypeDef Camera_RTOS_IwdgInit(void);
+
+/**
+ * @brief  Capture, commit and process one RGB565 frame without UART output.
+ * @param  timeout_ms Maximum time to wait for the DCMI snapshot.
+ * @return CameraRtosErrorCode_t value; CAMERA_RTOS_ERR_NONE on success.
+ * @note   Call from CameraServiceTask context. On success the same front
+ *         buffer used by DUMP contains the prepared 160x120 RGB565 frame.
+ */
+uint32_t Camera_RTOS_PrepareRgb565Frame(uint32_t timeout_ms);
 
 /**
  * @brief  记录一次 DUMP 请求
