@@ -8740,3 +8740,28 @@ Codex 本轮只执行静态检查与 Debug 构建；连续 snapshot、实际耗�
 - 卡中已有编号文件时选择第一个不存在的候选名称；扫描异常显示 `FILE_SCAN_FAILED`，编号耗尽显示 `FILE_INDEX_FULL`，两种失败均不写卡。
 - 成功结果继续显示 `format=BMP24`、`bytes=57654`，prepare、mount、write、cleanup、restore 均为 PASS，耗时字段继续有效。
 - 保存后文本 DUMP 正常，binary basic/repeat 工具 PASS；上述 SD 卡、图像和连续保存行为仍需开发板验证。
+
+## Stage 13G SD SNAPSHOT 长时间稳定性自动测试
+
+### 1. 基线与测试工具
+
+- Stage 13F 已完成 `IMG0001.BMP` 至 `IMG9999.BMP` 的递增保存，板测确认连续 snapshot、57654 字节 BMP24 文件、SD 状态缓存以及 cleanup/restore 均正常。
+- 本轮只新增 PC 端工具 `tools/uart_sd_snapshot_stability.py`，不修改固件、CLI、SD SNAPSHOT 行为或串口协议。
+- 工具默认使用 COM4、115200 baud、执行 50 次、轮次间隔 0.5 秒、单条命令超时 15 秒；可通过 `--port`、`--baud`、`--count`、`--interval`、`--timeout` 和 `--output` 调整。
+- 测试记录写入 `captures/sd_snapshot_stability_时间戳.csv` 和 `captures/sd_snapshot_stability_时间戳.log`。
+
+### 2. 自动测试流程
+
+1. 在打开串口前设置 DTR/RTS 为 false，并禁用 RTS/CTS 与 DSR/DTR 流控；打开后清理旧输入输出。
+2. 依次发送 `HELP`、`STATUS`、`SD STATUS` 完成能力确认和初始状态记录。
+3. 循环发送 `SD SNAPSHOT\r\n`，以 `SD SNAPSHOT:` 为块起点解析缩进的 `key=value` 字段；缺失字段、响应超时或解析不到块时记录本轮失败，不使脚本崩溃。
+4. 每轮检查 result、8.3 递增文件名、57654 字节文件大小、`source_nonzero/source_sum32`、prepare 以及 mount/write/cleanup/restore，并记录全部耗时和错误字段。
+5. 循环结束后再次读取 `STATUS` 和 `SD STATUS`，检查健康计数以及最近一次 SD 保存状态。
+
+### 3. 输出与判断标准
+
+- CSV 逐轮记录文件编号、BMP/源数据字段、各阶段结果、total/prepare/write/cleanup 耗时、错误、单轮判定和文件序列判定；日志保留命令响应、进度和最终汇总。
+- 汇总统计总数、PASS/FAIL、成功率、首末文件、文件编号连续性、是否发现错误码，以及 `total_ms`、`write_ms` 的最小值、最大值和平均值。
+- 50 次必须全部 PASS，且本次测试内相邻文件编号严格加一、每个文件均为 57654 字节；任意单轮失败或文件编号不连续时脚本退出码为 1。
+- 最后 `STATUS` 的 `hook_fault`、`uart_dma_error`、`stream_overflow`、`refresh_skip` 必须为 0，最后 `SD STATUS` 的 `last_snapshot=PASS`、`save_error=OK`、`last_error=OK`；否则整体测试失败。
+- Codex 本轮只执行脚本语法检查，不连接开发板；50～100 次串口、SD 卡和相机链路稳定性测试由板端环境执行。
