@@ -1,8 +1,23 @@
-#include "camera_uart_dispatcher.h"
+#include "camera_uart_dispatcher.h"  // UART 文本/二进制分发状态、事件和公开接口
 
-#include <stddef.h>
+#include <stddef.h>                   // 提供 NULL 空指针常量
 
-// 清空上一次事件，避免调用方误用残留数据
+//============================================================================
+// @file    camera_uart_dispatcher.c
+// @brief   USART1 混合字节流的文本命令与 binary image request 分发器
+//
+// UART DMA/ISR 只把字节送进 StreamBuffer；CameraServiceTask 逐字节调用本模块，
+// 因而 dispatcher 由单一任务上下文拥有，不在中断中解析协议。
+// IDLE 用首字节选择文本或二进制：0xA5 启动请求候选，其他字节进入 TEXT；
+// TEXT 保持到 LF；BINARY 把字节交给固定 14 字节图像请求解析器。
+//
+// 若 version/type/length/EOF 在帧中途出错，后续 CRC/EOF 字节不能立刻成为 CLI。
+// 本模块会按出错字段位置隔离旧帧剩余字节，或在 inter-byte timeout 后回到 IDLE。
+// 底层解析器若已把当前 0xA5 保留为下一帧起点，则继续 BINARY 而不丢弃新帧。
+// 本模块只生成事件，不执行 CLI、图像采集、UART 响应或 CRC 算法。
+//============================================================================
+
+// 每次公开入口先清空输出事件，避免 NONE/PENDING 路径遗留上一帧字段。
 static void CameraUartDispatcher_ClearEvent(
     CameraUartDispatchEvent_t *event)
 {
@@ -15,7 +30,7 @@ static void CameraUartDispatcher_ClearEvent(
     event->binary_result = IMAGE_REQUEST_PARSE_NONE;
 }
 
-// 清除错误帧尾部隔离状态
+// 清除旧帧尾部隔离计数；底层 binary parser 状态由调用点另行决定是否复位。
 static void CameraUartDispatcher_ClearBinaryDiscard(
     CameraUartDispatcher_t *dispatcher)
 {
@@ -24,7 +39,8 @@ static void CameraUartDispatcher_ClearBinaryDiscard(
     dispatcher->binary_discard_last_time_ms = 0U;
 }
 
-// 根据发生错误前的解析状态计算当前固定帧剩余字节数
+// 根据错误字段在 14 字节帧中的位置计算仍需隔离的尾部长度。
+// VERSION/TYPE/LEN_HIGH/EOF0 已消费后分别剩 11/10/6/1 字节；EOF1 后为 0。
 static uint8_t CameraUartDispatcher_GetRemainingBytesAfterError(
     ImageRequestParserState_t state_before)
 {
@@ -48,13 +64,14 @@ static uint8_t CameraUartDispatcher_GetRemainingBytesAfterError(
     }
 }
 
-// 字段错误后隔离当前固定帧尚未接收的尾部字节
+// 字段错误后隔离旧固定帧尾部，避免残余二进制字节被误当成 CLI 文本。
+// 若 Resync 已保留当前 0xA5 作为新 SOF0，则优先继续新候选帧，不能启动旧尾丢弃。
 static void CameraUartDispatcher_StartBinaryDiscard(
     CameraUartDispatcher_t *dispatcher,
     ImageRequestParserState_t state_before,
     uint32_t now_ms)
 {
-    uint8_t remaining;
+    uint8_t remaining;  // 依据出错字段推导的旧帧剩余字节数
 
     CameraUartDispatcher_ClearBinaryDiscard(dispatcher);
 
@@ -77,7 +94,7 @@ static void CameraUartDispatcher_StartBinaryDiscard(
     dispatcher->mode = CAMERA_UART_DISPATCH_MODE_BINARY;
 }
 
-// 底层解析后按活动状态更新分发模式
+// 底层解析后按候选帧是否仍 active 选择 BINARY 或 IDLE，保留重同步结果。
 static void CameraUartDispatcher_UpdateBinaryMode(
     CameraUartDispatcher_t *dispatcher)
 {
@@ -91,7 +108,8 @@ static void CameraUartDispatcher_UpdateBinaryMode(
     }
 }
 
-// 将图像请求解析结果转换为分发事件
+// 将逐字节解析结果映射为 CameraServiceTask 可消费的请求、错误或超时事件。
+// CRC 错误发生在完整帧末，无需隔离；字段中途错误必须隔离固定尾部。
 static CameraUartDispatchResult_t CameraUartDispatcher_MapBinaryResult(
     CameraUartDispatcher_t *dispatcher,
     ImageRequestParseResult_t parse_result,
@@ -145,6 +163,7 @@ static CameraUartDispatchResult_t CameraUartDispatcher_MapBinaryResult(
     return out_event->type;
 }
 
+// 初始化 CameraServiceTask 私有的 UART 分发上下文；不启动 DMA，也不清文本行缓冲。
 void CameraUartDispatcher_Init(CameraUartDispatcher_t *dispatcher)
 {
     if (dispatcher == NULL)
@@ -157,6 +176,7 @@ void CameraUartDispatcher_Init(CameraUartDispatcher_t *dispatcher)
     dispatcher->mode = CAMERA_UART_DISPATCH_MODE_IDLE;
 }
 
+// 丢弃二进制候选帧和尾部隔离状态并回到 IDLE；文本解析器由上层单独复位。
 void CameraUartDispatcher_Reset(CameraUartDispatcher_t *dispatcher)
 {
     if (dispatcher == NULL)
@@ -169,14 +189,16 @@ void CameraUartDispatcher_Reset(CameraUartDispatcher_t *dispatcher)
     dispatcher->mode = CAMERA_UART_DISPATCH_MODE_IDLE;
 }
 
+// 在 CameraServiceTask 中消费一个 UART 字节并生成至多一个事件。
+// 函数本身没有循环，跨字节状态保存在 dispatcher；TEXT 以 LF 作为模式边界。
 CameraUartDispatchResult_t CameraUartDispatcher_FeedByte(
     CameraUartDispatcher_t *dispatcher,
     uint8_t byte,
     uint32_t now_ms,
     CameraUartDispatchEvent_t *out_event)
 {
-    ImageRequestParseResult_t parse_result;
-    ImageRequestParserState_t state_before;
+    ImageRequestParseResult_t parse_result;  // 底层 parser 对当前字节的处理结果
+    ImageRequestParserState_t state_before;  // 错误前字段位置，用于计算隔离长度
 
     if (out_event != NULL)
     {
@@ -188,6 +210,7 @@ CameraUartDispatchResult_t CameraUartDispatcher_FeedByte(
         return CAMERA_UART_DISPATCH_BAD_ARGUMENT;
     }
 
+    // 未超时时每个输入只递减一次固定尾长；超时则清隔离，让当前字节重新参与 IDLE 判定。
     if (dispatcher->binary_discard_active != 0U)
     {
         if ((uint32_t)(now_ms - dispatcher->binary_discard_last_time_ms) >=
@@ -216,6 +239,7 @@ CameraUartDispatchResult_t CameraUartDispatcher_FeedByte(
         }
     }
 
+    // TEXT 内不识别 0xA5，只原样上交字节；遇到 LF 后下一字节重新分类。
     if (dispatcher->mode == CAMERA_UART_DISPATCH_MODE_TEXT)
     {
         out_event->type = CAMERA_UART_DISPATCH_TEXT_BYTE;
@@ -226,6 +250,7 @@ CameraUartDispatchResult_t CameraUartDispatcher_FeedByte(
         return out_event->type;
     }
 
+    // 只有 IDLE 下的 0xA5 才启动 binary 候选，其余首字节立即属于 CLI 文本。
     if (dispatcher->mode == CAMERA_UART_DISPATCH_MODE_IDLE)
     {
         if (byte != IMAGE_REQUEST_SOF0)
@@ -269,13 +294,15 @@ CameraUartDispatchResult_t CameraUartDispatcher_FeedByte(
                                                 out_event);
 }
 
+// 在 CameraServiceTask 的 UART 有界读取未收到字节时检查 inter-byte timeout。
+// discard 超时静默恢复 IDLE；真实候选帧超时则产生可统计的 TIMEOUT 事件。
 CameraUartDispatchResult_t CameraUartDispatcher_CheckTimeout(
     CameraUartDispatcher_t *dispatcher,
     uint32_t now_ms,
     CameraUartDispatchEvent_t *out_event)
 {
-    ImageRequestParseResult_t parse_result;
-    ImageRequestParserState_t state_before;
+    ImageRequestParseResult_t parse_result;  // 底层候选帧 timeout 检查结果
+    ImageRequestParserState_t state_before;  // timeout 前状态，供统一结果映射使用
 
     if (out_event != NULL)
     {
@@ -324,6 +351,7 @@ CameraUartDispatchResult_t CameraUartDispatcher_CheckTimeout(
                                                 out_event);
 }
 
+// 只读查询当前分类模式；NULL 返回 IDLE 是容错值，不代表真实对象状态。
 CameraUartDispatchMode_t CameraUartDispatcher_GetMode(
     const CameraUartDispatcher_t *dispatcher)
 {

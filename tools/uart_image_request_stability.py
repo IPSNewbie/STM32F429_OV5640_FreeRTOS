@@ -1,3 +1,5 @@
+"""UART 图像请求长时间稳定性测试与统计工具。"""
+
 import argparse
 import csv
 import struct
@@ -252,6 +254,7 @@ def print_final_summary(summary, csv_path, summary_path, failed_path):
 
 
 def main():
+    """解析参数并执行完整测试流程。"""
     args = parse_arguments()
     try:
         validate_arguments(args)
@@ -290,6 +293,7 @@ def main():
         ser.write_timeout = 2.0
         ser.rtscts = False
         ser.dsrdtr = False
+        # open 前关闭控制线，避免 CH340 自动下载电路切换 BOOT0 或复位 MCU。
         ser.dtr = False
         ser.rts = False
         ser.open()

@@ -1,46 +1,55 @@
 #ifndef IMAGE_REQUEST_PROTOCOL_H
 #define IMAGE_REQUEST_PROTOCOL_H
 
-#include <stdint.h>
+#include <stdint.h>  // 提供协议字段和毫秒时间戳使用的固定宽度整数类型
 
-//============================================================================
-// @file    image_request_protocol.h
-// @brief   图像请求协议解析模块（上位机下行命令）
-// @note    定义帧格式：SOF(0xA5 0x5A) + 版本(1B) + 类型(1B) + 序列号(2B LE)
-//          + 载荷长度(2B LE) + CRC32(4B LE) + EOF(0x0D 0x0A)
-//          支持状态机解析、超时检测，适用于 UART 流式接收。
-//============================================================================
+/**
+ * @file image_request_protocol.h
+ * @brief 上位机 binary image request 的逐字节解析接口
+ *
+ * V1 请求固定为 14 字节：
+ * - [0..1]：SOF0=0xA5、SOF1=0x5A，用于从混合 UART 字节流中定位候选帧；
+ * - [2]：version，[3]：message type；
+ * - [4..5]：sequence，小端；[6..7]：payload length，小端且 V1 固定为 0；
+ * - [8..11]：CRC32，小端，只覆盖 [2..7] 六个业务字段字节；
+ * - [12..13]：EOF0=CR、EOF1=LF。
+ *
+ * 解析器不访问 UART、HAL 或 FreeRTOS。CameraServiceTask 从 StreamBuffer 取字节后
+ * 按接收顺序调用 FeedByte()；上下文必须跨调用保存，且不能由多个任务或 ISR 并发喂入。
+ * 100 ms timeout 是相邻已接受字节之间的间隔，不是整帧累计时间。
+ * CRC32 用于发现传输损坏，不提供身份认证或防篡改能力。
+ */
 
 
 //============================================================================
 // 协议固定常量
 //============================================================================
 
-// 帧头同步字节 0（固定 0xA5）
+/** @brief 双字节帧头的第一个同步字节，用于从混合文本/二进制流中寻找候选起点。 */
 #define IMAGE_REQUEST_SOF0              0xA5U
 
-// 帧头同步字节 1（固定 0x5A）
+/** @brief 双字节帧头的第二个同步字节，降低单个 0xA5 被误判为完整帧头的概率。 */
 #define IMAGE_REQUEST_SOF1              0x5AU
 
-// 当前协议版本号
+/** @brief 当前图像请求协议版本号。 */
 #define IMAGE_REQUEST_VERSION           0x01U
 
-// 消息类型：请求图像（0x20）
+/** @brief 请求一帧图像的消息类型。 */
 #define IMAGE_REQUEST_MSG_REQUEST_IMAGE 0x20U
 
-// 帧尾字节 0（回车 CR）
+/** @brief 帧尾字节 0（CR）。 */
 #define IMAGE_REQUEST_EOF0              0x0DU
 
-// 帧尾字节 1（换行 LF）
+/** @brief 帧尾字节 1（LF）。 */
 #define IMAGE_REQUEST_EOF1              0x0AU
 
-// 帧固定长度（不含有效载荷）：SOF2 + Version + Type + Seq2 + Len2 + CRC4 + EOF2 = 14 字节
+/** @brief V1 固定总长：2 字节 SOF + 6 字节业务字段 + 4 字节 CRC + 2 字节 EOF。 */
 #define IMAGE_REQUEST_FRAME_SIZE        14U
 
-// V1 版本中载荷长度为 0（保留扩展）
+/** @brief V1 只携带“请求一帧”字段，不在请求后附带 payload，因此固定为 0。 */
 #define IMAGE_REQUEST_PAYLOAD_LEN_V1    0U
 
-// 解析超时阈值（毫秒）
+/** @brief 相邻字节最大间隔，防止残缺帧长期占用 dispatcher 的 BINARY 模式。 */
 #define IMAGE_REQUEST_TIMEOUT_MS        100U
 
 //============================================================================
@@ -95,8 +104,8 @@ typedef enum
  */
 typedef enum
 {
-    IMAGE_REQUEST_PARSE_NONE = 0,           /**< 无有效结果（仍在处理） */
-    IMAGE_REQUEST_PARSE_PENDING,            /**< 正在等待更多数据 */
+    IMAGE_REQUEST_PARSE_NONE = 0,           /**< 当前没有候选帧或没有需要上报的事件 */
+    IMAGE_REQUEST_PARSE_PENDING,            /**< 已有活动候选帧，仍需后续字节才能判定 */
     IMAGE_REQUEST_PARSE_OK,                 /**< 完整帧解析成功 */
     IMAGE_REQUEST_PARSE_CRC_ERROR,          /**< CRC 校验失败 */
     IMAGE_REQUEST_PARSE_VERSION_ERROR,      /**< 版本号不匹配 */
@@ -119,9 +128,9 @@ typedef struct
 {
     ImageRequestParserState_t state;  /**< 当前状态机状态 */
     ImageRequestFrame_t frame;        /**< 正在接收的帧字段（版本/类型/序号/长度） */
-    uint32_t computed_crc;            /**< 实时计算的有效 CRC（不含帧头/尾） */
-    uint32_t received_crc;            /**< 从帧中解析出的接收端 CRC */
-    uint32_t last_byte_time_ms;       /**< 最后一个字节接收的时间戳（用于超时） */
+    uint32_t computed_crc;            /**< 尚未 Finalize 的增量 CRC 内部状态，仅累计 [2..7] */
+    uint32_t received_crc;            /**< 按小端顺序从 [8..11] 重组的发送端 CRC */
+    uint32_t last_byte_time_ms;       /**< 最近一个已接受字节时间，用于 inter-byte timeout */
     uint8_t frame_active;             /**< 是否正在接收一帧（1=活跃） */
 } ImageRequestParser_t;
 
@@ -132,14 +141,15 @@ typedef struct
 /**
  * @brief  初始化解析器并进入空闲同步状态
  * @param  parser 由调用者静态分配的解析器指针
- * @note   将状态设为 IMAGE_REQUEST_STATE_SYNC0，并重置所有内部字段
+ * @note   将状态设为 IMAGE_REQUEST_STATE_SYNC0，并重置所有内部字段。
+ *         应由 CameraServiceTask 在 dispatcher 初始化阶段调用，不得与 FeedByte() 并发。
  */
 void ImageRequestProtocol_Init(ImageRequestParser_t *parser);
 
 /**
  * @brief  清除候选帧并恢复空闲同步状态
  * @param  parser 由调用者静态分配的解析器指针
- * @note   与 Init 效果相同，用于丢弃当前正在接收的帧
+ * @note   只清 parser 内部候选帧，不修改调用方此前保存的 out_frame。
  */
 void ImageRequestProtocol_Reset(ImageRequestParser_t *parser);
 
@@ -150,7 +160,9 @@ void ImageRequestProtocol_Reset(ImageRequestParser_t *parser);
  * @param  now_ms    调用者提供的当前毫秒时间戳
  * @param  out_frame 输出参数：仅在返回 IMAGE_REQUEST_PARSE_OK 时写入完整帧内容
  * @return 解析结果码（见 @ref ImageRequestParseResult_t）
- * @note   out_frame 必须是独立对象，不能指向 parser 内部的 frame 字段
+ * @note   每次调用只消费一个字节。成功、字段错误或超时后 parser 会按状态复位或重同步。
+ * @warning out_frame 必须是独立对象，不能指向 parser 内部 frame；成功复制后 parser
+ *          会立即 Reset，若二者别名相同，刚输出的字段会被一并清零。
  */
 ImageRequestParseResult_t ImageRequestProtocol_FeedByte(
     ImageRequestParser_t *parser,
@@ -166,7 +178,8 @@ ImageRequestParseResult_t ImageRequestProtocol_FeedByte(
  * @retval IMAGE_REQUEST_PARSE_PENDING  帧仍在接收中（未超时）
  * @retval IMAGE_REQUEST_PARSE_NONE     空闲状态（无活跃帧）
  * @retval IMAGE_REQUEST_PARSE_BAD_ARGUMENT  参数无效
- * @note   调用者应定期（如每 50ms）调用此函数，以便及时清理超时帧
+ * @note   CameraServiceTask 在 UART 有界读取未收到数据时调用。时间差使用无符号减法，
+ *         可自然跨越 HAL tick 回绕；空闲状态返回 NONE，不会产生伪超时。
  */
 ImageRequestParseResult_t ImageRequestProtocol_CheckTimeout(
     ImageRequestParser_t *parser,
@@ -176,7 +189,7 @@ ImageRequestParseResult_t ImageRequestProtocol_CheckTimeout(
  * @brief  查询解析器是否正在接收候选帧
  * @param  parser 解析器指针
  * @retval 1 正在接收中（frame_active 为真）
- * @retval 0 空闲状态
+ * @retval 0 空闲状态；parser 为 NULL 时也按防御性容错返回 0
  */
 uint8_t ImageRequestProtocol_IsActive(const ImageRequestParser_t *parser);
 

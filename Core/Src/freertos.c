@@ -122,11 +122,7 @@ void MX_FREERTOS_Init(void) {
 }
 
 /* USER CODE BEGIN Header_StartCameraServiceTask */
-/**
-  * @brief  Function implementing the CameraServiceTa thread.
-  * @param  argument: Not used
-  * @retval None
-  */
+// Camera Service 任务入口，实际循环由 camera_rtos 模块实现
 /* USER CODE END Header_StartCameraServiceTask */
 void StartCameraServiceTask(void *argument)
 {
@@ -136,11 +132,7 @@ void StartCameraServiceTask(void *argument)
 }
 
 /* USER CODE BEGIN Header_StartMonitorTask */
-/**
-* @brief Function implementing the MonitorTask thread.
-* @param argument: Not used
-* @retval None
-*/
+// Monitor 任务入口，实际健康监控循环由 camera_rtos 模块实现
 /* USER CODE END Header_StartMonitorTask */
 void StartMonitorTask(void *argument)
 {

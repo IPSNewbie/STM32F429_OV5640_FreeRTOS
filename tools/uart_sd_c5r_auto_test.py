@@ -54,6 +54,7 @@ REQ_EOF = b"\x0D\x0A"
 
 @dataclass
 class FrameResult:
+    """保存一帧 OV56RGB5 响应的解析结果。"""
     ok: bool
     error: str = ""
     total_len: int = 0
@@ -67,25 +68,31 @@ class FrameResult:
 
 
 class TestLogger:
+    """同时写入终端和文件的测试日志器。"""
     def __init__(self, log_path: str):
+        """初始化测试会话及其运行状态。"""
         self.log_path = log_path
         self._fp = open(log_path, "w", encoding="utf-8", newline="\n")
 
     def close(self) -> None:
+        """关闭串口或日志等会话资源。"""
         self._fp.close()
 
     def write(self, text: str = "") -> None:
+        """写入日志并立即刷新，保留故障现场。"""
         print(text)
         self._fp.write(text + "\n")
         self._fp.flush()
 
     def section(self, title: str) -> None:
+        """在日志中输出测试分节标题。"""
         line = "=" * 72
         self.write("\n" + line)
         self.write(title)
         self.write(line)
 
     def command(self, cmd: str, response: str) -> None:
+        """记录并执行一条测试命令。"""
         self.section(f"CLI > {cmd}")
         self.write(response.rstrip() if response else "<无输出>")
 
@@ -94,6 +101,7 @@ _FIELD_RE_CACHE: Dict[str, re.Pattern[str]] = {}
 
 
 def get_field(text: str, key: str) -> Optional[str]:
+    """读取 CLI 响应中的指定字段。"""
     pat = _FIELD_RE_CACHE.get(key)
     if pat is None:
         pat = re.compile(rf"^\s*{re.escape(key)}\s*=\s*(.*?)\s*$", re.MULTILINE)
@@ -103,6 +111,7 @@ def get_field(text: str, key: str) -> Optional[str]:
 
 
 def get_int_field(text: str, key: str) -> Optional[int]:
+    """读取并转换 CLI 响应中的整数字段。"""
     val = get_field(text, key)
     if val is None:
         return None
@@ -116,20 +125,24 @@ def get_int_field(text: str, key: str) -> Optional[int]:
 
 
 def contains_any(text: str, keywords: List[str]) -> bool:
+    """判断文本是否包含任一目标片段。"""
     return any(k in text for k in keywords)
 
 
 def crc32_u32(data: bytes) -> int:
+    """计算 CRC32，使请求或图像负载的传输损坏可被协议检测。"""
     return binascii.crc32(data) & 0xFFFFFFFF
 
 
 def make_image_request(seq: int) -> bytes:
+    """构造固定格式的二进制图像请求帧。"""
     body = bytes([REQ_VERSION, REQ_TYPE_IMAGE]) + struct.pack("<HH", seq & 0xFFFF, 0)
     crc = crc32_u32(body)
     return REQ_MAGIC + body + struct.pack("<I", crc) + REQ_EOF
 
 
 def open_serial(port: str, baud: int, timeout_s: float) -> "serial.Serial":
+    """以不会触发开发板自动复位的控制线状态打开串口。"""
     ser = serial.Serial()
     ser.port = port
     ser.baudrate = baud
@@ -142,6 +155,7 @@ def open_serial(port: str, baud: int, timeout_s: float) -> "serial.Serial":
     ser.dtr = False
     ser.rts = False
     ser.open()
+    # 某些驱动会在 open() 时重写控制线，打开后再次锁定安全状态。
     ser.dtr = False
     ser.rts = False
 
@@ -150,6 +164,7 @@ def open_serial(port: str, baud: int, timeout_s: float) -> "serial.Serial":
 
 
 def drain_serial(ser: "serial.Serial", duration_s: float = 0.25) -> bytes:
+    """清空串口中本轮测试前的残留输入。"""
     deadline = time.monotonic() + duration_s
     chunks: List[bytes] = []
     while time.monotonic() < deadline:
@@ -169,6 +184,7 @@ def send_cli_command(
         idle_timeout_s: float = 0.45,
         reset_input: bool = True,
 ) -> str:
+    """发送 CLI 命令并等待响应收敛。"""
     if reset_input:
         drain_serial(ser, 0.05)
         ser.reset_input_buffer()
@@ -194,6 +210,7 @@ def send_cli_command(
 
 
 def read_exact_with_timeout(ser: "serial.Serial", n: int, timeout_s: float) -> bytes:
+    """在总截止时间内读取指定字节数。"""
     chunks: List[bytes] = []
     got = 0
     deadline = time.monotonic() + timeout_s
@@ -210,6 +227,7 @@ def read_exact_with_timeout(ser: "serial.Serial", n: int, timeout_s: float) -> b
 
 
 def receive_ov56rgb5_frame(ser: "serial.Serial", timeout_s: float) -> Tuple[FrameResult, bytes]:
+    """接收 OV56RGB5 图像帧并校验长度与 CRC32。"""
     start = time.monotonic()
     deadline = start + timeout_s
     buf = bytearray()
@@ -289,6 +307,7 @@ def receive_ov56rgb5_frame(ser: "serial.Serial", timeout_s: float) -> Tuple[Fram
 
 
 def send_image_request(ser: "serial.Serial", seq: int, timeout_s: float) -> FrameResult:
+    """发送二进制图像请求并返回校验结果。"""
     drain_serial(ser, 0.05)
     ser.reset_input_buffer()
     req = make_image_request(seq)
@@ -299,6 +318,7 @@ def send_image_request(ser: "serial.Serial", seq: int, timeout_s: float) -> Fram
 
 
 def summarize_sd_init(text: str) -> Dict[str, Optional[int]]:
+    """汇总 SD 初始化结果。"""
     keys = [
         "is_initialized",
         "sdio_ready",
@@ -315,6 +335,7 @@ def summarize_sd_init(text: str) -> Dict[str, Optional[int]]:
 
 
 def summarize_readinfo(text: str) -> Dict[str, Optional[int]]:
+    """汇总 SD READINFO 诊断字段。"""
     keys = [
         "block_read_attempt_count",
         "block_read_success_count",
@@ -333,12 +354,14 @@ def summarize_readinfo(text: str) -> Dict[str, Optional[int]]:
 
 
 def print_kv(logger: TestLogger, title: str, fields: Dict[str, Optional[int]]) -> None:
+    """按固定顺序输出键值诊断信息。"""
     logger.write(title)
     for k, v in fields.items():
         logger.write(f"  {k}={v if v is not None else '<未找到>'}")
 
 
 def main() -> int:
+    """解析参数并执行完整测试流程。"""
     parser = argparse.ArgumentParser(description="Stage 11 SD Snapshot 自动板测脚本")
     parser.add_argument("--port", default="COM4", help="串口号，默认 COM4")
     parser.add_argument("--baud", type=int, default=115200, help="波特率，默认 115200")
@@ -362,6 +385,7 @@ def main() -> int:
     summary_lines: List[str] = []
 
     def add_summary(line: str) -> None:
+        """把当前测试结果追加到汇总集合。"""
         summary_lines.append(line)
         logger.write(line)
 
@@ -385,6 +409,7 @@ def main() -> int:
         outputs: Dict[str, str] = {}
 
         def run(cmd: str, name: Optional[str] = None, timeout: Optional[float] = None) -> str:
+            """执行自动化测试主体并收集结果。"""
             text = send_cli_command(
                 ser,  # type: ignore[arg-type]
                 cmd,
@@ -523,6 +548,7 @@ def main() -> int:
     finally:
         try:
             if ser is not None and ser.is_open:
+                # 关闭前保持控制线为低，避免退出脚本时再次触发自动下载电路。
                 ser.dtr = False
                 ser.rts = False
                 ser.close()

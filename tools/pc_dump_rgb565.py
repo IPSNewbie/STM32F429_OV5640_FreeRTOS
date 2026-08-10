@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""OV5640 RGB565 图像接收、CRC 校验与质量分析工具。"""
+
 import argparse
 import csv
 import re
@@ -16,6 +18,11 @@ import serial
 MAGIC = b"OV56RGB5"
 HEADER_FORMAT = "<BBHHII"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+IMAGE_VERSION = 1
+PIXEL_FORMAT_RGB565 = 1
+IMAGE_WIDTH = 160
+IMAGE_HEIGHT = 120
+IMAGE_PAYLOAD_SIZE = IMAGE_WIDTH * IMAGE_HEIGHT * 2
 SHARPNESS_BLUR_THRESHOLD = 100.0
 CAPTURE_NUMBER_PATTERN = re.compile(r"^(\d+)_")
 SUMMARY_FIELDS = [
@@ -38,15 +45,12 @@ SUMMARY_FIELDS = [
 
 def open_camera_serial_port(port_name: str, baudrate: int, timeout_s: float) -> serial.Serial:
     """
-    Open serial port with explicit RTS/DTR safe state.
+    在明确设置安全的 RTS/DTR 状态后打开串口。
 
-    On the ATK STM32F429 + CH340 auto-download circuit:
-    - RTS may affect BOOT0.
-    - DTR may affect RESET.
-    - The tested safe pySerial state is RTS=False and DTR=False.
+    ATK STM32F429 + CH340 自动下载电路中，RTS 可能影响 BOOT0，
+    DTR 可能影响 RESET，因此使用硬件实测安全的 False 状态。
 
-    Do not use `with serial.Serial(...) as port` here, because that opens
-    the COM port before we explicitly set RTS/DTR.
+    这里不能直接构造已打开的 Serial 对象，否则来不及先固定控制线状态。
     """
     port = serial.Serial()
     port.port = port_name
@@ -56,10 +60,7 @@ def open_camera_serial_port(port_name: str, baudrate: int, timeout_s: float) -> 
     port.rtscts = False
     port.dsrdtr = False
 
-    # Set safe control-line state before opening the port.
-    # For this board, tested result:
-    #   RTS=False: BOOT0 is not forced into ISP boot state.
-    #   DTR=False: RESET is not forced active.
+    # 必须在 open() 前固定控制线：RTS=False 避免进入 ISP，DTR=False 避免复位 MCU。
     port.rts = False
     port.dtr = False
 
@@ -67,10 +68,10 @@ def open_camera_serial_port(port_name: str, baudrate: int, timeout_s: float) -> 
         port.open()
         print(f"Serial control: DTR={port.dtr} RTS={port.rts}")
 
-        # Give MCU and USB-UART control lines time to settle.
+        # 留出短暂时间让 MCU 与 USB-UART 控制线稳定。
         time.sleep(0.1)
 
-        # Clear old boot logs or stale bytes before sending DUMP.
+        # 清除旧启动日志和残留字节，避免干扰下一次 DUMP 帧头搜索。
         port.reset_input_buffer()
         port.reset_output_buffer()
     except Exception:
@@ -82,6 +83,7 @@ def open_camera_serial_port(port_name: str, baudrate: int, timeout_s: float) -> 
 
 
 def read_exact(port: serial.Serial, size: int) -> bytes:
+    """在超时约束内读取指定字节数。"""
     data = bytearray()
     while len(data) < size:
         chunk = port.read(size - len(data))
@@ -92,9 +94,11 @@ def read_exact(port: serial.Serial, size: int) -> bytes:
 
 
 def find_magic(port: serial.Serial, timeout_s: float) -> bool:
+    """在截止时间内滑动查找 OV56RGB5 帧头。"""
     window = bytearray()
     deadline = time.monotonic() + timeout_s
 
+    # 使用滑动窗口重新同步，避免一段残留文本让后续图像帧永久失步。
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
         port.timeout = min(0.1, max(remaining, 0.0))
@@ -112,6 +116,7 @@ def find_magic(port: serial.Serial, timeout_s: float) -> bool:
 
 
 def rgb565_to_bgr(payload: bytes, width: int, height: int) -> np.ndarray:
+    """将 RGB565 负载转换为 OpenCV BGR 图像。"""
     pixels = np.frombuffer(payload, dtype="<u2").reshape(height, width).astype(np.uint32)
     red = (((pixels >> 11) & 0x1F) * 255 // 31).astype(np.uint8)
     green = (((pixels >> 5) & 0x3F) * 255 // 63).astype(np.uint8)
@@ -120,12 +125,14 @@ def rgb565_to_bgr(payload: bytes, width: int, height: int) -> np.ndarray:
 
 
 def safe_ratio(numerator: float, denominator: float) -> float:
+    """安全计算比值并处理零分母。"""
     if denominator > 0.0:
         return numerator / denominator
     return 1.0 if numerator == 0.0 else float("inf")
 
 
 def analyze_image(image: np.ndarray) -> tuple[np.ndarray, dict[str, float]]:
+    """计算图像亮度、色彩和清晰度指标。"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blue, green, red = cv2.split(image)
 
@@ -152,6 +159,7 @@ def analyze_image(image: np.ndarray) -> tuple[np.ndarray, dict[str, float]]:
 
 
 def create_histogram_image(gray: np.ndarray, mean_brightness: float) -> np.ndarray:
+    """根据灰度图生成亮度直方图图像。"""
     width = 512
     height = 320
     baseline = height - 35
@@ -192,11 +200,13 @@ def create_histogram_image(gray: np.ndarray, mean_brightness: float) -> np.ndarr
 
 
 def sanitize_tag(tag: str) -> str:
+    """清洗标签，使其可安全用于文件名。"""
     sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", tag.strip()).strip("_")
     return sanitized or "capture"
 
 
 def next_capture_number(captures_dir: Path) -> int:
+    """扫描现有文件并生成下一个抓图编号。"""
     highest_number = 0
     for path in captures_dir.iterdir():
         match = CAPTURE_NUMBER_PATTERN.match(path.name)
@@ -208,6 +218,7 @@ def next_capture_number(captures_dir: Path) -> int:
 def create_capture_paths(
         captures_dir: Path, tag: str, capture_time: datetime
 ) -> dict[str, Path]:
+    """为本次抓图生成互不冲突的输出文件路径。"""
     capture_number = next_capture_number(captures_dir)
     timestamp = capture_time.strftime("%Y%m%d_%H%M%S")
     prefix = f"{capture_number:03d}_{tag}_{timestamp}"
@@ -227,6 +238,7 @@ def append_summary(
         image_file: Path,
         metrics: dict[str, float],
 ) -> None:
+    """将本次图像指标追加到 CSV 汇总文件。"""
     write_header = not summary_path.exists() or summary_path.stat().st_size == 0
     row = {
         "frame_id": frame_id,
@@ -263,6 +275,7 @@ def build_report(
         output_files: dict[str, Path],
         metrics: dict[str, float],
 ) -> str:
+    """根据协议字段和图像指标生成质量报告。"""
     warnings = []
     if metrics["highlight_ratio"] > 5.0:
         warnings.append("Possible overexposure: highlight ratio is above 5%.")
@@ -326,6 +339,7 @@ Assessment
 
 
 def main() -> None:
+    """解析参数并执行完整测试流程。"""
     parser = argparse.ArgumentParser(description="Receive one OV5640 RGB565 frame")
     parser.add_argument("--port", required=True, help="serial port, for example COM6")
     parser.add_argument("--baud", type=int, default=115200)
@@ -347,7 +361,7 @@ def main() -> None:
             # 保留原有每次DUMP尝试前的短间隔，不再切换已配置的控制线。
             time.sleep(0.02)
 
-            # Clear stale bytes before a new request.
+            # 新请求前丢弃残留数据，确保帧头来自本次 DUMP。
             port.reset_input_buffer()
 
             port.write(b"DUMP\n")
@@ -369,15 +383,21 @@ def main() -> None:
             HEADER_FORMAT, header
         )
 
-        if version != 1 or pixel_format != 1:
+        if version != IMAGE_VERSION or pixel_format != PIXEL_FORMAT_RGB565:
             raise ValueError(f"unsupported frame version={version}, format={pixel_format}")
-        if payload_len != width * height * 2:
+        if width != IMAGE_WIDTH or height != IMAGE_HEIGHT:
             raise ValueError(
-                f"invalid payload length {payload_len}, expected {width * height * 2}"
+                f"invalid resolution {width}x{height}, "
+                f"expected {IMAGE_WIDTH}x{IMAGE_HEIGHT}"
+            )
+        if payload_len != IMAGE_PAYLOAD_SIZE:
+            raise ValueError(
+                f"invalid payload length {payload_len}, expected {IMAGE_PAYLOAD_SIZE}"
             )
 
         payload = read_exact(port, payload_len)
         received_crc = struct.unpack("<I", read_exact(port, 4))[0]
+        # CRC32 覆盖完整 RGB565 负载，用于发现串口丢字节、错位或传输损坏。
         calculated_crc = zlib.crc32(payload) & 0xFFFFFFFF
         if received_crc != calculated_crc:
             raise ValueError(

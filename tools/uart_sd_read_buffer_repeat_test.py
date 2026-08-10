@@ -35,6 +35,7 @@ FRAME_TOTAL_LEN = 22 + FRAME_PAYLOAD_LEN + 4
 
 @dataclass
 class ImageResult:
+    """保存一次图像请求的校验结果。"""
     ok: bool
     length: int
     frame_id: Optional[int] = None
@@ -43,15 +44,18 @@ class ImageResult:
 
 
 def crc32_u32(data: bytes) -> int:
+    """计算 CRC32，使请求或图像负载的传输损坏可被协议检测。"""
     return binascii.crc32(data) & 0xFFFFFFFF
 
 
 def build_image_request(seq: int) -> bytes:
+    """构造带 CRC32 的二进制图像请求帧。"""
     body = struct.pack("<BBHH", 0x01, 0x20, seq & 0xFFFF, 0)
     return b"\xA5\x5A" + body + struct.pack("<I", crc32_u32(body)) + b"\x0D\x0A"
 
 
 def parse_kv(text: str) -> Dict[str, str]:
+    """解析 CLI 响应中的键值字段。"""
     out: Dict[str, str] = {}
     for line in text.splitlines():
         m = re.match(r"\s*([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$", line)
@@ -61,6 +65,7 @@ def parse_kv(text: str) -> Dict[str, str]:
 
 
 def get_int(kv: Dict[str, str], key: str, default: int = -1) -> int:
+    """读取整数键值，缺失或非法时返回默认值。"""
     v = kv.get(key)
     if v is None:
         return default
@@ -71,6 +76,7 @@ def get_int(kv: Dict[str, str], key: str, default: int = -1) -> int:
 
 
 def classify_readtest(text: str, kv: Dict[str, str]) -> str:
+    """根据 READTEST 响应字段归类测试结果。"""
     if "not ready" in text:
         return "SKIP_NOT_READY"
     if "block read OK" in text:
@@ -85,7 +91,9 @@ def classify_readtest(text: str, kv: Dict[str, str]) -> str:
 
 
 class UartSession:
+    """封装串口 CLI 与二进制图像请求会话。"""
     def __init__(self, port: str, baud: int, log: List[str]):
+        """初始化测试会话及其运行状态。"""
         self.log = log
         self.ser = serial.Serial()
         self.ser.port = port
@@ -94,6 +102,7 @@ class UartSession:
         self.ser.write_timeout = 2.0
         self.ser.rtscts = False
         self.ser.dsrdtr = False
+        # open 前关闭控制线，避免 CH340 自动下载电路切换 BOOT0 或复位 MCU。
         self.ser.dtr = False
         self.ser.rts = False
         self.ser.open()
@@ -103,10 +112,12 @@ class UartSession:
         self.drain(0.8)
 
     def close(self) -> None:
+        """关闭串口或日志等会话资源。"""
         if self.ser.is_open:
             self.ser.close()
 
     def drain(self, max_time: float = 0.5) -> bytes:
+        """清空串口中本轮测试前的残留输入。"""
         end = time.monotonic() + max_time
         chunks: List[bytes] = []
         while time.monotonic() < end:
@@ -117,6 +128,7 @@ class UartSession:
         return b"".join(chunks)
 
     def read_until_quiet(self, max_time: float = 8.0, quiet_time: float = 0.45) -> bytes:
+        """持续读取响应，直到串口保持静默。"""
         start = time.monotonic()
         last = start
         chunks: List[bytes] = []
@@ -133,6 +145,7 @@ class UartSession:
         return b"".join(chunks)
 
     def cli(self, cmd: str, max_time: float = 8.0, after_delay: float = 0.0) -> str:
+        """发送一条 CLI 命令并读取完整文本响应。"""
         self.drain(0.15)
         self.log.append("\n===== CLI >>> %s =====" % cmd)
         self.ser.write((cmd + "\r\n").encode("ascii"))
@@ -144,6 +157,7 @@ class UartSession:
         return text
 
     def read_exact(self, n: int, timeout: float) -> bytes:
+        """在超时约束内读取指定字节数。"""
         deadline = time.monotonic() + timeout
         chunks: List[bytes] = []
         total = 0
@@ -155,6 +169,7 @@ class UartSession:
         return b"".join(chunks)
 
     def image_request(self, seq: int, timeout: float) -> ImageResult:
+        """发送二进制图像请求并校验完整响应。"""
         self.drain(0.2)
         self.log.append("\n===== BIN >>> IMAGE_REQUEST seq=0x%04X =====" % (seq & 0xFFFF))
         start = time.monotonic()
@@ -187,6 +202,7 @@ class UartSession:
 
 
 def read_once(sess: UartSession, block: int, index: int, gap: float) -> Dict[str, str]:
+    """执行并记录一次 SD 读块测试。"""
     text1 = sess.cli("SD READTEST %d" % block, max_time=8.0, after_delay=gap)
     text2 = sess.cli("SD READINFO", max_time=8.0, after_delay=gap)
     combined = text1 + "\n" + text2
@@ -223,6 +239,7 @@ def read_once(sess: UartSession, block: int, index: int, gap: float) -> Dict[str
 
 
 def main() -> int:
+    """解析参数并执行完整测试流程。"""
     p = argparse.ArgumentParser(description="Stage 11C-5I SD read buffer fingerprint repeat test")
     p.add_argument("--port", default="COM4")
     p.add_argument("--baud", type=int, default=115200)

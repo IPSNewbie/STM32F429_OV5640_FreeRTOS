@@ -122,6 +122,7 @@ uint8_t SCCB_ReadReg(uint16_t reg, uint8_t *data)
     return 0;
 }
 
+// 读取 OV5640 芯片 ID，并在任一 SCCB 访问失败时返回无效值
 uint16_t OV5640_ReadID(void)
 {
     uint8_t id_high = 0;

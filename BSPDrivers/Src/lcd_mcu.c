@@ -29,24 +29,28 @@ static SRAM_HandleTypeDef s_lcd_sram;    // FMC SRAM 句柄，LCD 在 STM32 里�
 
 /* ---------------- low level ---------------- */
 
+// 通过 FMC 命令地址向 LCD 写入一个寄存器编号
 void LCD_MCU_WriteReg(uint16_t reg)
 {
     reg = reg;                           // 防止编译器过度优化，保持一次真实写操作
     LCD_MCU->REG = reg;                  // 向命令地址写入，RS=0，LCD 认为这是“指令”
 }
 
+// 通过 FMC 数据地址向 LCD 写入寄存器数据或像素
 void LCD_MCU_WriteData(uint16_t data)
 {
     data = data;                         // 防止编译器过度优化，保持一次真实写操作
     LCD_MCU->RAM = data;                 // 向数据地址写入，RS=1，LCD 认为这是“数据/像素”
 }
 
+// 连续写入一个 LCD 寄存器编号及其数据
 void LCD_MCU_WriteRegData(uint16_t reg, uint16_t data)
 {
     LCD_MCU->REG = reg;                  // 先写 LCD 指令
     LCD_MCU->RAM = data;                 // 再写该指令对应的数据
 }
 
+// 从 LCD 的 FMC 数据地址读取一个 16 位值
 static uint16_t LCD_MCU_ReadData(void)
 {
     volatile uint16_t data;              // volatile 防止读操作被优化掉
@@ -56,6 +60,7 @@ static uint16_t LCD_MCU_ReadData(void)
 
 /* ---------------- FMC GPIO ---------------- */
 
+// 初始化 LCD 使用的 FMC 引脚、背光和保守读写时序
 static void LCD_MCU_GPIO_FMC_Init(void)
 {
     GPIO_InitTypeDef gpio = {0};                         // GPIO 初始化结构体
@@ -165,6 +170,7 @@ static void LCD_MCU_GPIO_FMC_Init(void)
     HAL_Delay(50);                                       // 等待 LCD/FMC 时序稳定
 }
 
+// 仅为已验证的 NT35310 应用 6/6 快速写时序，避免 480×320 刷屏雪花
 static void LCD_MCU_ApplyFastWriteTimingIfNeeded(void)
 {
     // 定义一个写时序配置结构体并初始化为零
@@ -213,6 +219,7 @@ static void LCD_MCU_ApplyFastWriteTimingIfNeeded(void)
 
 /* ---------------- ID ---------------- */
 
+// 按 NT35310 读 ID 时序取得 0x5310 标识
 uint16_t LCD_MCU_ReadID(void)
 {
     uint16_t id;                                         // 保存最终 LCD ID
@@ -233,6 +240,7 @@ uint16_t LCD_MCU_ReadID(void)
 
 /* ---------------- direction/window ---------------- */
 
+// 设置 LCD 横竖屏扫描方向及对应逻辑尺寸
 void LCD_MCU_DisplayDir(uint8_t dir)
 {
     g_lcd_mcu.dir = dir ? 1 : 0;                         // 保存当前方向，非 0 都认为是横屏
@@ -261,6 +269,7 @@ void LCD_MCU_DisplayDir(uint8_t dir)
     }
 }
 
+// 设置后续 GRAM 写入覆盖的矩形窗口
 void LCD_MCU_SetWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
     uint16_t x2 = x + w - 1;                              // 计算窗口右边界
@@ -279,6 +288,7 @@ void LCD_MCU_SetWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
     LCD_MCU_WriteData(y2 & 0xFF);                         // Y 终点低 8 位
 }
 
+// 发送连续写入 LCD GRAM 的命令
 void LCD_MCU_BeginWriteGRAM(void)
 {
     LCD_MCU_WriteReg(g_lcd_mcu.cmd_write_ram);            // 发送写 GRAM 指令，通常是 0x2C，之后写入的都是像素
@@ -286,6 +296,7 @@ void LCD_MCU_BeginWriteGRAM(void)
 
 /* ---------------- public init/draw ---------------- */
 
+// 初始化 FMC 与 NT35310，并按当前硬件基线切换为 480×320 横屏
 void LCD_MCU_Init(void)
 {
     LCD_MCU_GPIO_FMC_Init();                              // 初始化 FMC GPIO、FMC 控制器、背光
@@ -301,12 +312,13 @@ void LCD_MCU_Init(void)
     g_lcd_mcu.id = id;                                    // 保存读到的 LCD ID
 
     LCD_MCU_NT35310_RegInit();                            // 执行 NT35310 厂家初始化序列
-    LCD_MCU_ApplyFastWriteTimingIfNeeded();               // Apply verified fast write timing for NT35310.
+    LCD_MCU_ApplyFastWriteTimingIfNeeded();               // 应用已通过硬件验证的 NT35310 快速写时序
     LCD_MCU_DisplayDir(1);                                // 设置为横屏，480x320
 
     LCD_MCU_Fill(0, 0, g_lcd_mcu.width, g_lcd_mcu.height, LCD_COLOR_WHITE); // 初始化完成后清白屏
 }
 
+// 用指定 RGB565 颜色填充一个矩形区域
 void LCD_MCU_Fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
 {
     uint32_t pixels = (uint32_t)w * (uint32_t)h;           // 计算要写入的像素总数
@@ -320,6 +332,7 @@ void LCD_MCU_Fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color
     }
 }
 
+// 显示八色彩条，供本地 LCD 数据通路检查
 void LCD_MCU_ShowColorBars(void)
 {
     const uint16_t color[8] =

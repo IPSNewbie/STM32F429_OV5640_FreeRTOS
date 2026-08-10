@@ -8765,3 +8765,20 @@ Codex 本轮只执行静态检查与 Debug 构建；连续 snapshot、实际耗�
 - 50 次必须全部 PASS，且本次测试内相邻文件编号严格加一、每个文件均为 57654 字节；任意单轮失败或文件编号不连续时脚本退出码为 1。
 - 最后 `STATUS` 的 `hook_fault`、`uart_dma_error`、`stream_overflow`、`refresh_skip` 必须为 0，最后 `SD STATUS` 的 `last_snapshot=PASS`、`save_error=OK`、`last_error=OK`；否则整体测试失败。
 - Codex 本轮只执行脚本语法检查，不连接开发板；50～100 次串口、SD 卡和相机链路稳定性测试由板端环境执行。
+
+## Stage 13H SD Snapshot 功能收尾
+
+- Stage 13G 的 `tools/uart_sd_snapshot_stability.py` 自动稳定性测试结果正常，逐轮 CSV/log 保存在 `captures/`，不纳入仓库。
+- SD Snapshot 主功能已完成：最终输出为 160×120、57654 字节的 BMP24 文件，文件名使用 `IMG0001.BMP` 至 `IMG9999.BMP` 递增保存。
+- 图像准备最终复用 DUMP 已验证的 `Camera_RTOS_PrepareRgb565Frame()` 路径，不复制第二套采集、commit 或图像处理流程。
+- DVP/SDIO 共享线冲突最终使用 OV5640 `0x3018[6:4]` mask 解决：SD 会话前写入 `saved_3018 & 0x8F`，会话结束后恢复原值和相机链路。
+- `SD STATUS` 最终保持只读缓存显示；SDIO 保持 1-bit polling，不启用 DMA/IRQ，不增加临时诊断 CLI。
+- 本阶段新增 `SD_SNAPSHOT_TEST_REPORT.md`，归档最终命令、功能流程、根因闭环、板测结果、耗时、限制、后续建议和简历描述草稿。
+- 后续建议进入项目总结、简历化和最终回归测试，不再盲目增加 SD 诊断功能；更高分辨率、DMA、目录、RTC 命名和读回校验作为独立后续需求评估。
+
+## Stage 14A 项目总文档和简历化
+
+- SD Snapshot 主功能已完成，Stage 13G 自动稳定性脚本测试正常。
+- 本轮新增 `PROJECT_FINAL_SUMMARY.md`、`PROJECT_RESUME_DESCRIPTION.md` 和 `PROJECT_INTERVIEW_NOTES.md`，分别归档项目架构与技术总结、简历项目描述、面试问答和难点讲述。
+- 本轮不修改固件、Python 工具、构建系统、CLI 或协议，也不执行硬件测试。
+- 后续进入最终回归测试和项目收尾提交；新功能优化应作为独立阶段评估。

@@ -68,14 +68,6 @@
 #define OV5640_SATURATION_LEVEL        1
 #define OV5640_SHARPNESS_LEVEL         0
 #define CAMERA_FRAME_BUFFER_ENABLE     1U
-#define CAMERA_IMAGE_PROCESS_ENABLE    1U
-
-#define CAMERA_PROCESS_MODE_BYPASS     0
-#define CAMERA_PROCESS_MODE_GRAYSCALE  1
-#define CAMERA_PROCESS_MODE_BINARY     2
-
-#define CAMERA_PROCESS_MODE            CAMERA_PROCESS_MODE_BYPASS
-#define CAMERA_BINARY_THRESHOLD        128U
 #define CAMERA_CLI_ENABLE              1U
 
 /* FreeRTOS严重错误Hook类型。 */
@@ -248,6 +240,7 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 
 #if (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U)
+// 初始化仅用于 SD 诊断的最小启动路径
 static void Camera_SDOnly_Application_Init(void)
 {
   Camera_CLI_Init();
@@ -256,6 +249,7 @@ static void Camera_SDOnly_Application_Init(void)
 #endif
 
 #if (CAMERA_SD_DIAG_SD_ONLY_BOOT == 0U)
+// 按编译期模式初始化摄像头、可选 LCD、双缓冲和 CLI
 static void Camera_Application_Init(void)
 {
   uint16_t ov_id;
@@ -271,7 +265,7 @@ static void Camera_Application_Init(void)
     LOG_INFO("PCF8574 initialized successfully");
   }
 
-  /* Leave camera power-down mode before applying the hardware reset. */
+  // 先退出 PWDN 再执行硬复位，保证 OV5640 能响应后续 SCCB 访问。
   PCF8574_WriteBit(PCF8574_OV_PWDN_IO, 0);
   HAL_Delay(20);
 

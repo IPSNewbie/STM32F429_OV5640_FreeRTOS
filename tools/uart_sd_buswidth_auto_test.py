@@ -58,6 +58,7 @@ FRAME_TOTAL_LEN = FRAME_HEADER_LEN + FRAME_PAYLOAD_LEN + 4
 
 @dataclass
 class ImageResult:
+    """保存一次图像请求的校验结果。"""
     ok: bool
     length: int
     frame_id: Optional[int] = None
@@ -67,14 +68,17 @@ class ImageResult:
 
 
 def now_tag() -> str:
+    """生成适合文件名使用的当前时间标签。"""
     return _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def decode_text(data: bytes) -> str:
+    """以容错方式解码串口文本。"""
     return data.decode("utf-8", errors="replace")
 
 
 def parse_kv(text: str) -> Dict[str, str]:
+    """解析 CLI 响应中的键值字段。"""
     result: Dict[str, str] = {}
     for line in text.splitlines():
         m = re.match(r"\s*([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$", line)
@@ -84,6 +88,7 @@ def parse_kv(text: str) -> Dict[str, str]:
 
 
 def get_int(kv: Dict[str, str], key: str, default: int = -1) -> int:
+    """读取整数键值，缺失或非法时返回默认值。"""
     value = kv.get(key)
     if value is None:
         return default
@@ -94,6 +99,7 @@ def get_int(kv: Dict[str, str], key: str, default: int = -1) -> int:
 
 
 def classify_readtest(text: str, kv: Dict[str, str]) -> str:
+    """根据 READTEST 响应字段归类测试结果。"""
     if "not ready" in text:
         return "SKIP_NOT_READY"
     if "block read OK" in text:
@@ -111,17 +117,21 @@ def classify_readtest(text: str, kv: Dict[str, str]) -> str:
 
 
 def crc32_u32(data: bytes) -> int:
+    """计算 CRC32，使请求或图像负载的传输损坏可被协议检测。"""
     return binascii.crc32(data) & 0xFFFFFFFF
 
 
 def build_image_request(seq: int) -> bytes:
+    """构造带 CRC32 的二进制图像请求帧。"""
     body = struct.pack("<BBHH", 0x01, 0x20, seq & 0xFFFF, 0)
     crc = crc32_u32(body)
     return b"\xA5\x5A" + body + struct.pack("<I", crc) + b"\x0D\x0A"
 
 
 class UartSession:
+    """封装串口 CLI 与二进制图像请求会话。"""
     def __init__(self, port: str, baud: int, log_lines: List[str], read_timeout: float = 0.1):
+        """初始化测试会话及其运行状态。"""
         self.log_lines = log_lines
         self.ser = serial.Serial()
         self.ser.port = port
@@ -140,10 +150,12 @@ class UartSession:
         self.drain(max_time=0.8)
 
     def close(self) -> None:
+        """关闭串口或日志等会话资源。"""
         if self.ser.is_open:
             self.ser.close()
 
     def drain(self, max_time: float = 0.5) -> bytes:
+        """清空串口中本轮测试前的残留输入。"""
         end = time.monotonic() + max_time
         chunks: List[bytes] = []
         while time.monotonic() < end:
@@ -154,6 +166,7 @@ class UartSession:
         return b"".join(chunks)
 
     def read_until_quiet(self, max_time: float = 8.0, quiet_time: float = 0.45) -> bytes:
+        """持续读取响应，直到串口保持静默。"""
         start = time.monotonic()
         last = start
         chunks: List[bytes] = []
@@ -171,6 +184,7 @@ class UartSession:
 
     def send_cli(self, command: str, max_time: float = 8.0, quiet_time: float = 0.45,
                  after_delay: float = 0.0) -> str:
+        """发送 CLI 命令并读取文本响应。"""
         self.drain(max_time=0.15)
         self.log_lines.append(f"\n===== CLI >>> {command} =====")
         self.ser.write((command + "\r\n").encode("ascii"))
@@ -183,6 +197,7 @@ class UartSession:
         return text
 
     def read_exact(self, n: int, timeout: float) -> bytes:
+        """在超时约束内读取指定字节数。"""
         deadline = time.monotonic() + timeout
         chunks: List[bytes] = []
         total = 0
@@ -194,6 +209,7 @@ class UartSession:
         return b"".join(chunks)
 
     def send_image_request(self, seq: int, timeout: float) -> ImageResult:
+        """发送二进制图像请求并返回校验结果。"""
         self.drain(max_time=0.2)
         req = build_image_request(seq)
         self.log_lines.append(f"\n===== BIN >>> IMAGE_REQUEST seq=0x{seq & 0xFFFF:04X} =====")
@@ -244,6 +260,7 @@ class UartSession:
 
 def run_readtest_pair(sess: UartSession, bus_name: str, summary: Dict[str, str],
                       command_gap: float) -> None:
+    """依次测试两个固定 SD 块地址。"""
     for block in (0, 2048):
         text1 = sess.send_cli(f"SD READTEST {block}", max_time=8.0, after_delay=command_gap)
         text2 = sess.send_cli("SD READINFO", max_time=8.0, after_delay=command_gap)
@@ -257,6 +274,7 @@ def run_readtest_pair(sess: UartSession, bus_name: str, summary: Dict[str, str],
 
 
 def main() -> int:
+    """解析参数并执行完整测试流程。"""
     parser = argparse.ArgumentParser(description="Stage 11C-5D SDIO 1-bit / 4-bit bus 自动测试")
     parser.add_argument("--port", default="COM4")
     parser.add_argument("--baud", type=int, default=115200)

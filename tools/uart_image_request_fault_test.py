@@ -1,3 +1,5 @@
+"""UART 二进制图像请求协议故障注入与恢复验证工具。"""
+
 import struct
 import sys
 import time
@@ -102,6 +104,7 @@ def send_valid_request(ser, seq):
     return success, frame_id, elapsed_ms, error_message
 
 def main():
+    """解析参数并执行完整测试流程。"""
     baseline_success = False
     silence_success_count = 0
     silence_failure_count = 0
@@ -122,6 +125,7 @@ def main():
             ser.write_timeout = 2.0
             ser.rtscts = False
             ser.dsrdtr = False
+            # open 前关闭控制线，避免 CH340 自动下载电路切换 BOOT0 或复位 MCU。
             ser.dtr = False
             ser.rts = False
             ser.open()

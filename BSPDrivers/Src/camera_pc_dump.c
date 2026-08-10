@@ -8,17 +8,30 @@
 //============================================================================
 // @file    camera_pc_dump.c
 // @brief   OV5640 图像帧 UART 导出模块
-//          本模块同时承担两个功能：
-//          1. 接收逐字节输入的文本命令，并识别 DUMP 或交给 camera_cli 处理。
-//          2. 将前台 RGB565 图像封装为 OV56RGB5 数据帧，通过 UART 发送到 PC。
+//
+// 本模块主要负责：
+// 1. 在 CameraServiceTask 中逐字节维护一行文本命令。
+// 2. 单独识别 DUMP，并把其他文本命令交给 camera_cli 处理。
+// 3. 从双缓冲模块取得已经提交的 front frame。
+// 4. 按 OV56RGB5 布局构造 header，计算 RGB565 payload 的 CRC32。
+// 5. 按 header、payload、CRC 的顺序通过 UART 阻塞发送完整图像帧。
+//
+// 主要调用关系：
+// UART DMA/StreamBuffer -> dispatcher -> Camera_PC_Dump_FeedCommandByte()
+// Camera RTOS prepare/commit -> Camera_PC_Dump_SendFrame() -> UART -> PC
+//
+// 本模块不直接启动 DCMI、不提交 front/back 缓冲区，也不管理 UART RX DMA。
+// 文本行状态由 CameraServiceTask 单一上下文维护，不能在 ISR 中并发调用。
 //============================================================================
 
-// UART 每次发送的最大数据块为 1024 字节，避免一次 HAL_UART_Transmit() 传入过大的长度
+// 38400 字节 payload 不一次交给单个阻塞式 HAL_UART_Transmit()，而是拆成最大 1024 字节的小块。
+// 分块只限制单次调用的数据量，不改变 OV56RGB5 字节流的先后顺序。
 #define PC_DUMP_UART_CHUNK_SIZE  1024U
 
 // 文本命令缓冲区总长度为 32 字节，其中最后 1 字节必须预留给字符串结束符 '\0'
 #define PC_DUMP_COMMAND_LINE_LEN 32U
 
+// 以下三个静态状态只由 CameraServiceTask 维护，用于跨多次逐字节调用拼接同一行命令。
 // 保存当前正在接收的一行文本命令，例如 "STATUS"、"PROC GRAY" 或 "DUMP"
 static char s_camera_pc_dump_line[PC_DUMP_COMMAND_LINE_LEN];
 
@@ -28,7 +41,8 @@ static uint8_t s_camera_pc_dump_line_length;
 // 表示当前这一行是否已经超过缓冲区容量，1 表示已经溢出，之后的字符会一直丢弃到换行符
 static uint8_t s_camera_pc_dump_line_overflow;
 
-// 将一个 ASCII 小写字母转换成大写字母，方便后续实现命令不区分大小写
+// 将一个 ASCII 小写字母转换成大写字母，供 DUMP 命令的不区分大小写比较使用。
+// 该 helper 不修改输入缓冲区，非小写字符保持原值。
 static char Camera_PC_Dump_ToUpper(char ch)
 {
     if ((ch >= 'a') && (ch <= 'z'))               // 只处理 ASCII 范围内的 a～z
@@ -39,13 +53,15 @@ static char Camera_PC_Dump_ToUpper(char ch)
     return ch;                                     // 非小写字母保持原值，例如数字、空格和大写字母
 }
 
-// 判断一个字符是不是文本命令中的空白字符
+// 判断一个字符是否属于当前命令语法允许的空白集合。
+// 这里只接受空格和制表符，换行符由逐字节解析入口单独处理。
 static uint8_t Camera_PC_Dump_IsSpace(char ch)
 {
     return ((ch == ' ') || (ch == '\t')) ? 1U : 0U; // 空格或制表符返回 1，否则返回 0
 }
 
-// 跳过字符串左侧所有空格和制表符，返回第一个非空白字符的位置
+// 跳过命令左侧连续的空格和制表符，供后续完整 token 比较使用。
+// 循环在遇到首个非空白字符或字符串结束符时退出；它只扫描内存，不涉及 timeout。
 static const char *Camera_PC_Dump_TrimLeft(const char *line)
 {
     while ((line != NULL) &&                       // 先确保传入的字符串指针有效
@@ -57,7 +73,8 @@ static const char *Camera_PC_Dump_TrimLeft(const char *line)
     return line;                                   // 返回去除左侧空白后的字符串起始地址
 }
 
-// 计算字符串去除右侧空格和制表符后的有效长度
+// 计算命令去除右侧空格和制表符后的有效长度，避免 "DUMP   " 被误判为不同命令。
+// 输入来自本模块的定长、以 '\0' 结尾的命令缓冲区；两个循环均有明确字符串边界，不需要 timeout。
 static uint32_t Camera_PC_Dump_TrimmedLength(const char *line)
 {
     uint32_t len = 0U;                             // len 最终表示去掉右侧空白后的有效字符数
@@ -67,11 +84,13 @@ static uint32_t Camera_PC_Dump_TrimmedLength(const char *line)
         return 0U;                                 // 返回长度 0，避免访问非法地址
     }
 
+    // 第一轮找到字符串结束符；命令缓冲区最多 32 字节，因此不会无界扫描。
     while (line[len] != '\0')                      // 从字符串开头寻找末尾的 '\0'
     {
         ++len;                                     // 每发现一个普通字符，字符串长度加 1
     }
 
+    // 第二轮从右向左去掉空白，在长度变为 0 或遇到非空白字符时退出。
     while ((len > 0U) &&                           // 字符串至少还有一个字符时才检查末尾
            (Camera_PC_Dump_IsSpace(line[len - 1U]) != 0U)) // 最后一个字符是空格或制表符
     {
@@ -81,7 +100,8 @@ static uint32_t Camera_PC_Dump_TrimmedLength(const char *line)
     return len;                                    // 返回去除右侧空白后的实际有效长度
 }
 
-// 判断一整行文本是否与指定命令完全相等，比较时忽略大小写和首尾空白
+// 判断一整行文本是否与指定命令完全相等，比较时忽略大小写和首尾空白。
+// token 只传入模块内部的固定命令；循环在 token 结束、长度不足或字符不匹配时退出。
 static uint8_t Camera_PC_Dump_LineEquals(const char *line, const char *token)
 {
     const char *trimmed = Camera_PC_Dump_TrimLeft(line); // 先跳过命令行左侧的空格和制表符
@@ -106,7 +126,8 @@ static uint8_t Camera_PC_Dump_LineEquals(const char *line, const char *token)
     return (i == len) ? 1U : 0U;                  // token结束后，命令行也必须同时结束才算完全匹配
 }
 
-// 清空一行文本命令的缓存、长度和溢出状态
+// 清空一行文本命令的缓存、长度和溢出状态，供正常完成和错误恢复路径共同使用。
+// 三个输出对象可按需传入 NULL；例如标记超长行时会清内容和长度，但暂不清 overflow。
 static void Camera_PC_Dump_ResetLine(char *line,
                                      uint32_t line_size,
                                      uint8_t *line_length,
@@ -128,14 +149,16 @@ static void Camera_PC_Dump_ResetLine(char *line,
     }
 }
 
-// 将一个 16 位整数按照小端序写入 2 字节数组
+// 将一个 16 位整数按照小端序写入连续 2 字节，供 OV56RGB5 多字节字段序列化使用。
+// 调用点均传入固定 header 数组内仍有至少 2 个可写字节的位置。
 static void Camera_PC_Dump_WriteU16LE(uint8_t *dst, uint16_t value)
 {
     dst[0] = (uint8_t)(value & 0xFFU);             // 第 0 字节保存 value 的低 8 位
     dst[1] = (uint8_t)((value >> 8) & 0xFFU);      // 第 1 字节保存 value 的高 8 位
 }
 
-// 将一个 32 位整数按照小端序写入 4 字节数组
+// 将一个 32 位整数按照小端序写入连续 4 字节，供长度、frame_id 和 CRC 字段序列化使用。
+// 调用点均传入固定 header/crc 数组内仍有至少 4 个可写字节的位置。
 static void Camera_PC_Dump_WriteU32LE(uint8_t *dst, uint32_t value)
 {
     dst[0] = (uint8_t)(value & 0xFFU);             // 第 0 字节保存最低 8 位
@@ -144,21 +167,24 @@ static void Camera_PC_Dump_WriteU32LE(uint8_t *dst, uint32_t value)
     dst[3] = (uint8_t)((value >> 24) & 0xFFU);     // 第 3 字节保存最高 8 位
 }
 
-// 获取 DCMI DMA 当前应该写入的图像缓冲区地址
+// 向 DCMI 启动路径提供本次采集应写入的 back buffer 地址。
+// UART/SD 只读取已经 commit 的 front frame，因此采集期间不会直接覆盖正在消费的图像。
 uint32_t Camera_PC_Dump_GetBufferAddress(void)
 {
     // DCMI DMA 必须写入 back buffer，不能直接写正在被 UART 发送的 front buffer
     return (uint32_t)Camera_FrameBuffer_GetBackBuffer();
 }
 
-// 获取 DCMI DMA 需要传输的 32 位数据数量
+// 向 DCMI 启动路径提供一帧 RGB565 对应的 32 位 DMA 传输数量。
+// 返回值单位是 word 而不是字节，160×120 个 16 位像素对应 9600 个 32 位 word。
 uint32_t Camera_PC_Dump_GetWordCount(void)
 {
     // DCMI DMA 的长度单位通常是 32 位 word，而不是字节，所以返回预先计算好的 word 数
     return PC_DUMP_WORD_COUNT;
 }
 
-// 无任何串口输出地复位文本命令解析器
+// 放弃尚未完成的文本行并恢复干净解析状态，不产生任何 UART 输出。
+// UART DMA 恢复或 StreamBuffer 溢出后由 CameraServiceTask 调用，避免残缺旧命令污染下一行。
 void Camera_PC_Dump_ResetCommandParser(void)
 {
     // UART 错误恢复或 StreamBuffer 溢出后，需要放弃当前接收到一半的旧命令
@@ -168,7 +194,9 @@ void Camera_PC_Dump_ResetCommandParser(void)
                              &s_camera_pc_dump_line_overflow);
 }
 
-// 将一个 UART 接收字节送入文本命令行解析器
+// 在 CameraServiceTask 上下文把一个 dispatcher 判定为文本的字节送入行解析器。
+// 本函数跨调用积累字符：DUMP 只返回事件给上层，其他完整命令才交给 camera_cli 立即处理。
+// 命令最多保存 31 个字符；超长后持续丢弃到 CR/LF，防止截断内容被当成另一条合法命令。
 uint8_t Camera_PC_Dump_FeedCommandByte(UART_HandleTypeDef *huart, uint8_t byte)
 {
     if (huart == NULL)                             // CLI 回复需要使用 UART 句柄，因此必须先检查
@@ -271,10 +299,26 @@ uint8_t Camera_PC_Dump_FeedCommandByte(UART_HandleTypeDef *huart, uint8_t byte)
     return CAMERA_PC_DUMP_CMD_PENDING;
 }
 
-// 将前台图像帧封装为 OV56RGB5 格式，并通过 UART 阻塞发送到 PC
+// 将已经 prepare/commit 的 front frame 封装为 OV56RGB5，并在 CameraServiceTask 中阻塞发送。
+// 文本 DUMP 与 binary image request 共用此发送函数；本函数不启动采集，也绝不能从 ISR 调用。
+// 三段 HAL_UART_Transmit() 都使用 HAL_MAX_DELAY，模块没有额外的软件 timeout。
 uint8_t Camera_PC_Dump_SendFrame(UART_HandleTypeDef *huart, uint32_t frame_id)
 {
-    // magic 是图像帧固定标识，PC端会搜索这8字节判断图像帧从哪里开始
+    /*
+     * OV56RGB5 字节流布局：
+     * header[0..7]   : ASCII magic "OV56RGB5"
+     * header[8]      : version，当前固定为 1
+     * header[9]      : pixel format，1 表示 RGB565
+     * header[10..11] : width，小端序，当前为 160
+     * header[12..13] : height，小端序，当前为 120
+     * header[14..17] : payload length，小端序，当前为 38400
+     * header[18..21] : frame_id，小端序，由 STM32 上层维护
+     * payload        : 38400 字节 RGB565 front frame
+     * crc_bytes[0..3]: payload 的 CRC32，小端序；header 不参与 CRC
+     * 完整帧长度为 22 + 38400 + 4 = 38426 字节。
+     */
+
+    // magic 让 PC 在连续 UART 字节流中重新定位一帧图像的起点
     static const uint8_t magic[8] =
     {
         'O', 'V', '5', '6', 'R', 'G', 'B', '5'
@@ -305,7 +349,7 @@ uint8_t Camera_PC_Dump_SendFrame(UART_HandleTypeDef *huart, uint32_t frame_id)
     // 将void类型的帧数据地址转换成只读字节指针，便于逐字节计算CRC和发送
     payload = (const uint8_t *)frame.data;
 
-    // 将固定8字节magic复制到header的0～7字节
+    // 固定循环恰好复制 8 字节 magic；达到 sizeof(magic) 后退出，不涉及等待或 timeout
     for (uint32_t i = 0U; i < sizeof(magic); ++i)
     {
         header[i] = magic[i];                       // 逐字节复制，最终得到ASCII字符串OV56RGB5
@@ -328,7 +372,8 @@ uint8_t Camera_PC_Dump_SendFrame(UART_HandleTypeDef *huart, uint32_t frame_id)
     // 将32位CRC转换为4字节小端序，随后直接通过UART发送
     Camera_PC_Dump_WriteU32LE(crc_bytes, crc);
 
-    // 先发送22字节header，PC端必须先解析header才能知道payload长度和frame_id
+    // 先发送 22 字节 header，PC 端必须先解析它才能确定 payload 长度和 frame_id。
+    // HAL_MAX_DELAY 表示该调用没有模块级软件 timeout，会等待 HAL 完成发送或报告错误。
     if (HAL_UART_Transmit(huart,
                           header,
                           sizeof(header),
@@ -337,7 +382,13 @@ uint8_t Camera_PC_Dump_SendFrame(UART_HandleTypeDef *huart, uint32_t frame_id)
         return 2U;                                  // 错误码2表示header发送失败
     }
 
-    // payload总长度为38400字节，循环分成若干个不超过1024字节的数据块
+    /*
+     * payload 总长固定为 38400 字节，每轮从 offset 开始发送最多 1024 字节。
+     * remaining 表示尚未发送的长度，chunk 等于 min(remaining, 1024)。
+     * chunk 在循环内始终大于 0，因此 offset 单调增加，在达到 38400 时固定退出；
+     * 当前参数共执行 38 次发送（37 个 1024 字节块和最后 512 字节块）。
+     * 循环自身有固定上界，但每次 HAL_UART_Transmit() 使用 HAL_MAX_DELAY，没有软件 timeout。
+     */
     while (offset < PC_DUMP_PAYLOAD_LEN)
     {
         // 计算当前还剩多少字节没有发送
@@ -349,7 +400,7 @@ uint8_t Camera_PC_Dump_SendFrame(UART_HandleTypeDef *huart, uint32_t frame_id)
                        ? PC_DUMP_UART_CHUNK_SIZE
                        : remaining);
 
-        // 从payload[offset]开始，阻塞发送当前chunk字节数据
+        // 必须等待当前块完成后再发送下一块，才能保持 header、payload、CRC 的连续字节顺序
         if (HAL_UART_Transmit(huart,
                               (uint8_t *)&payload[offset],
                               chunk,
@@ -361,7 +412,7 @@ uint8_t Camera_PC_Dump_SendFrame(UART_HandleTypeDef *huart, uint32_t frame_id)
         offset += chunk;                            // 更新已发送位置，下一次从新的offset继续发送
     }
 
-    // payload全部发送完成后，再发送4字节CRC32作为整帧结尾
+    // payload 全部发送完成后再发送 4 字节 CRC32；这里同样使用 HAL_MAX_DELAY，没有软件 timeout
     if (HAL_UART_Transmit(huart,
                           crc_bytes,
                           sizeof(crc_bytes),

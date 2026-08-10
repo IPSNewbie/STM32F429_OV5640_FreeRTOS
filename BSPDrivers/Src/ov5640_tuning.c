@@ -1,6 +1,16 @@
-#include "ov5640_tuning.h"
-#include "bsp_log.h"
-#include "bsp_sccb.h"
+//============================================================================
+// @file    ov5640_tuning.c
+// @brief   OV5640 曝光、白平衡和基础画质参数的离散档位调试接口
+//
+// 本模块把经过 PC Dump 对比的候选参数集中成小型静态表，避免在应用代码中
+// 散落直接寄存器写入。它不自动选择“最佳”参数，也不改变分辨率、DCMI 或
+// 协议；每次只按调用者指定的档位同步访问 SCCB。所有接口为阻塞式任务上下文
+// 接口，没有并发锁，不应从 ISR 调用。预设值只是调试起点，正式采用前仍需在
+// 相同场景下比较亮度、过曝比例、色彩比值和清晰度等 PC Dump 指标。
+//============================================================================
+#include "ov5640_tuning.h" // 声明调参档位、公共读取和设置接口
+#include "bsp_log.h"       // 输出可选的寄存器诊断信息
+#include "bsp_sccb.h"      // 阻塞读写 OV5640 的 16 位寄存器地址
 
 /* OV5640调参成功明细日志开关：默认关闭，不影响寄存器读取与错误处理。 */
 #ifndef OV5640_TUNING_VERBOSE_LOG
@@ -9,8 +19,8 @@
 
 typedef struct
 {
-    uint16_t reg;
-    const char *name;
+    uint16_t reg;    // OV5640 寄存器地址
+    const char *name; // 仅用于调试日志的人类可读名称
 } OV5640_Tuning_RegDesc;
 
 typedef struct
@@ -95,26 +105,27 @@ static const OV5640_Tuning_RegDesc s_aec_regs[AEC_REG_COUNT] =
 
 static const OV5640_Tuning_AecTargetCfg s_aec_target_cfg[] =
 {
+    // 四个阈值必须作为一组评估；低档位用于逐步降低 AEC 目标而非直接固定曝光
     {0x30U, 0x28U, 0x30U, 0x26U},
     {0x2CU, 0x24U, 0x2CU, 0x22U},
     {0x28U, 0x20U, 0x28U, 0x1EU}
 };
 
 /*
- * Manual AWB gain presets for OV5640 0x3400~0x3406.
- * These are initial light-mode gain presets and must be validated by PC Dump.
+ * OV5640 0x3400～0x3406 手动白平衡增益预设。
+ * 这些是不同光照模式的初始值，选为正式默认值前必须通过 PC Dump 验证。
  */
 static const OV5640_Tuning_AwbGainCfg s_awb_manual_gain_cfg[] =
 {
-    {0x061CU, 0x0400U, 0x04F3U},  /* sunny */
-    {0x0648U, 0x0400U, 0x04D3U},  /* cloudy */
-    {0x0548U, 0x0400U, 0x07CFU},  /* office */
-    {0x0410U, 0x0400U, 0x0840U}   /* home */
+    {0x061CU, 0x0400U, 0x04F3U},  /* 晴天 */
+    {0x0648U, 0x0400U, 0x04D3U},  /* 阴天 */
+    {0x0548U, 0x0400U, 0x07CFU},  /* 办公室 */
+    {0x0410U, 0x0400U, 0x0840U}   /* 室内 */
 };
 
 /*
- * Initial SDE/CIP presets. No exact project-specific tuning table exists yet;
- * validate these values with PC Dump before selecting a final default.
+ * 初始 SDE/CIP 参数预设。当前还没有针对本项目场景定标的最终表，
+ * 选择正式默认值前需要使用 PC Dump 做定量验证。
  */
 static const OV5640_Tuning_BrightnessCfg s_brightness_cfg[] =
 {
@@ -144,6 +155,7 @@ static const OV5640_Tuning_SharpnessCfg s_sharpness_cfg[] =
     {0x06U, 0x18U, 0x20U, 0x08U, 0x06U, 0x18U, 0x0CU, 0x0AU}   /* 2 */
 };
 
+// 按 0x3500[3:0]、0x3501[7:0]、0x3502[7:0] 组合 20 位原始曝光值
 static uint32_t OV5640_Tuning_ComposeExposureRaw(uint8_t high,
                                                  uint8_t middle,
                                                  uint8_t low)
@@ -153,11 +165,13 @@ static uint32_t OV5640_Tuning_ComposeExposureRaw(uint8_t high,
            ((uint32_t)low);
 }
 
+// 按 0x350A[1:0] 和 0x350B[7:0] 组合 10 位原始增益值
 static uint16_t OV5640_Tuning_ComposeGainRaw(uint8_t high, uint8_t low)
 {
     return (uint16_t)((((uint16_t)(high & 0x03U)) << 8) | low);
 }
 
+// 按索引输出一个 AEC/AGC 寄存器的调试信息
 static void OV5640_Tuning_PrintReg(uint32_t index, const uint8_t *values)
 {
 #if (OV5640_TUNING_VERBOSE_LOG != 0U)
@@ -171,6 +185,7 @@ static void OV5640_Tuning_PrintReg(uint32_t index, const uint8_t *values)
 #endif
 }
 
+// 读取并组合 OV5640 当前原始曝光值
 uint8_t OV5640_Tuning_GetExposureRaw(uint32_t *exposure_raw)
 {
     uint8_t exposure_h;
@@ -192,6 +207,7 @@ uint8_t OV5640_Tuning_GetExposureRaw(uint32_t *exposure_raw)
     return 0U;
 }
 
+// 读取并组合 OV5640 当前原始增益值
 uint8_t OV5640_Tuning_GetGainRaw(uint16_t *gain_raw)
 {
     uint8_t gain_h;
@@ -209,12 +225,14 @@ uint8_t OV5640_Tuning_GetGainRaw(uint16_t *gain_raw)
     return 0U;
 }
 
+// 按固定有限表读取 AEC/AGC 寄存器，供一次调参前后进行可重复核对
 uint8_t OV5640_Tuning_DumpAECRegs(void)
 {
     uint8_t values[AEC_REG_COUNT];
     uint32_t exposure_raw;
     uint16_t gain_raw;
 
+    // AEC_REG_COUNT 是静态表上界；首个读失败即退出，不输出不完整的组合值
     for (uint32_t i = 0U; i < AEC_REG_COUNT; ++i)
     {
         if (SCCB_ReadReg(s_aec_regs[i].reg, &values[i]) != 0U)
@@ -263,6 +281,7 @@ uint8_t OV5640_Tuning_DumpAECRegs(void)
     return 0U;
 }
 
+// 应用一组 AEC 目标阈值，并回读全部关键寄存器确认本次实验输入
 uint8_t OV5640_Tuning_SetAecTarget(OV5640_AecTargetLevel_t level)
 {
     const OV5640_Tuning_AecTargetCfg *cfg;
@@ -282,6 +301,7 @@ uint8_t OV5640_Tuning_SetAecTarget(OV5640_AecTargetLevel_t level)
     return OV5640_Tuning_DumpAECRegs();
 }
 
+// 按高低字节顺序写入 0x3400~0x3405 的 R/G/B 手动白平衡增益
 static uint8_t OV5640_Tuning_WriteAwbGain(uint16_t r_gain,
                                           uint16_t g_gain,
                                           uint16_t b_gain)
@@ -295,6 +315,7 @@ static uint8_t OV5640_Tuning_WriteAwbGain(uint16_t r_gain,
     return 0U;
 }
 
+// 通过 0x3406 切换自动白平衡，或先写增益再启用手动模式
 uint8_t OV5640_Tuning_SetAWBMode(OV5640_AwbMode_t mode)
 {
     const OV5640_Tuning_AwbGainCfg *cfg;
@@ -325,6 +346,7 @@ uint8_t OV5640_Tuning_SetAWBMode(OV5640_AwbMode_t mode)
     return 0U;
 }
 
+// 读取固定 7 个 AWB 寄存器；单个失败只记录并继续，便于看到其余诊断值
 void OV5640_Tuning_DumpAWBRegs(void)
 {
     static const uint16_t regs[] =
@@ -348,6 +370,7 @@ void OV5640_Tuning_DumpAWBRegs(void)
     LOG_RAW("=====================================\r\n");
 }
 
+// 将 -1、0、+1 参数档位映射为配置表索引
 static uint8_t OV5640_Tuning_LevelToIndex(int8_t level, uint32_t *index)
 {
     if (index == 0)
@@ -374,6 +397,7 @@ static uint8_t OV5640_Tuning_LevelToIndex(int8_t level, uint32_t *index)
     return 2U;
 }
 
+// 设置 OV5640 亮度档位
 uint8_t OV5640_Tuning_SetBrightness(int8_t level)
 {
     uint32_t index;
@@ -392,6 +416,7 @@ uint8_t OV5640_Tuning_SetBrightness(int8_t level)
     return 0U;
 }
 
+// 设置 OV5640 对比度档位
 uint8_t OV5640_Tuning_SetContrast(int8_t level)
 {
     uint32_t index;
@@ -411,6 +436,7 @@ uint8_t OV5640_Tuning_SetContrast(int8_t level)
     return 0U;
 }
 
+// 设置 OV5640 饱和度档位
 uint8_t OV5640_Tuning_SetSaturation(int8_t level)
 {
     const OV5640_Tuning_SaturationCfg *cfg;
@@ -428,6 +454,7 @@ uint8_t OV5640_Tuning_SetSaturation(int8_t level)
     return 0U;
 }
 
+// 设置 OV5640 锐度档位
 uint8_t OV5640_Tuning_SetSharpness(uint8_t level)
 {
     const OV5640_Tuning_SharpnessCfg *cfg;

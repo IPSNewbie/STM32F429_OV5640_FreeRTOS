@@ -33,14 +33,31 @@ extern "C" {
 /* USER CODE END Includes */
 
 /* USER CODE BEGIN Private defines */
+/**
+ * @brief 板载 LED 标识
+ */
 typedef enum
 {
-  BSP_LED0 = 0,
-  BSP_LED1 = 1
+  BSP_LED0 = 0, /**< LED0 */
+  BSP_LED1 = 1  /**< LED1 */
 } bsp_led_t;
 
+/**
+ * @brief 点亮指定板载 LED
+ * @param led LED 标识；非法值不执行操作
+ */
 void BSP_LED_On(bsp_led_t led);
+
+/**
+ * @brief 熄灭指定板载 LED
+ * @param led LED 标识；非法值不执行操作
+ */
 void BSP_LED_Off(bsp_led_t led);
+
+/**
+ * @brief 翻转指定板载 LED
+ * @param led LED 标识；非法值不执行操作
+ */
 void BSP_LED_Toggle(bsp_led_t led);
 /* USER CODE END Private defines */
 

@@ -1,3 +1,5 @@
+"""UART 二进制图像请求协议重复稳定性验证工具。"""
+
 import struct
 import sys
 import time
@@ -96,6 +98,7 @@ def check_response(response):
     return True, frame_id, ""
 
 def main():
+    """解析参数并执行完整测试流程。"""
     success_count = 0
     failure_count = 0
     failure_dump_saved = False
@@ -116,6 +119,7 @@ def main():
             ser.write_timeout = 2.0
             ser.rtscts = False
             ser.dsrdtr = False
+            # open 前关闭控制线，避免 CH340 自动下载电路切换 BOOT0 或复位 MCU。
             ser.dtr = False
             ser.rts = False
             ser.open()

@@ -109,6 +109,7 @@ CSV_FIELDS = [
 
 
 def parse_blocks(text: str) -> List[int]:
+    """按响应边界拆分串口 CLI 文本块。"""
     values: List[int] = []
     for item in text.split(","):
         token = item.strip()
@@ -125,6 +126,7 @@ def parse_blocks(text: str) -> List[int]:
 
 
 def sanitize_tag(text: str) -> str:
+    """清洗标签，使其可安全用于文件名。"""
     tag = re.sub(r"[^A-Za-z0-9_-]+", "_", text.strip()).strip("_")
     if not tag:
         raise argparse.ArgumentTypeError("--tag 必须包含字母、数字、下划线或连字符")
@@ -132,6 +134,7 @@ def sanitize_tag(text: str) -> str:
 
 
 def parse_kv(text: str) -> Dict[str, str]:
+    """解析 CLI 响应中的键值字段。"""
     values: Dict[str, str] = {}
     for line in text.splitlines():
         match = re.match(r"\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$", line)
@@ -141,6 +144,7 @@ def parse_kv(text: str) -> Dict[str, str]:
 
 
 def get_int(values: Dict[str, str], key: str, default: int = -1) -> int:
+    """读取整数键值，缺失或非法时返回默认值。"""
     text = values.get(key)
     if text is None:
         return default
@@ -151,6 +155,7 @@ def get_int(values: Dict[str, str], key: str, default: int = -1) -> int:
 
 
 def build_request(seq: int) -> bytes:
+    """按正式协议构造二进制图像请求帧。"""
     if not 0 <= seq <= 0xFFFF:
         raise ValueError("请求 seq 必须在 0 到 65535 之间")
     body = struct.pack("<BBHH", REQUEST_VERSION, REQUEST_TYPE, seq, 0)
@@ -162,6 +167,7 @@ def build_request(seq: int) -> bytes:
 
 
 def validate_image_frame(frame: bytes) -> Tuple[bool, bool, Optional[int], str]:
+    """校验 OV56RGB5 图像响应的固定字段与 CRC32。"""
     if len(frame) != IMAGE_FRAME_SIZE:
         return False, False, None, "响应长度错误：%d/%d B" % (len(frame), IMAGE_FRAME_SIZE)
 
@@ -195,6 +201,7 @@ def validate_image_frame(frame: bytes) -> Tuple[bool, bool, Optional[int], str]:
 
 
 def classify_read(text: str, values: Dict[str, str]) -> str:
+    """根据读块响应字段归类测试结果。"""
     if "SD ATK1BREAD: block read OK" in text or (
             get_int(values, "atk_1bit_last_read_status") == 0
             and get_int(values, "atk_1bit_last_read_size") == 512
@@ -210,6 +217,7 @@ def classify_read(text: str, values: Dict[str, str]) -> str:
 
 
 def check_frame_ids_continuous(frame_ids: Sequence[int]) -> bool:
+    """检查图像帧编号是否连续递增。"""
     if len(frame_ids) <= 1:
         return bool(frame_ids)
     return all(
@@ -219,7 +227,9 @@ def check_frame_ids_continuous(frame_ids: Sequence[int]) -> bool:
 
 
 class UartSession:
+    """封装串口 CLI 与二进制图像请求会话。"""
     def __init__(self, port: str, baud: int, command_timeout: float, log: List[str]) -> None:
+        """初始化测试会话及其运行状态。"""
         if serial is None:
             raise RuntimeError("未安装 pyserial，请先执行：pip install pyserial")
         self.command_timeout = command_timeout
@@ -231,6 +241,7 @@ class UartSession:
         self.ser.write_timeout = 2.0
         self.ser.rtscts = False
         self.ser.dsrdtr = False
+        # open 前关闭控制线，避免 CH340 自动下载电路切换 BOOT0 或复位 MCU。
         self.ser.dtr = False
         self.ser.rts = False
         self.ser.open()
@@ -241,10 +252,12 @@ class UartSession:
         self.ser.reset_output_buffer()
 
     def close(self) -> None:
+        """关闭串口或日志等会话资源。"""
         if self.ser.is_open:
             self.ser.close()
 
     def read_text_until_quiet(self) -> str:
+        """持续读取文本，直到串口保持静默。"""
         started = time.monotonic()
         last_data = started
         quiet_time = min(0.45, max(0.1, self.command_timeout / 4.0))
@@ -265,6 +278,7 @@ class UartSession:
         return b"".join(chunks).decode("utf-8", errors="replace")
 
     def cli(self, command: str) -> str:
+        """发送一条 CLI 命令并读取完整文本响应。"""
         self.ser.reset_input_buffer()
         self.log.append("\n===== %s CLI >>> %s =====" % (dt.datetime.now().isoformat(timespec="seconds"), command))
         self.ser.write((command + "\r\n").encode("ascii"))
@@ -274,6 +288,7 @@ class UartSession:
         return text
 
     def image_request(self, seq: int, timeout_seconds: float) -> Tuple[bytes, int]:
+        """发送二进制图像请求并校验完整响应。"""
         request = build_request(seq)
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
@@ -290,6 +305,7 @@ class UartSession:
             chunk = self.ser.read(self.ser.in_waiting or 1)
             if chunk:
                 data.extend(chunk)
+            # CLI 文本可能先到，按 magic 定位可避免把混合输出误当成图像帧头。
             magic_index = data.find(IMAGE_MAGIC)
             if magic_index >= 0 and len(data) >= magic_index + IMAGE_FRAME_SIZE:
                 frame = bytes(data[magic_index:magic_index + IMAGE_FRAME_SIZE])
@@ -304,6 +320,7 @@ class UartSession:
 
 
 def safe_cli(session: UartSession, command: str, log: List[str]) -> str:
+    """执行 CLI 命令，并将异常转换为可记录结果。"""
     try:
         return session.cli(command)
     except Exception as exc:
@@ -312,12 +329,14 @@ def safe_cli(session: UartSession, command: str, log: List[str]) -> str:
 
 
 def sleep_and_log(log: List[str], label: str, seconds: float) -> None:
+    """记录原因后等待指定时间。"""
     if seconds > 0.0:
         log.append("%s wait %.3f s" % (label, seconds))
         time.sleep(seconds)
 
 
 def best_effort_cleanup(session: UartSession, log: List[str], label: str, cleanup_wait: float) -> str:
+    """尽最大努力恢复 takeover 状态，避免一次失败影响后续测试。"""
     log.append("\n===== %s =====" % label)
     responses: List[bool] = []
     commands = ("SD TAKEOVER EXIT", "SD DVPRESTORE", "SNAPSHOT RESTORE", "STATUS")
@@ -329,6 +348,7 @@ def best_effort_cleanup(session: UartSession, log: List[str], label: str, cleanu
 
 
 def unique_values(rows: Sequence[Dict[str, str]], field: str) -> str:
+    """提取字段中按顺序去重的值。"""
     values: List[str] = []
     for row in rows:
         value = row.get(field, "")
@@ -338,10 +358,12 @@ def unique_values(rows: Sequence[Dict[str, str]], field: str) -> str:
 
 
 def failed_cycle_values(rows: Sequence[Dict[str, str]], field: str, pass_value: str) -> str:
+    """提取失败循环对应的字段值。"""
     return ",".join(row["cycle"] for row in rows if row.get(field) != pass_value)
 
 
 def fail_reason_counts(rows: Sequence[Dict[str, str]]) -> str:
+    """统计各类失败原因的出现次数。"""
     counts: Dict[str, int] = {}
     for row in rows:
         for reason in row.get("errors", "").split(" | "):
@@ -351,6 +373,7 @@ def fail_reason_counts(rows: Sequence[Dict[str, str]]) -> str:
 
 
 def make_row(mode: str, cycle: int, read_index: str = "") -> Dict[str, str]:
+    """创建一行带默认值的循环测试记录。"""
     row = {field: "" for field in CSV_FIELDS}
     row.update(
         {
@@ -429,6 +452,7 @@ def make_row(mode: str, cycle: int, read_index: str = "") -> Dict[str, str]:
 
 
 def parse_prepare(text: str) -> bool:
+    """解析 SNAPSHOT PREPARE 响应字段。"""
     return any(
         marker in text
         for marker in (
@@ -440,12 +464,14 @@ def parse_prepare(text: str) -> bool:
 
 
 def run_sd_init_deferred(session: UartSession, row: Dict[str, str], log: List[str]) -> None:
+    """执行 takeover 后延迟的 SD 初始化。"""
     pre_init_text = safe_cli(session, "SD INIT", log)
     pre_init_lower = pre_init_text.lower()
     row["sd_init_blocked"] = "YES" if ("need sdio takeover" in pre_init_lower or "deferred" in pre_init_lower) else "NO"
 
 
 def run_prepare(session: UartSession, row: Dict[str, str], log: List[str]) -> bool:
+    """执行 SNAPSHOT PREPARE 步骤。"""
     prepare_text = safe_cli(session, "SNAPSHOT PREPARE", log)
     ok = parse_prepare(prepare_text)
     row["snapshot_prepare"] = "PASS" if ok else "FAIL"
@@ -453,6 +479,7 @@ def run_prepare(session: UartSession, row: Dict[str, str], log: List[str]) -> bo
 
 
 def run_dvpstop(session: UartSession, row: Dict[str, str], log: List[str]) -> Tuple[bool, int]:
+    """执行 DVP 输出停止步骤。"""
     dvp_stop_text = safe_cli(session, "SD DVPSTOP", log)
     dvp_status_text = safe_cli(session, "SD DVPSTATUS", log)
     dvp_values = parse_kv(dvp_stop_text + "\n" + dvp_status_text)
@@ -473,6 +500,7 @@ def run_dvpstop(session: UartSession, row: Dict[str, str], log: List[str]) -> Tu
 
 
 def run_takeover(session: UartSession, row: Dict[str, str], log: List[str]) -> bool:
+    """执行 SDIO takeover 进入步骤。"""
     enter_text = safe_cli(session, "SD TAKEOVER ENTER", log)
     enter_values = parse_kv(enter_text)
     full_gpio_af12 = get_int(enter_values, "sdio_full_gpio_af12_selected")
@@ -490,6 +518,7 @@ def run_takeover(session: UartSession, row: Dict[str, str], log: List[str]) -> b
 
 
 def run_atk1b_init(session: UartSession, row: Dict[str, str], log: List[str]) -> bool:
+    """执行 ATK 1-bit SD 初始化步骤。"""
     init_text = safe_cli(session, "SD ATK1BINIT", log)
     init_status_text = safe_cli(session, "SD ATK1BSTATUS", log)
     init_values = parse_kv(init_text + "\n" + init_status_text)
@@ -516,6 +545,7 @@ def run_atk1b_init(session: UartSession, row: Dict[str, str], log: List[str]) ->
 
 
 def read_block(session: UartSession, block: int) -> Dict[str, str]:
+    """执行一次指定地址的 SD 读块测试。"""
     read_text = safe_cli(session, "SD ATK1BREAD %d" % block, session.log)
     status_text = safe_cli(session, "SD ATK1BSTATUS", session.log)
     combined = read_text + "\n" + status_text
@@ -529,6 +559,7 @@ def read_block(session: UartSession, block: int) -> Dict[str, str]:
 
 
 def put_read_result(row: Dict[str, str], block: int, result: Dict[str, str]) -> None:
+    """把读块结果写入当前循环记录。"""
     if block not in (0, 2048):
         # 为了保持 CSV 表头简单，额外 block 只写入 log，不写入 CSV 汇总字段。
         return
@@ -539,6 +570,7 @@ def put_read_result(row: Dict[str, str], block: int, result: Dict[str, str]) -> 
 
 
 def run_takeover_exit(session: UartSession, row: Dict[str, str], log: List[str]) -> bool:
+    """执行 SDIO takeover 退出步骤。"""
     exit_text = safe_cli(session, "SD TAKEOVER EXIT", log)
     ok = "full SDIO GPIO restored, conflict pins restored to DCMI AF13" in exit_text or (
             "SD TAKEOVER EXIT" in exit_text and "restored" in exit_text
@@ -548,6 +580,7 @@ def run_takeover_exit(session: UartSession, row: Dict[str, str], log: List[str])
 
 
 def run_dvprestore(session: UartSession, row: Dict[str, str], log: List[str], saved_3018: int) -> bool:
+    """执行 DVP 输出恢复步骤。"""
     dvp_restore_text = safe_cli(session, "SD DVPRESTORE", log)
     dvp_status_text = safe_cli(session, "SD DVPSTATUS", log)
     values = parse_kv(dvp_restore_text + "\n" + dvp_status_text)
@@ -570,6 +603,7 @@ def run_dvprestore(session: UartSession, row: Dict[str, str], log: List[str], sa
 
 
 def run_snapshot_restore(session: UartSession, row: Dict[str, str], log: List[str]) -> bool:
+    """执行 SNAPSHOT RESTORE 恢复步骤。"""
     text = safe_cli(session, "SNAPSHOT RESTORE", log)
     # 当前固件会返回 deferred，也算 guard 已解除的预期行为。
     ok = "SNAPSHOT RESTORE" in text
@@ -578,6 +612,7 @@ def run_snapshot_restore(session: UartSession, row: Dict[str, str], log: List[st
 
 
 def run_status(session: UartSession, row: Dict[str, str], log: List[str]) -> bool:
+    """读取并解析缓存状态。"""
     status_text = safe_cli(session, "STATUS", log)
     values = parse_kv(status_text)
     health_values = {
@@ -594,6 +629,7 @@ def run_status(session: UartSession, row: Dict[str, str], log: List[str]) -> boo
 
 
 def run_image_request(session: UartSession, row: Dict[str, str], args: argparse.Namespace, seq: int, log: List[str]) -> bool:
+    """执行一次恢复后的图像请求验证。"""
     try:
         frame, rx_len = session.image_request(seq, args.image_timeout)
         image_ok, crc_ok, frame_id, image_error = validate_image_frame(frame)
@@ -619,6 +655,7 @@ def run_image_request(session: UartSession, row: Dict[str, str], args: argparse.
 
 
 def collect_errors(row: Dict[str, str], blocks: Sequence[int], no_image: bool) -> List[str]:
+    """收集本轮测试的失败原因。"""
     errors: List[str] = []
     checks = [
         ("snapshot_prepare", "PASS", "SNAPSHOT_PREPARE"),
@@ -652,12 +689,14 @@ def collect_errors(row: Dict[str, str], blocks: Sequence[int], no_image: bool) -
 
 
 def finalize_cycle(row: Dict[str, str], blocks: Sequence[int], no_image: bool) -> None:
+    """汇总并定稿一轮循环测试结果。"""
     errors = collect_errors(row, blocks, no_image)
     row["errors"] = " | ".join(errors)
     row["cycle_result"] = "PASS" if not errors else "FAIL"
 
 
 def log_cycle_diagnostics(row: Dict[str, str], log: List[str]) -> None:
+    """记录本轮循环的关键诊断字段。"""
     log.append("\nCYCLE %s DIAGNOSTICS:" % row["cycle"])
     for field in CSV_FIELDS:
         if field not in ("timestamp", "mode"):
@@ -665,6 +704,7 @@ def log_cycle_diagnostics(row: Dict[str, str], log: List[str]) -> None:
 
 
 def print_cycle_progress(cycle: int, total: int, row: Dict[str, str]) -> None:
+    """输出当前循环的精简进度。"""
     print(
         "[%02d/%02d] DVP=%s TAKEOVER=%s INIT=%s READ0=%s READ2048=%s "
         "RESTORE=%s IMAGE=%s frame_id=%s CYCLE=%s"
@@ -700,6 +740,7 @@ def print_cycle_progress(cycle: int, total: int, row: Dict[str, str]) -> None:
 
 
 def run_cycle_mode(session: UartSession, args: argparse.Namespace, log: List[str]) -> List[Dict[str, str]]:
+    """以每轮重开会话的方式执行循环测试。"""
     rows: List[Dict[str, str]] = []
     for cycle in range(1, args.cycles + 1):
         row = make_row("cycle", cycle)
@@ -751,6 +792,7 @@ def run_cycle_mode(session: UartSession, args: argparse.Namespace, log: List[str
 
 
 def run_single_session_mode(session: UartSession, args: argparse.Namespace, log: List[str]) -> List[Dict[str, str]]:
+    """在同一串口会话中执行全部循环。"""
     rows: List[Dict[str, str]] = []
     base_row = make_row("single-session", 1)
     base_row["pre_cleanup"] = "NOT_RUN"
@@ -825,6 +867,7 @@ def run_single_session_mode(session: UartSession, args: argparse.Namespace, log:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """创建并配置命令行参数解析器。"""
     parser = argparse.ArgumentParser(
         description="Stage 11C-5U-2 DVP mask 稳定性脚本，支持 single-session / cycle 对照"
     )
@@ -854,6 +897,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    """校验循环测试参数范围。"""
     if args.cycles <= 0:
         raise SystemExit("--cycles 必须大于 0")
     if args.read_count <= 0:
@@ -883,6 +927,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def count_rows(rows: Sequence[Dict[str, str]], field: str, value: str, only_summary: bool = True) -> int:
+    """统计 CSV 中已记录的数据行数。"""
     selected = rows
     if only_summary:
         selected = [row for row in rows if row.get("read_index", "") in ("", "summary")]
@@ -890,6 +935,7 @@ def count_rows(rows: Sequence[Dict[str, str]], field: str, value: str, only_summ
 
 
 def summarize(rows: Sequence[Dict[str, str]], args: argparse.Namespace, paths: Tuple[Path, Path, Path]) -> Dict[str, str]:
+    """汇总全部循环并生成统计结果。"""
     summary_rows = [row for row in rows if row.get("read_index", "") in ("", "summary")]
     if not summary_rows:
         summary_rows = list(rows)
@@ -903,6 +949,7 @@ def summarize(rows: Sequence[Dict[str, str]], args: argparse.Namespace, paths: T
     ]
 
     def nonzero_count(field: str) -> int:
+        """统计指定字段中非零结果的数量。"""
         total = 0
         for row in summary_rows:
             try:
@@ -995,6 +1042,7 @@ def summarize(rows: Sequence[Dict[str, str]], args: argparse.Namespace, paths: T
 
 
 def write_outputs(rows: Sequence[Dict[str, str]], summary: Dict[str, str], paths: Tuple[Path, Path, Path], log: List[str]) -> None:
+    """写出 CSV、摘要和测试日志。"""
     csv_path, log_path, summary_path = paths
     with csv_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
@@ -1007,6 +1055,7 @@ def write_outputs(rows: Sequence[Dict[str, str]], summary: Dict[str, str], paths
 
 
 def main() -> int:
+    """解析参数并执行完整测试流程。"""
     args = build_parser().parse_args()
     validate_args(args)
 

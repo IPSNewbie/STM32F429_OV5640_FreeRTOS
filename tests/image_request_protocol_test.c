@@ -1,3 +1,8 @@
+/*
+ * 二进制图像请求协议主机侧单元测试。
+ *
+ * 覆盖固定向量、CRC32、状态机同步、字段错误、超时、自动复位和输出参数保护。
+ */
 #include "image_request_protocol.h"
 #include "protocol_crc32.h"
 
@@ -16,6 +21,7 @@ static const uint8_t s_fixed_request[IMAGE_REQUEST_FRAME_SIZE] = {
     0x00U, 0xEAU, 0x45U, 0xB4U, 0xDBU, 0x0DU, 0x0AU
 };
 
+// 构造指定序号的合法图像请求帧并返回其 CRC32
 static uint32_t BuildValidRequestFrame(
     uint16_t seq,
     uint8_t frame[IMAGE_REQUEST_FRAME_SIZE])
@@ -43,6 +49,7 @@ static uint32_t BuildValidRequestFrame(
     return crc;
 }
 
+// 用哨兵值填充输出帧，便于检测非成功路径的意外写入
 static void SetFrameSentinel(ImageRequestFrame_t *frame)
 {
     frame->version = 0xA7U;
@@ -51,6 +58,7 @@ static void SetFrameSentinel(ImageRequestFrame_t *frame)
     frame->payload_len = 0xEBFCU;
 }
 
+// 检查输出帧是否仍保持哨兵值
 static int FrameIsSentinel(const ImageRequestFrame_t *frame)
 {
     return (frame->version == 0xA7U) &&
@@ -59,6 +67,7 @@ static int FrameIsSentinel(const ImageRequestFrame_t *frame)
            (frame->payload_len == 0xEBFCU);
 }
 
+// 检查解析结果是否匹配固定协议字段和预期序号
 static int FrameMatches(const ImageRequestFrame_t *frame, uint16_t seq)
 {
     return (frame->version == IMAGE_REQUEST_VERSION) &&
@@ -67,6 +76,7 @@ static int FrameMatches(const ImageRequestFrame_t *frame, uint16_t seq)
            (frame->payload_len == IMAGE_REQUEST_PAYLOAD_LEN_V1);
 }
 
+// 比较两个解析器上下文的全部运行字段
 static int ParserMatches(const ImageRequestParser_t *left,
                          const ImageRequestParser_t *right)
 {
@@ -81,6 +91,7 @@ static int ParserMatches(const ImageRequestParser_t *left,
            (left->frame_active == right->frame_active);
 }
 
+// 检查解析器是否已恢复初始清零状态
 static int ParserIsCleared(const ImageRequestParser_t *parser)
 {
     return (parser->state == IMAGE_REQUEST_STATE_SYNC0) &&
@@ -94,6 +105,7 @@ static int ParserIsCleared(const ImageRequestParser_t *parser)
            (parser->frame_active == 0U);
 }
 
+// 检查解析器是否仅保留最新帧头起始字节
 static int ParserHasFreshSof(const ImageRequestParser_t *parser,
                              uint32_t expected_time_ms)
 {
@@ -108,6 +120,7 @@ static int ParserHasFreshSof(const ImageRequestParser_t *parser,
            (parser->frame_active == 1U);
 }
 
+// 连续输入一段字节并返回最后一次解析结果
 static ImageRequestParseResult_t FeedData(
     ImageRequestParser_t *parser,
     const uint8_t *data,
@@ -136,6 +149,7 @@ static ImageRequestParseResult_t FeedData(
     return result;
 }
 
+// 验证指定序号的合法帧能够完整解析
 static int ParseValidSeq(uint16_t seq)
 {
     ImageRequestParser_t parser;
@@ -158,6 +172,7 @@ static int ParseValidSeq(uint16_t seq)
            ParserIsCleared(&parser);
 }
 
+// 验证固定请求向量、CRC 和业务字段
 static int Test01FixedFrame(void)
 {
     ImageRequestParser_t parser;
@@ -180,6 +195,7 @@ static int Test01FixedFrame(void)
            FrameMatches(&out_frame, 0x1234U);
 }
 
+// 验证逐字节输入时各中间状态均保持等待
 static int Test04SingleByteFeed(void)
 {
     ImageRequestParser_t parser;
@@ -210,6 +226,7 @@ static int Test04SingleByteFeed(void)
            FrameMatches(&out_frame, 0x2345U);
 }
 
+// 验证循环输入完整帧后只在末字节成功
 static int Test05FullLoop(void)
 {
     ImageRequestParser_t parser;
@@ -227,6 +244,7 @@ static int Test05FullLoop(void)
            FrameMatches(&out_frame, 0x3456U);
 }
 
+// 验证连续两帧可独立解析
 static int Test06TwoFrames(void)
 {
     ImageRequestParser_t parser;
@@ -250,6 +268,7 @@ static int Test06TwoFrames(void)
     return (ok_count == 2U) && FrameMatches(&out_frame, 0x1002U);
 }
 
+// 验证连续十帧序号递增解析的稳定性
 static int Test07TenFrames(void)
 {
     ImageRequestParser_t parser;
@@ -276,6 +295,7 @@ static int Test07TenFrames(void)
     return (ok_count == 10U) && FrameMatches(&out_frame, 9U);
 }
 
+// 验证终态结果后解析器自动复位
 static int Test08AutomaticReset(void)
 {
     ImageRequestParser_t parser;
@@ -304,6 +324,7 @@ static int Test08AutomaticReset(void)
            FrameMatches(&out_frame, 0x2002U);
 }
 
+// 验证随机前缀后仍可同步合法帧
 static int Test09GarbagePrefix(void)
 {
     static const uint8_t garbage[] = {0x00U, 0xFFU, 0x5AU, 0x20U, 0x0DU};
@@ -329,6 +350,7 @@ static int Test09GarbagePrefix(void)
                     &out_frame, NULL) == IMAGE_REQUEST_PARSE_OK;
 }
 
+// 验证重复帧头首字节后的重新同步
 static int Test10A5A55A(void)
 {
     ImageRequestParser_t parser;
@@ -347,6 +369,7 @@ static int Test10A5A55A(void)
                     &out_frame, NULL) == IMAGE_REQUEST_PARSE_OK;
 }
 
+// 验证损坏帧头不会进入活跃帧状态
 static int Test11BrokenPrefix(void)
 {
     ImageRequestParser_t parser;
@@ -367,6 +390,7 @@ static int Test11BrokenPrefix(void)
                     &out_frame, NULL) == IMAGE_REQUEST_PARSE_OK;
 }
 
+// 验证多个连续 0xA5 始终保留最新起点
 static int Test12RepeatedA5(void)
 {
     ImageRequestParser_t parser;
@@ -389,6 +413,7 @@ static int Test12RepeatedA5(void)
                     &out_frame, NULL) == IMAGE_REQUEST_PARSE_OK;
 }
 
+// 验证错误帧之后可以解析下一合法帧
 static int Test13BadThenValid(void)
 {
     ImageRequestParser_t parser;
@@ -416,6 +441,7 @@ static int Test13BadThenValid(void)
                      &out_frame, NULL) == IMAGE_REQUEST_PARSE_OK);
 }
 
+// 验证错误字段值为 0xA5 时作为下一候选帧起点
 static int Test14ErrorByteA5(void)
 {
     ImageRequestParser_t parser;
@@ -441,6 +467,7 @@ static int Test14ErrorByteA5(void)
                     &out_frame, NULL) == IMAGE_REQUEST_PARSE_OK;
 }
 
+// 验证指定字段损坏时返回预期错误且不写输出
 static int TestFieldError(size_t index,
                           uint8_t value,
                           size_t feed_length,
@@ -460,6 +487,7 @@ static int TestFieldError(size_t index,
     return (result == expected) && FrameIsSentinel(&out_frame);
 }
 
+// 验证指定字段错误后的自动恢复
 static int TestErrorRecovery(size_t index,
                              uint8_t value,
                              ImageRequestParseResult_t expected)
@@ -507,6 +535,7 @@ static int TestErrorRecovery(size_t index,
            FrameMatches(&out_frame, 0x4003U);
 }
 
+// 验证帧尾错误优先于成功结果报告
 static int Test20EofPriority(void)
 {
     ImageRequestParser_t parser;
@@ -523,6 +552,7 @@ static int Test20EofPriority(void)
            FrameIsSentinel(&out_frame);
 }
 
+// 验证字节间隔小于阈值时不超时
 static int Test31ShortIntervals(void)
 {
     ImageRequestParser_t parser;
@@ -535,6 +565,7 @@ static int Test31ShortIntervals(void)
                     &out_frame, NULL) == IMAGE_REQUEST_PARSE_OK;
 }
 
+// 验证超时后普通字节被丢弃并恢复空闲
 static int Test32TimedOutNonA5(void)
 {
     ImageRequestParser_t parser;
@@ -550,6 +581,7 @@ static int Test32TimedOutNonA5(void)
            ParserIsCleared(&parser) && FrameIsSentinel(&out_frame);
 }
 
+// 验证超时后的 0xA5 同时作为新帧起点
 static int Test33TimedOutA5(void)
 {
     ImageRequestParser_t parser;
@@ -575,6 +607,7 @@ static int Test33TimedOutA5(void)
            FrameMatches(&out_frame, 0x5003U);
 }
 
+// 验证半帧超时后下一合法帧仍可解析
 static int Test34ValidAfterTimeout(void)
 {
     ImageRequestParser_t parser;
@@ -594,6 +627,7 @@ static int Test34ValidAfterTimeout(void)
                     &out_frame, NULL) == IMAGE_REQUEST_PARSE_OK;
 }
 
+// 验证输出指针为空时解析器状态不被破坏
 static int Test40NullOutputKeepsState(void)
 {
     ImageRequestParser_t parser;
@@ -618,6 +652,7 @@ static int Test40NullOutputKeepsState(void)
            (parser.state == IMAGE_REQUEST_STATE_VERSION);
 }
 
+// 验证非成功结果不会修改调用方输出帧
 static int Test43NonOkKeepsOutput(void)
 {
     ImageRequestParser_t parser;
@@ -679,6 +714,7 @@ static int Test43NonOkKeepsOutput(void)
            FrameIsSentinel(&out_frame);
 }
 
+// 验证仅在完整合法帧终态写入一次输出
 static int Test44OutputWrittenOnce(void)
 {
     ImageRequestParser_t parser;
@@ -703,6 +739,7 @@ static int Test44OutputWrittenOnce(void)
            (out_frame.payload_len == saved.payload_len);
 }
 
+// 验证显式复位清除全部内部字段
 static int Test45ResetClearsFields(void)
 {
     ImageRequestParser_t parser;
@@ -735,6 +772,7 @@ static int Test45ResetClearsFields(void)
     return ParserIsCleared(&parser);
 }
 
+// 验证候选帧接收期间活跃标志保持有效
 static int Test46ActiveDuringParsing(void)
 {
     ImageRequestParser_t parser;
@@ -762,6 +800,7 @@ static int Test46ActiveDuringParsing(void)
     return 1;
 }
 
+// 验证成功或错误终态后活跃标志清除
 static int Test47InactiveAfterTerminalResults(void)
 {
     ImageRequestParser_t parser;
@@ -796,6 +835,7 @@ static int Test47InactiveAfterTerminalResults(void)
            (ImageRequestProtocol_IsActive(&parser) == 0U);
 }
 
+// 记录单项测试结果并输出失败名称
 static void RunTest(const char *name, int passed)
 {
     s_test_total++;
@@ -809,6 +849,7 @@ static void RunTest(const char *name, int passed)
     (void)fprintf(stderr, "测试失败：%s\n", name);
 }
 
+// 运行图像请求协议全部主机侧单元测试
 int main(void)
 {
     ImageRequestParser_t parser;

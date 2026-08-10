@@ -1,30 +1,39 @@
 #ifndef ISP_OV5640_CAMERA_PC_DUMP_H
 #define ISP_OV5640_CAMERA_PC_DUMP_H
 
-#include "stm32f4xx_hal.h"                             // 引入 STM32F4 HAL 类型，主要用于 UART_HandleTypeDef
-#include <stdint.h>                                    // 引入 uint8_t、uint32_t 等固定宽度整数类型
+#include "stm32f4xx_hal.h"                             // 提供 UART_HandleTypeDef，供文本回复和图像帧发送接口使用
+#include <stdint.h>                                    // 提供 uint8_t、uint16_t、uint32_t 等协议固定宽度整数类型
 
-//============================================================================
-// @file    camera_pc_dump.h
-// @brief   OV5640 图像帧通过 UART 导出到 PC 的接口声明
-// @note    本模块主要负责以下三类功能：
-//          1. 为 DCMI DMA 提供图像采集缓冲区地址和传输长度；
-//          2. 接收并解析文本命令字节，例如 DUMP、HELP、STATUS；
-//          3. 将一帧 RGB565 图像封装成 OV56RGB5 数据包并通过 UART 发送。
-//============================================================================
+/**
+ * @file camera_pc_dump.h
+ * @brief OV5640 图像帧通过 UART 导出到 PC 的接口
+ *
+ * 本模块连接以下三条工程链路：
+ *
+ * 1. DCMI DMA 通过本模块查询 back buffer 地址和 32 位传输数量；
+ * 2. UART dispatcher 将文本字节交给本模块，DUMP 事件返回 CameraServiceTask；
+ * 3. Camera RTOS 准备并提交 front frame 后，本模块按 OV56RGB5 协议发送图像。
+ *
+ * @note 文本解析状态由模块内部静态变量保存，只应由 CameraServiceTask 单一上下文调用。
+ * @note 本模块不直接启动 DCMI，也不会把仍由 DMA 写入的 back buffer 发送给 PC。
+ */
 
 
 //============================================================================
 // 图像尺寸及数据包长度
 //============================================================================
 
-#define PC_DUMP_WIDTH       160U                       // PC Dump 图像宽度固定为 160 像素，U 表示无符号整数常量
+/** @brief PC Dump 图像固定宽度，单位像素。 */
+#define PC_DUMP_WIDTH       160U                       // OV56RGB5 当前正式输出固定为 160 像素宽
 
+/** @brief PC Dump 图像固定高度，单位像素。 */
 #define PC_DUMP_HEIGHT      120U                       // PC Dump 图像高度固定为 120 像素
 
+/** @brief DCMI DMA 采集一帧所需的 32 位 word 数。 */
 #define PC_DUMP_WORD_COUNT  \
     (PC_DUMP_WIDTH * PC_DUMP_HEIGHT / 2U)              // DCMI DMA 以 32 位 word 为单位传输；一个 word 可容纳两个 RGB565 像素
 
+/** @brief 一帧 160x120 RGB565 有效载荷长度，单位字节。 */
 #define PC_DUMP_PAYLOAD_LEN \
     (PC_DUMP_WIDTH * PC_DUMP_HEIGHT * 2U)              // RGB565 每个像素占 2 字节，因此图像数据总长度为 160×120×2=38400 字节
 
@@ -33,16 +42,22 @@
 // 文本命令解析结果
 //============================================================================
 
+/** @brief 当前没有得到有效文本命令结果。 */
 #define CAMERA_PC_DUMP_CMD_NONE        0U              // 当前没有得到有效结果，通常表示参数无效或没有完整命令
 
+/** @brief 已接收到完整 DUMP 命令。 */
 #define CAMERA_PC_DUMP_CMD_DUMP        1U              // 已接收到完整 DUMP 命令，调用方应执行采集、处理和图像发送
 
+/** @brief 历史 AEC 文本命令结果，当前最终 CLI 不再暴露该命令。 */
 #define CAMERA_PC_DUMP_CMD_AEC         2U              // 已接收到完整 AEC 命令，用于输出 OV5640 AEC/AGC 寄存器信息
 
+/** @brief 普通 CLI 命令已完成处理。 */
 #define CAMERA_PC_DUMP_CMD_CLI         3U              // 已接收到普通 CLI 命令，并且该命令已经由 CLI 模块完成处理
 
+/** @brief 当前文本命令行尚未接收完整。 */
 #define CAMERA_PC_DUMP_CMD_PENDING     4U              // 当前字节已保存，但一整行命令尚未接收完，需要继续输入后续字节
 
+/** @brief UART 接收错误兼容状态。 */
 #define CAMERA_PC_DUMP_CMD_UART_ERROR  5U              // UART 接收过程中发生错误；当前 DMA版本中主要作为兼容状态保留
 
 
@@ -120,6 +135,9 @@ uint32_t Camera_PC_Dump_GetWordCount(void);             // 返回 DCMI DMA 的�
  *     -> Camera_PC_Dump_FeedCommandByte()
  *
  * 因此，本函数只负责文本行状态，不再直接读取 UART 硬件。
+ *
+ * @note 解析器使用模块内部静态状态，不可由多个任务或 ISR 并发调用。
+ * @note DUMP 只形成返回事件；图像准备与发送仍由 CameraServiceTask 的上层流程执行。
  */
 uint8_t Camera_PC_Dump_FeedCommandByte(
     UART_HandleTypeDef *huart,                          // USART1 句柄，用于 CLI 文本响应
@@ -145,6 +163,8 @@ uint8_t Camera_PC_Dump_FeedCommandByte(
  * 4. 其他与当前未完成命令相关的静态状态。
  *
  * 本函数不会向 UART 输出任何文本。
+ * 它只清除本模块的文本行状态；UART dispatcher 和 binary request parser
+ * 由调用方通过各自的 Reset 接口另行清除。
  */
 void Camera_PC_Dump_ResetCommandParser(void);           // 放弃当前未完成文本命令，使下一字节从新命令开始解析
 
@@ -267,6 +287,11 @@ void Camera_PC_Dump_ResetCommandParser(void);           // 放弃当前未完成
  *     由 STM32 维护，用于标识成功发送的图像帧。
  *
  * 当前协议不要求 seq 等于 frame_id。
+ *
+ * @warning 本函数使用阻塞式 HAL_UART_Transmit()，且 timeout 参数为 HAL_MAX_DELAY，
+ *          模块本身没有额外的软件超时机制，不能在 ISR 中调用。
+ * @note 调用前必须已经通过 Camera RTOS 的统一准备路径得到尺寸正确、已经 commit 的 front frame。
+ * @note frame_id 的递增由上层在发送成功后完成；本函数只把传入值写入 header。
  */
 uint8_t Camera_PC_Dump_SendFrame(
     UART_HandleTypeDef *huart,                          // UART发送句柄，当前为USART1

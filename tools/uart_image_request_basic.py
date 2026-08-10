@@ -1,3 +1,5 @@
+"""UART 二进制图像请求协议基础验证工具。"""
+
 import struct
 import sys
 import time
@@ -43,6 +45,7 @@ def read_exact(ser, expected_size, timeout_seconds):
 
 
 def main():
+    """解析参数并执行完整测试流程。"""
     try:
         request, request_crc = build_request(REQUEST_SEQ)
         print(f"串口：{PORT}")
@@ -60,6 +63,7 @@ def main():
             ser.write_timeout = 2.0
             ser.rtscts = False
             ser.dsrdtr = False
+            # open 前关闭控制线，避免 CH340 自动下载电路切换 BOOT0 或复位 MCU。
             ser.dtr = False
             ser.rts = False
             ser.open()

@@ -1,3 +1,8 @@
+/*
+ * UART 应用层分发器主机侧单元测试。
+ *
+ * 覆盖文本/二进制复用、错误帧尾部隔离、超时、复位、事件字段清理及连续帧恢复。
+ */
 #include "camera_uart_dispatcher.h"
 #include "protocol_crc32.h"
 
@@ -44,6 +49,7 @@ static const uint8_t s_crc_error_request[IMAGE_REQUEST_FRAME_SIZE] = {
     0x00U, 0xEBU, 0x45U, 0xB4U, 0xDBU, 0x0DU, 0x0AU
 };
 
+// 构造指定序号的合法二进制图像请求帧
 static void BuildValidRequestFrame(
     uint16_t seq,
     uint8_t frame[IMAGE_REQUEST_FRAME_SIZE])
@@ -69,6 +75,7 @@ static void BuildValidRequestFrame(
     frame[13] = IMAGE_REQUEST_EOF1;
 }
 
+// 用哨兵值填充事件，便于确认失败路径是否意外改写输出
 static void SetEventSentinel(CameraUartDispatchEvent_t *event)
 {
     event->type = CAMERA_UART_DISPATCH_BAD_ARGUMENT;
@@ -80,6 +87,7 @@ static void SetEventSentinel(CameraUartDispatchEvent_t *event)
     event->binary_result = IMAGE_REQUEST_PARSE_BAD_ARGUMENT;
 }
 
+// 检查事件中的图像请求字段是否已清零
 static int RequestFieldsAreZero(const CameraUartDispatchEvent_t *event)
 {
     return (event->image_request.version == 0U) &&
@@ -88,6 +96,7 @@ static int RequestFieldsAreZero(const CameraUartDispatchEvent_t *event)
            (event->image_request.payload_len == 0U);
 }
 
+// 检查事件是否为字段完整清零的无事件状态
 static int EventIsNone(const CameraUartDispatchEvent_t *event)
 {
     return (event->type == CAMERA_UART_DISPATCH_NONE) &&
@@ -96,6 +105,7 @@ static int EventIsNone(const CameraUartDispatchEvent_t *event)
            (event->binary_result == IMAGE_REQUEST_PARSE_NONE);
 }
 
+// 检查事件是否为预期文本字节
 static int EventIsText(const CameraUartDispatchEvent_t *event, uint8_t byte)
 {
     return (event->type == CAMERA_UART_DISPATCH_TEXT_BYTE) &&
@@ -104,6 +114,7 @@ static int EventIsText(const CameraUartDispatchEvent_t *event, uint8_t byte)
            (event->binary_result == IMAGE_REQUEST_PARSE_NONE);
 }
 
+// 检查事件是否为指定序号的合法图像请求
 static int EventIsImage(const CameraUartDispatchEvent_t *event, uint16_t seq)
 {
     return (event->type == CAMERA_UART_DISPATCH_IMAGE_REQUEST) &&
@@ -117,6 +128,7 @@ static int EventIsImage(const CameraUartDispatchEvent_t *event, uint16_t seq)
            (event->binary_result == IMAGE_REQUEST_PARSE_OK);
 }
 
+// 检查事件是否包含预期二进制解析结果
 static int EventIsBinaryResult(
     const CameraUartDispatchEvent_t *event,
     CameraUartDispatchResult_t event_type,
@@ -127,6 +139,7 @@ static int EventIsBinaryResult(
            (event->binary_result == parse_result);
 }
 
+// 检查二进制解析器是否已恢复初始状态
 static int ParserIsCleared(const ImageRequestParser_t *parser)
 {
     return (parser->state == IMAGE_REQUEST_STATE_SYNC0) &&
@@ -140,6 +153,7 @@ static int ParserIsCleared(const ImageRequestParser_t *parser)
            (parser->frame_active == 0U);
 }
 
+// 检查解析器是否只保留最新帧头起始字节
 static int ParserHasFreshSof(
     const ImageRequestParser_t *parser,
     uint32_t expected_time_ms)
@@ -155,6 +169,7 @@ static int ParserHasFreshSof(
            (parser->frame_active == 1U);
 }
 
+// 比较两个二进制解析器的全部运行字段
 static int ParserMatches(
     const ImageRequestParser_t *left,
     const ImageRequestParser_t *right)
@@ -170,6 +185,7 @@ static int ParserMatches(
            (left->frame_active == right->frame_active);
 }
 
+// 比较两个 UART 分发器的全部运行字段
 static int DispatcherMatches(
     const CameraUartDispatcher_t *left,
     const CameraUartDispatcher_t *right)
@@ -183,6 +199,7 @@ static int DispatcherMatches(
             right->binary_discard_last_time_ms);
 }
 
+// 连续输入一段数据并返回最后一次分发结果
 static CameraUartDispatchResult_t FeedData(
     CameraUartDispatcher_t *dispatcher,
     const uint8_t *data,
@@ -223,18 +240,21 @@ static CameraUartDispatchResult_t FeedData(
     return result;
 }
 
+// 验证空指针初始化不会访问内存
 static int TestInitNull(void)
 {
     CameraUartDispatcher_Init(NULL);
     return 1;
 }
 
+// 验证空指针复位不会访问内存
 static int TestResetNull(void)
 {
     CameraUartDispatcher_Reset(NULL);
     return 1;
 }
 
+// 验证输入空分发器时返回参数错误并清理事件
 static int TestFeedNullDispatcher(void)
 {
     CameraUartDispatchEvent_t event;
@@ -246,6 +266,7 @@ static int TestFeedNullDispatcher(void)
            EventIsNone(&event);
 }
 
+// 验证输出事件为空时返回参数错误且不破坏分发器
 static int TestFeedNullEvent(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -259,6 +280,7 @@ static int TestFeedNullEvent(void)
            DispatcherMatches(&dispatcher, &before);
 }
 
+// 验证超时检查对空参数的处理
 static int TestCheckTimeoutNull(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -281,6 +303,7 @@ static int TestCheckTimeoutNull(void)
            DispatcherMatches(&dispatcher, &before);
 }
 
+// 验证初始化后分发器处于完全清零的空闲状态
 static int TestInitIdle(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -295,6 +318,7 @@ static int TestInitIdle(void)
            (dispatcher.binary_discard_last_time_ms == 0U);
 }
 
+// 验证复位后分发器恢复空闲状态
 static int TestResetIdle(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -311,6 +335,7 @@ static int TestResetIdle(void)
            ParserIsCleared(&dispatcher.binary_parser);
 }
 
+// 验证普通文本字节按原值依次分发
 static int TestTextBytes(
     const uint8_t *data,
     size_t length,
@@ -335,6 +360,7 @@ static int TestTextBytes(
     return CameraUartDispatcher_GetMode(&dispatcher) == expected_mode;
 }
 
+// 验证回车不会提前结束文本模式
 static int TestCrKeepsText(void)
 {
     static const uint8_t data[] = {'H', '\r'};
@@ -344,6 +370,7 @@ static int TestCrKeepsText(void)
                          CAMERA_UART_DISPATCH_MODE_TEXT);
 }
 
+// 验证换行结束文本行并恢复空闲模式
 static int TestLfEndsText(void)
 {
     static const uint8_t data[] = {'H', '\n'};
@@ -353,6 +380,7 @@ static int TestLfEndsText(void)
                          CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证空闲状态下的换行按空文本行处理
 static int TestEmptyLf(void)
 {
     static const uint8_t data[] = {'\n'};
@@ -362,6 +390,7 @@ static int TestEmptyLf(void)
                          CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证连续空行不会破坏文本分发状态
 static int TestConsecutiveEmptyLines(void)
 {
     static const uint8_t data[] = {'\n', '\n', '\n'};
@@ -371,6 +400,7 @@ static int TestConsecutiveEmptyLines(void)
                          CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证文本行中的 0xA5 不会误启动二进制解析
 static int TestA5InsideText(void)
 {
     static const uint8_t data[] = {'H', IMAGE_REQUEST_SOF0};
@@ -380,6 +410,7 @@ static int TestA5InsideText(void)
                          CAMERA_UART_DISPATCH_MODE_TEXT);
 }
 
+// 验证长文本流保持有界状态且逐字节输出
 static int TestLongText(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -408,6 +439,7 @@ static int TestLongText(void)
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证文本行结束后紧随的 0xA5 可启动二进制候选帧
 static int TestLfThenA5(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -426,6 +458,7 @@ static int TestLfThenA5(void)
            ParserHasFreshSof(&dispatcher.binary_parser, 1U);
 }
 
+// 输入一帧数据并统计文本、图像和错误事件
 static int ParseFrame(
     const uint8_t frame[IMAGE_REQUEST_FRAME_SIZE],
     CameraUartDispatchEvent_t *event,
@@ -447,6 +480,7 @@ static int ParseFrame(
     return result;
 }
 
+// 验证固定合法帧只产生一次图像请求事件
 static int TestFixedFrameOneImage(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -465,6 +499,7 @@ static int TestFixedFrameOneImage(void)
            (image_count == 1U);
 }
 
+// 验证固定帧序号按小端序解析
 static int TestFixedFrameSeq(void)
 {
     CameraUartDispatchEvent_t event;
@@ -475,6 +510,7 @@ static int TestFixedFrameSeq(void)
            (event.image_request.seq == 0x1234U);
 }
 
+// 验证固定帧版本字段解析正确
 static int TestFixedFrameVersion(void)
 {
     CameraUartDispatchEvent_t event;
@@ -485,6 +521,7 @@ static int TestFixedFrameVersion(void)
            (event.image_request.version == 0x01U);
 }
 
+// 验证固定帧消息类型解析正确
 static int TestFixedFrameType(void)
 {
     CameraUartDispatchEvent_t event;
@@ -495,6 +532,7 @@ static int TestFixedFrameType(void)
            (event.image_request.msg_type == 0x20U);
 }
 
+// 验证固定帧载荷长度解析正确
 static int TestFixedFrameLength(void)
 {
     CameraUartDispatchEvent_t event;
@@ -505,6 +543,7 @@ static int TestFixedFrameLength(void)
            (event.image_request.payload_len == 0U);
 }
 
+// 验证完整二进制帧不会泄漏文本事件
 static int TestFullFrameNoText(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -524,6 +563,7 @@ static int TestFullFrameNoText(void)
     return (text_count == 0U) && (image_count == 1U);
 }
 
+// 验证合法帧完成后分发器恢复空闲
 static int TestFrameEndsIdle(void)
 {
     CameraUartDispatchEvent_t event;
@@ -534,6 +574,7 @@ static int TestFrameEndsIdle(void)
            (mode == CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证指定边界序号能够完整往返解析
 static int TestValidSeq(uint16_t seq)
 {
     CameraUartDispatchEvent_t event;
@@ -547,6 +588,7 @@ static int TestValidSeq(uint16_t seq)
            (mode == CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证连续两帧均只产生一次图像事件
 static int TestTwoFrames(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -578,6 +620,7 @@ static int TestTwoFrames(void)
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证二进制请求后可立即解析 HELP 文本
 static int TestBinaryThenHelp(void)
 {
     static const uint8_t help[] = {'H', 'E', 'L', 'P', '\n'};
@@ -607,6 +650,7 @@ static int TestBinaryThenHelp(void)
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证 HELP 文本后可立即解析二进制请求
 static int TestHelpThenBinary(void)
 {
     static const uint8_t help[] = {'H', 'E', 'L', 'P', '\n'};
@@ -633,6 +677,7 @@ static int TestHelpThenBinary(void)
            EventIsImage(&event, 0x1234U);
 }
 
+// 验证普通文本结束后可以重新同步二进制帧
 static int TestGarbageTextThenBinary(void)
 {
     static const uint8_t garbage[] = {0x00U, 0xFFU, 0x5AU, 'X', '\n'};
@@ -661,6 +706,7 @@ static int TestGarbageTextThenBinary(void)
            EventIsImage(&event, 0x1234U);
 }
 
+// 验证重复 0xA5 后的 0x5A 仍可形成合法帧头
 static int TestA5A55ASucceeds(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -680,6 +726,7 @@ static int TestA5A55ASucceeds(void)
            EventIsImage(&event, 0x1234U);
 }
 
+// 验证错误帧头字节回退为空闲且不产生错误事件
 static int TestA500(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -697,12 +744,14 @@ static int TestA500(void)
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 构造 CRC 字段损坏的完整请求帧
 static void BuildCrcErrorFrame(uint8_t frame[IMAGE_REQUEST_FRAME_SIZE])
 {
     BuildValidRequestFrame(0x3301U, frame);
     frame[8] ^= 0x01U;
 }
 
+// 验证 CRC 错误只产生一次二进制错误事件
 static int TestCrcErrorEvent(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -724,6 +773,7 @@ static int TestCrcErrorEvent(void)
                                IMAGE_REQUEST_PARSE_CRC_ERROR);
 }
 
+// 验证 CRC 错误帧不会泄漏文本字节
 static int TestCrcErrorNoText(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -744,6 +794,7 @@ static int TestCrcErrorNoText(void)
     return text_count == 0U;
 }
 
+// 验证 CRC 错误帧不会产生图像请求
 static int TestCrcErrorNoImage(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -764,6 +815,7 @@ static int TestCrcErrorNoImage(void)
     return image_count == 0U;
 }
 
+// 验证版本、类型或长度等早期字段错误的隔离行为
 static int TestEarlyFrameError(
     size_t byte_index,
     uint8_t bad_value,
@@ -790,6 +842,7 @@ static int TestEarlyFrameError(
                                expected_error);
 }
 
+// 验证错误帧隔离完成后可解析下一合法帧
 static int TestErrorThenValid(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -821,6 +874,7 @@ static int TestErrorThenValid(void)
            EventIsImage(&event, 0x1234U);
 }
 
+// 验证错误帧隔离完成后可解析下一文本命令
 static int TestErrorThenHelp(void)
 {
     static const uint8_t help[] = {'H', 'E', 'L', 'P', '\n'};
@@ -852,6 +906,7 @@ static int TestErrorThenHelp(void)
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证错误字段值为 0xA5 时不会误同步新帧
 static int TestErrorByteA5(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -873,6 +928,7 @@ static int TestErrorByteA5(void)
            ParserHasFreshSof(&dispatcher.binary_parser, 2U);
 }
 
+// 验证帧头同步失败不计为完整二进制帧错误
 static int TestHeaderFailureIsNotBinaryError(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -889,6 +945,7 @@ static int TestHeaderFailureIsNotBinaryError(void)
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证空闲状态超时检查不产生事件
 static int TestIdleTimeoutNone(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -904,6 +961,7 @@ static int TestIdleTimeoutNone(void)
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证文本模式不受二进制半帧超时影响
 static int TestTextTimeoutNone(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -921,6 +979,7 @@ static int TestTextTimeoutNone(void)
             CAMERA_UART_DISPATCH_MODE_TEXT);
 }
 
+// 验证二进制候选帧在指定时间边界的超时结果
 static int TestBinaryTimeoutAt(
     uint32_t elapsed_ms,
     CameraUartDispatchResult_t expected_result,
@@ -951,6 +1010,7 @@ static int TestBinaryTimeoutAt(
     return EventIsNone(&event);
 }
 
+// 验证半帧超时后分发器恢复空闲
 static int TestTimeoutEndsIdle(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -965,6 +1025,7 @@ static int TestTimeoutEndsIdle(void)
            ParserIsCleared(&dispatcher.binary_parser);
 }
 
+// 验证输入新字节时会先报告已到期候选帧
 static int TestFeedReportsOldTimeout(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -982,6 +1043,7 @@ static int TestFeedReportsOldTimeout(void)
            (event.type != CAMERA_UART_DISPATCH_TEXT_BYTE);
 }
 
+// 验证超时后的当前 0xA5 可作为新帧起点
 static int TestTimeoutCurrentA5(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -998,6 +1060,7 @@ static int TestTimeoutCurrentA5(void)
            ParserHasFreshSof(&dispatcher.binary_parser, 1100U);
 }
 
+// 验证毫秒计数回绕时的超时计算
 static int TestTickWrapTimeout(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1025,6 +1088,7 @@ static int TestTickWrapTimeout(void)
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证半帧超时后可继续解析文本
 static int TestTimeoutThenText(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1042,6 +1106,7 @@ static int TestTimeoutThenText(void)
             CAMERA_UART_DISPATCH_MODE_TEXT);
 }
 
+// 验证半帧超时后可继续解析完整二进制帧
 static int TestTimeoutThenBinary(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1062,6 +1127,7 @@ static int TestTimeoutThenBinary(void)
            EventIsImage(&event, 0x1234U);
 }
 
+// 验证无事件结果会清除旧请求字段
 static int TestNoneClearsRequestFields(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1075,6 +1141,7 @@ static int TestNoneClearsRequestFields(void)
            RequestFieldsAreZero(&event);
 }
 
+// 验证文本事件仅填充文本字节字段
 static int TestTextByteField(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1087,6 +1154,7 @@ static int TestTextByteField(void)
            (event.text_byte == (uint8_t)'Q');
 }
 
+// 验证图像请求事件填充全部业务字段
 static int TestImageRequestFields(void)
 {
     CameraUartDispatchEvent_t event;
@@ -1097,6 +1165,7 @@ static int TestImageRequestFields(void)
            EventIsImage(&event, 0x1234U);
 }
 
+// 验证二进制错误事件保留具体解析错误码
 static int TestBinaryErrorResultField(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1117,6 +1186,7 @@ static int TestBinaryErrorResultField(void)
            (event.binary_result == IMAGE_REQUEST_PARSE_CRC_ERROR);
 }
 
+// 验证超时事件写入对应二进制结果字段
 static int TestTimeoutResultField(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1130,6 +1200,7 @@ static int TestTimeoutResultField(void)
            (event.binary_result == IMAGE_REQUEST_PARSE_TIMEOUT);
 }
 
+// 验证复位会清除上一次请求内容
 static int TestResetRemovesOldRequest(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1157,6 +1228,7 @@ static int TestResetRemovesOldRequest(void)
            EventIsNone(&event);
 }
 
+// 验证后续无事件调用不会重复上一次事件
 static int TestNoRepeatedOldEvent(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1200,6 +1272,7 @@ typedef struct
     ImageRequestParseResult_t last_error_result;
 } DispatchEventCounts_t;
 
+// 按事件类型累计一次分发结果
 static void CountDispatchResult(
     CameraUartDispatchResult_t result,
     const CameraUartDispatchEvent_t *event,
@@ -1228,6 +1301,7 @@ static void CountDispatchResult(
     }
 }
 
+// 连续输入数据并累计各类分发事件
 static CameraUartDispatchResult_t FeedAndCountEvents(
     CameraUartDispatcher_t *dispatcher,
     const uint8_t *data,
@@ -1252,6 +1326,7 @@ static CameraUartDispatchResult_t FeedAndCountEvents(
     return result;
 }
 
+// 验证每个完整错误帧只报告一次错误
 static int TestCompleteErrorOnce(
     const uint8_t frame[IMAGE_REQUEST_FRAME_SIZE],
     ImageRequestParseResult_t expected_error)
@@ -1274,6 +1349,7 @@ static int TestCompleteErrorOnce(
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证完整错误帧隔离期间不产生文本事件
 static int TestCompleteErrorHasNoText(
     const uint8_t frame[IMAGE_REQUEST_FRAME_SIZE],
     ImageRequestParseResult_t expected_error)
@@ -1294,6 +1370,7 @@ static int TestCompleteErrorHasNoText(
            (counts.last_error_result == expected_error);
 }
 
+// 验证指定错误帧后文本命令仍可恢复
 static int TestBadFrameThenText(
     const uint8_t bad_frame[IMAGE_REQUEST_FRAME_SIZE],
     ImageRequestParseResult_t expected_error,
@@ -1326,6 +1403,7 @@ static int TestBadFrameThenText(
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证指定错误帧后合法二进制帧仍可恢复
 static int TestBadFrameThenBinary(
     const uint8_t bad_frame[IMAGE_REQUEST_FRAME_SIZE],
     ImageRequestParseResult_t expected_error)
@@ -1357,6 +1435,7 @@ static int TestBadFrameThenBinary(
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 构造版本错误后尚未丢完帧尾的隔离状态
 static int EnterPartialVersionDiscard(
     CameraUartDispatcher_t *dispatcher,
     CameraUartDispatchEvent_t *event,
@@ -1389,6 +1468,7 @@ static int EnterPartialVersionDiscard(
             CAMERA_UART_DISPATCH_MODE_BINARY);
 }
 
+// 验证错误尾部隔离在 99 ms 时仍保持有效
 static int TestDiscardAt99Ms(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1416,6 +1496,7 @@ static int TestDiscardAt99Ms(void)
             CAMERA_UART_DISPATCH_MODE_BINARY);
 }
 
+// 验证错误尾部隔离在 100 ms 边界结束
 static int TestDiscardAt100Ms(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1443,6 +1524,7 @@ static int TestDiscardAt100Ms(void)
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证隔离超时不会重复报告原二进制错误
 static int TestDiscardTimeoutNoSecondError(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1467,6 +1549,7 @@ static int TestDiscardTimeoutNoSecondError(void)
            (event.type != CAMERA_UART_DISPATCH_BINARY_ERROR);
 }
 
+// 验证错误尾部隔离结束不伪造半帧超时事件
 static int TestDiscardTimeoutNoTimeoutEvent(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1492,6 +1575,7 @@ static int TestDiscardTimeoutNoTimeoutEvent(void)
            (event.binary_result == IMAGE_REQUEST_PARSE_NONE);
 }
 
+// 验证错误尾部隔离超时后可解析文本
 static int TestDiscardTimeoutThenText(void)
 {
     static const uint8_t help[] = {'H', 'E', 'L', 'P', '\n'};
@@ -1524,6 +1608,7 @@ static int TestDiscardTimeoutThenText(void)
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证错误尾部隔离超时后可解析二进制帧
 static int TestDiscardTimeoutThenBinary(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1554,6 +1639,7 @@ static int TestDiscardTimeoutThenBinary(void)
            EventIsImage(&event, 0x1234U);
 }
 
+// 验证隔离期间复位可立即恢复空闲
 static int TestResetDuringDiscard(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1575,6 +1661,7 @@ static int TestResetDuringDiscard(void)
            (dispatcher.binary_discard_active == 0U);
 }
 
+// 验证复位清除全部错误尾部隔离字段
 static int TestResetClearsDiscardFields(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1597,6 +1684,7 @@ static int TestResetClearsDiscardFields(void)
            ParserIsCleared(&dispatcher.binary_parser);
 }
 
+// 验证隔离期间复位后可解析文本
 static int TestResetDiscardThenText(void)
 {
     static const uint8_t help[] = {'H', 'E', 'L', 'P', '\n'};
@@ -1628,6 +1716,7 @@ static int TestResetDiscardThenText(void)
             CAMERA_UART_DISPATCH_MODE_IDLE);
 }
 
+// 验证隔离期间复位后可解析二进制帧
 static int TestResetDiscardThenBinary(void)
 {
     CameraUartDispatcher_t dispatcher;
@@ -1657,6 +1746,7 @@ static int TestResetDiscardThenBinary(void)
            EventIsImage(&event, 0x1234U);
 }
 
+// 记录单项测试结果并输出失败名称
 static void RunTest(const char *name, int passed)
 {
     (void)name;
@@ -1671,6 +1761,7 @@ static void RunTest(const char *name, int passed)
     }
 }
 
+// 运行 UART 分发器全部主机侧单元测试
 int main(void)
 {
     static const uint8_t help_lf[] = {'H', 'E', 'L', 'P', '\n'};

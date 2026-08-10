@@ -8,6 +8,7 @@
 DCMI_HandleTypeDef g_camera_dcmi;   // 定义DCMI句柄
 DMA_HandleTypeDef  g_camera_dma;    // 定义DCMI使用的DMA句柄
 
+/* ISR 与任务共同访问快照标志；volatile 防止轮询读写被编译器缓存，8 位访问在本平台为原子操作。 */
 static volatile uint8_t s_camera_snapshot_active = 0U;
 static volatile uint8_t s_camera_snapshot_done = 0U;
 
@@ -17,7 +18,8 @@ static volatile uint8_t s_camera_snapshot_done = 0U;
  * VSYNC=PB7, HREF=PH8, PCLK=PA6
  */
 
-void Camera_DCMI_GPIO_Init(void)    // 初始化DCMI相关GPIO
+// 初始化 OV5640 DVP 对应的 DCMI GPIO
+void Camera_DCMI_GPIO_Init(void)
 {
     GPIO_InitTypeDef gpio = {0};    // 定义GPIO初始化结构体并清零
 
@@ -49,7 +51,8 @@ void Camera_DCMI_GPIO_Init(void)    // 初始化DCMI相关GPIO
     HAL_GPIO_Init(GPIOH, &gpio);  // 初始化PH8为HREF/HSYNC
 }
 
-void Camera_DCMI_Init(void)        // 初始化DCMI外设
+// 初始化 DCMI 外设及帧中断
+void Camera_DCMI_Init(void)
 {
     Camera_DCMI_GPIO_Init();       // 先初始化DCMI GPIO引脚
 
@@ -75,7 +78,7 @@ void Camera_DCMI_Init(void)        // 初始化DCMI外设
     HAL_NVIC_EnableIRQ(DCMI_IRQn);          // 使能DCMI中断
 }
 
-//启动 DCMI 快照，将一帧图像通过 DMA 保存到内存缓冲区
+// 启动 DCMI 快照，将一帧图像通过 DMA 保存到内存缓冲区
 uint8_t Camera_DCMI_StartSnapshotToBuffer(uint32_t buffer_addr, uint32_t word_count)
 {
     // 检查缓冲区地址非空、4 字节对齐，且传输数量不为 0
@@ -144,19 +147,19 @@ uint8_t Camera_DCMI_StartSnapshotToBuffer(uint32_t buffer_addr, uint32_t word_co
     return 0U;
 }
 
-//查询 DCMI 快照是否传输完成
+// 查询 ISR 更新的 DCMI 快照完成标志
 uint8_t Camera_DCMI_IsSnapshotDone(void)
 {
     return s_camera_snapshot_done;
 }
 
-//清除快照完成标志
+// 清除 DCMI 快照完成标志
 void Camera_DCMI_ClearSnapshotDone(void)
 {
     s_camera_snapshot_done = 0U;   // 复位标志，表示未完成
 }
 
-// 配置DMA把DCMI数据搬到LCD
+// 配置 DMA 将 DCMI 数据直接搬运到 LCD GRAM 数据口
 void Camera_DCMI_DMA_ConfigToLCD(uint32_t lcd_ram_addr)
 {
     __HAL_RCC_DMA2_CLK_ENABLE();  // 使能DMA2时钟
@@ -199,7 +202,7 @@ void Camera_DCMI_DMA_ConfigToLCD(uint32_t lcd_ram_addr)
                   1);                   // 传输长度，即传输计数器为1个单位
 }
 
-// 启动DCMI采集并显示到LCD
+// 启动 DCMI 连续采集并直接显示到 LCD
 void Camera_DCMI_StartToLCD(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
     LCD_MCU_SetWindow(x, y, w, h);  // 设置LCD显示窗口
@@ -210,23 +213,29 @@ void Camera_DCMI_StartToLCD(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
     SET_BIT(DCMI->CR, DCMI_CR_CAPTURE); // 启动DCMI捕获
 }
 
-void Camera_DCMI_Stop(void)  // 停止DCMI采集
+// 停止 DCMI 采集，并清除可能残留的快照活动状态
+void Camera_DCMI_Stop(void)
 {
     CLEAR_BIT(DCMI->CR, DCMI_CR_CAPTURE); // 停止DCMI捕获
     __HAL_DMA_DISABLE(&g_camera_dma);     // 关闭DMA
+    // 超时路径也会调用本函数，必须清除活动标志，避免后续帧中断被误判为旧快照完成。
+    s_camera_snapshot_active = 0U;
 }
 
-void DCMI_IRQHandler(void)  // DCMI中断服务函数
+// 将 DCMI 中断交给 HAL 处理
+void DCMI_IRQHandler(void)
 {
     HAL_DCMI_IRQHandler(&g_camera_dcmi);  // 交给HAL库处理中断
 }
 
-void DMA2_Stream1_IRQHandler(void)  // DMA2_Stream1中断服务函数
+// 将 DCMI 使用的 DMA2 Stream1 中断交给 HAL 处理
+void DMA2_Stream1_IRQHandler(void)
 {
     HAL_DMA_IRQHandler(&g_camera_dma);  // 交给HAL库处理DMA中断
 }
 
-void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)  // DCMI帧中断回调
+// 在帧事件中区分快照完成和连续显示路径
+void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
 {
     if (s_camera_snapshot_active != 0U)
     {

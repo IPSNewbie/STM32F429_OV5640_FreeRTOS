@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Stage 11C-5N: ATK official 1-bit polling read repeat test.
+"""Stage 11C-5N：ATK 官方 1-bit polling 重复读块测试。
 
-This script only drives text CLI diagnostics. It does not issue a binary image
-request, write the SD card, or change firmware configuration.
+本脚本只驱动已有文本 CLI 诊断，不发送二进制图像请求、不写 SD 卡，
+也不修改固件配置。
 """
 
 from __future__ import annotations
@@ -103,6 +103,7 @@ FULL_GPIO_READBACK_FIELDS = [
 
 
 def parse_blocks(text: str) -> List[int]:
+    """按响应边界拆分串口 CLI 文本块。"""
     values: List[int] = []
     for item in text.split(","):
         token = item.strip()
@@ -121,6 +122,7 @@ def parse_blocks(text: str) -> List[int]:
 
 
 def sanitize_tag(text: str) -> str:
+    """清洗标签，使其可安全用于文件名。"""
     tag = re.sub(r"[^A-Za-z0-9_-]+", "_", text.strip()).strip("_")
     if not tag:
         raise argparse.ArgumentTypeError("--tag 必须包含字母、数字、下划线或连字符")
@@ -128,6 +130,7 @@ def sanitize_tag(text: str) -> str:
 
 
 def parse_kv(text: str) -> Dict[str, str]:
+    """解析 CLI 响应中的键值字段。"""
     values: Dict[str, str] = {}
     for line in text.splitlines():
         match = re.match(r"\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$", line)
@@ -137,6 +140,7 @@ def parse_kv(text: str) -> Dict[str, str]:
 
 
 def get_int(values: Dict[str, str], key: str, default: int = -1) -> int:
+    """读取整数键值，缺失或非法时返回默认值。"""
     text = values.get(key)
     if text is None:
         return default
@@ -147,6 +151,7 @@ def get_int(values: Dict[str, str], key: str, default: int = -1) -> int:
 
 
 def classify_read(text: str, values: Dict[str, str]) -> str:
+    """根据读块响应字段归类测试结果。"""
     read_ok = "SD ATK1BREAD: block read OK" in text
     status_ok = (
         get_int(values, "atk_1bit_last_read_status") == 0
@@ -165,6 +170,7 @@ def classify_read(text: str, values: Dict[str, str]) -> str:
 
 
 def ordered_unique(values: Sequence[str]) -> List[str]:
+    """按首次出现顺序去除重复值。"""
     result: List[str] = []
     seen = set()
     for value in values:
@@ -175,6 +181,7 @@ def ordered_unique(values: Sequence[str]) -> List[str]:
 
 
 class UartSession:
+    """封装串口 CLI 与二进制图像请求会话。"""
     def __init__(
         self,
         port: str,
@@ -182,6 +189,7 @@ class UartSession:
         command_timeout: float,
         log: List[str],
     ) -> None:
+        """初始化测试会话及其运行状态。"""
         if serial is None:
             raise RuntimeError("未安装 pyserial，请先执行：pip install pyserial")
         self.command_timeout = command_timeout
@@ -193,6 +201,7 @@ class UartSession:
         self.ser.write_timeout = 2.0
         self.ser.rtscts = False
         self.ser.dsrdtr = False
+        # open 前关闭控制线，避免 CH340 自动下载电路切换 BOOT0 或复位 MCU。
         self.ser.dtr = False
         self.ser.rts = False
         self.ser.open()
@@ -205,10 +214,12 @@ class UartSession:
             self.log.append(startup.decode("utf-8", errors="replace").rstrip())
 
     def close(self) -> None:
+        """关闭串口或日志等会话资源。"""
         if self.ser.is_open:
             self.ser.close()
 
     def drain(self, max_time: float = 0.2) -> bytes:
+        """清空串口中本轮测试前的残留输入。"""
         deadline = time.monotonic() + max_time
         chunks: List[bytes] = []
         while time.monotonic() < deadline:
@@ -219,6 +230,7 @@ class UartSession:
         return b"".join(chunks)
 
     def read_until_quiet(self) -> bytes:
+        """持续读取响应，直到串口保持静默。"""
         started = time.monotonic()
         last_data = started
         quiet_time = min(0.45, max(0.1, self.command_timeout / 4.0))
@@ -239,6 +251,7 @@ class UartSession:
         return b"".join(chunks)
 
     def cli(self, command: str) -> str:
+        """发送一条 CLI 命令并读取完整文本响应。"""
         stale = self.drain()
         if stale:
             self.log.append("===== RX DRAINED BEFORE %s =====" % command)
@@ -255,6 +268,7 @@ class UartSession:
 
 
 def make_summary() -> Dict[str, str]:
+    """根据采样结果生成统计摘要。"""
     summary: Dict[str, str] = {
         "SD_ONLY_BOOT": "-1",
         "SD_ONLY_BOOT_SUPPORTED": "-1",
@@ -295,6 +309,7 @@ def make_summary() -> Dict[str, str]:
 
 
 def add_empty_block_summary(summary: Dict[str, str], block: int) -> None:
+    """记录未收到读块响应时的汇总结果。"""
     prefix = "BLOCK_%d_" % block
     summary[prefix + "RESULTS"] = ""
     summary[prefix + "PASS_COUNT"] = "0"
@@ -313,6 +328,7 @@ def update_block_summary(
     block: int,
     rows: Sequence[Dict[str, str]],
 ) -> None:
+    """用一次读块结果更新累计统计。"""
     prefix = "BLOCK_%d_" % block
     block_rows = [row for row in rows if row["block"] == str(block)]
     results = [row["result"] for row in block_rows]
@@ -336,6 +352,7 @@ def update_block_summary(
 
 
 def read_once(session: UartSession, block: int, index: int) -> Dict[str, str]:
+    """执行并记录一次 SD 读块测试。"""
     read_text = session.cli("SD ATK1BREAD %d" % block)
     status_text = session.cli("SD ATK1BSTATUS")
     combined = read_text + "\n" + status_text
@@ -414,6 +431,7 @@ def read_once(session: UartSession, block: int, index: int) -> Dict[str, str]:
 
 
 def safe_cli(session: UartSession, command: str, log: List[str]) -> str:
+    """执行 CLI 命令，并将异常转换为可记录结果。"""
     try:
         return session.cli(command)
     except Exception as exc:  # Continue best-effort recovery after serial errors.
@@ -426,6 +444,7 @@ def run_cleanup(
     summary: Dict[str, str],
     log: List[str],
 ) -> None:
+    """按既定顺序执行测试后的恢复命令。"""
     dump_text = safe_cli(session, "DUMP", log)
     dump_guard_markers = (
         "DUMP blocked: snapshot software guard active",
@@ -464,6 +483,7 @@ def run_cleanup(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """创建并配置命令行参数解析器。"""
     parser = argparse.ArgumentParser(
         description="Stage 11C-5O-3 SD-only full-GPIO ATK1B block-read statistics"
     )
@@ -478,6 +498,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    """解析参数并执行完整测试流程。"""
     args = build_parser().parse_args()
     if args.read_count <= 0:
         raise SystemExit("--read-count 必须大于 0")

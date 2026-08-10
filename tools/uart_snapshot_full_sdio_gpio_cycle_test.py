@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""完整 SDIO GPIO takeover 循环与恢复验证工具。"""
+
 import argparse
 import csv
 import re
@@ -115,6 +117,7 @@ def open_serial_port(args):
     ser.write_timeout = 2.0
     ser.rtscts = False
     ser.dsrdtr = False
+    # open 前关闭控制线，避免 CH340 自动下载电路切换 BOOT0 或复位 MCU。
     ser.dtr = False
     ser.rts = False
 
@@ -219,6 +222,7 @@ def validate_image_frame(frame):
 def find_valid_image_frame(data):
     """在 guard 期间收到的数据中查找并校验完整图像帧。"""
     search_start = 0
+    # 校验失败后从下一个字节继续找 magic，避免一处伪帧头让后续响应失步。
     while True:
         magic_index = data.find(IMAGE_MAGIC, search_start)
         if magic_index < 0:
@@ -242,6 +246,7 @@ def read_image_frame(ser, timeout_seconds):
         if chunk:
             data.extend(chunk)
 
+        # 文本响应可能与二进制帧相邻，按 magic 重新同步后再按固定帧长截取。
         magic_index = data.find(IMAGE_MAGIC)
         if magic_index >= 0:
             if magic_index > 0:
@@ -325,6 +330,7 @@ def write_summary(summary_path, args, stats, final_pass):
 
 
 def main():
+    """解析参数并执行完整测试流程。"""
     args = parse_args()
     args.tag = sanitize_tag(args.tag)
     captures_dir = Path("captures")

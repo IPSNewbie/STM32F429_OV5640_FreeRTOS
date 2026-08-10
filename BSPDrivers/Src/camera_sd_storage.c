@@ -1,18 +1,36 @@
-#include "camera_sd_storage.h"
+#include "camera_sd_storage.h"       // SD takeover、FatFs、BMP 和状态缓存公开接口
 
-#include "bsp_sccb.h"
-#include "camera_dcmi_dma.h"
-#include "camera_frame_buffer.h"
-#include "camera_rtos.h"
-#include "camera_snapshot_control.h"
-#include "ff.h"
-#include "diskio.h"
-#include "stm32f4xx_hal.h"
+#include "bsp_sccb.h"                // 保存、屏蔽和恢复 OV5640 0x3018 DVP pad
+#include "camera_dcmi_dma.h"         // 停止/恢复 DCMI 及 DMA 句柄关联
+#include "camera_frame_buffer.h"     // 获取已提交的稳定 front frame
+#include "camera_rtos.h"             // 复用 DUMP 的公共 RGB565 帧准备路径
+#include "camera_snapshot_control.h" // takeover guard、暂停状态和请求阻止统计
+#include "ff.h"                      // FatFs mount、stat、open、write、close API
+#include "diskio.h"                  // FatFs ioctl 命令和块设备返回类型
+#include "stm32f4xx_hal.h"           // SDIO、GPIO、时钟和 HAL SD polling API
 
-#include <stddef.h>
-#include <string.h>
+#include <stddef.h>                   // 提供 NULL
+#include <string.h>                   // staging 复制、BMP header 清零和文件名缓存复制
 
+//============================================================================
+// @file    camera_sd_storage.c
+// @brief   摄像头共享引脚接管、FatFs 挂载和 BMP24 快照保存模块
+//
+// 完整链路：公共 prepare frame → stable front → 独立 staging → 暂停 camera/guard →
+// 保存并屏蔽 OV5640 0x3018[6:4] → GPIO 从 DCMI AF13 切到 SDIO AF12 →
+// SDIO 1-bit polling → FatFs → 逐行 RGB565 转 BMP24 → 统一 cleanup/restore。
+//
+// 必须先准备并复制图像，因为 PC8/PC9/PC11 接管给 SDIO 后摄像头不能继续采集；
+// 仅取得 front 指针也不等于长期锁住双缓冲，staging 才能保证写卡期间数据稳定。
+// 本模块保持硬件验证过的 1-bit polling 策略，不启用 SDIO DMA/IRQ。
+// SD STATUS 只读 s_camera_sd_status 缓存；真实探测、mount 或 takeover 只能由显式命令触发。
+// 所有失败都进入统一清理，先完成仍依赖 SD 的文件/文件系统操作，再恢复共享硬件。
+//============================================================================
+
+// OV5640 DVP pad output enable 02；项目已验证 bit[4]/[5]/[6] 控制 D2/D3/D4。
 #define CAMERA_SD_DVP_PAD_OUTPUT_ENABLE02_REG 0x3018U
+// 0x8F=1000 1111b：保留其他位并清零 bit[6:4]，临时关闭 D2/D3/D4 输出。
+// D2/D3/D4 分别连接 PC8/PC9/PC11，并与 SDIO D0/D1/D3 复用。
 #define CAMERA_SD_DVP_CONFLICT_PAD_KEEP_MASK  0x8FU
 #define CAMERA_SD_REG_VALUE_UNKNOWN           0xFFFFFFFFU
 #define CAMERA_SD_FATFS_CARD_TIMEOUT_MS       1000U
@@ -32,11 +50,13 @@
 #define CAMERA_SD_FRAME_PREPARE_RETRY_DELAY_MS  75U
 #define CAMERA_SD_BMP_FILE_HEADER_SIZE           14U
 #define CAMERA_SD_BMP_INFO_HEADER_SIZE           40U
+// BMP 文件头 14 字节加 BITMAPINFOHEADER 40 字节，像素数据从偏移 54 开始。
 #define CAMERA_SD_BMP_HEADER_SIZE \
     (CAMERA_SD_BMP_FILE_HEADER_SIZE + CAMERA_SD_BMP_INFO_HEADER_SIZE)
 #define CAMERA_SD_BMP_BYTES_PER_PIXEL             3U
 #define CAMERA_SD_BMP_ROW_BYTES \
     (CAMERA_FB_WIDTH * CAMERA_SD_BMP_BYTES_PER_PIXEL)
+// BMP 行必须按 4 字节对齐；160x3=480 已自然对齐，所以 stride 仍为 480。
 #define CAMERA_SD_BMP_ROW_STRIDE \
     ((CAMERA_SD_BMP_ROW_BYTES + 3U) & ~3U)
 #define CAMERA_SD_BMP_IMAGE_SIZE \
@@ -87,29 +107,42 @@ static const CameraSdLine_t s_camera_sd_lines[] =
     {GPIOD, 2U}
 };
 
+// 表中依次为 PC8=D0、PC9=D1、PC10=D2、PC11=D3、PC12=CLK、PD2=CMD；
+// 接管后逐线回读模式/上下拉/速度/AF，固定数组使校验循环具有明确上界。
+
+/*
+ * 在接管 SDIO 引脚前复制前台帧，使写卡期间的数据不再依赖摄像头双缓冲状态。
+ * 38400 字节暂存区放在文件作用域，避免占用任务栈。
+ */
 static uint8_t s_camera_sd_snapshot_image_buffer[CAMERA_FB_SIZE_BYTES]
     __attribute__((aligned(4)));
 static uint8_t s_camera_sd_bmp_header[CAMERA_SD_BMP_HEADER_SIZE]
     __attribute__((aligned(4)));
+/* BMP 按行转为 BGR888，复用 480 字节行缓冲，避免额外申请 57600 字节全帧缓冲。 */
 static uint8_t s_camera_sd_bmp_row_buffer[CAMERA_SD_BMP_ROW_STRIDE]
     __attribute__((aligned(4)));
 static char s_camera_sd_candidate_file_name[
     CAMERA_SD_SNAPSHOT_FILE_NAME_SIZE];
 static char s_camera_sd_last_file_name[
     CAMERA_SD_SNAPSHOT_FILE_NAME_SIZE];
+// SD STATUS 的纯缓存来源；查询函数只复制它，不触发任何硬件访问。
 static CameraSdStorageStatus_t s_camera_sd_status;
 static SD_HandleTypeDef s_camera_sd_handle;
 static HAL_SD_CardInfoTypeDef s_camera_sd_card_info;
 static FATFS s_camera_sd_fatfs;
 static FIL s_camera_sd_file;
+// 以下阶段标志让“部分初始化失败”也能执行对称 cleanup，而不是只清理成功路径。
 static uint32_t s_camera_sd_full_gpio_af12_selected;
 static uint32_t s_camera_sd_clock_enabled;
 static uint32_t s_camera_sd_hal_init_attempted;
 static uint32_t s_camera_sd_card_info_valid;
+// mount 会回调 diskio，必须在 f_mount 前激活 session；写允许位阻止只读探测意外写卡。
 static uint32_t s_camera_sd_fatfs_session_active;
 static uint32_t s_camera_sd_fatfs_write_allowed;
+// FatFs 只返回通用 FRESULT，该字段保存更具体的 HAL/diskio 根因供上层诊断。
 static uint32_t s_camera_sd_fatfs_disk_error;
 
+// 更新最近一次 SD 操作的缓存错误信息
 static void Camera_SDStorage_SetLastError(uint32_t error_code)
 {
     s_camera_sd_status.last_error_code = error_code;
@@ -117,6 +150,7 @@ static void Camera_SDStorage_SetLastError(uint32_t error_code)
         Camera_SDStorage_ErrorToString(error_code);
 }
 
+// 更新最近一次图片保存的缓存错误信息
 static void Camera_SDStorage_SetSaveError(uint32_t error_code)
 {
     s_camera_sd_status.save_error_code = error_code;
@@ -124,6 +158,7 @@ static void Camera_SDStorage_SetSaveError(uint32_t error_code)
         Camera_SDStorage_ErrorToString(error_code);
 }
 
+// 按 IMGxxxx.BMP 规则格式化候选文件名
 static void Camera_SDStorage_FormatSnapshotFileName(uint32_t file_index)
 {
     s_camera_sd_candidate_file_name[0] = 'I';
@@ -144,6 +179,9 @@ static void Camera_SDStorage_FormatSnapshotFileName(uint32_t file_index)
     s_camera_sd_candidate_file_name[11] = '\0';
 }
 
+// 使用 f_stat 顺序寻找首个不存在的 IMG0001.BMP～IMG9999.BMP。
+// 循环最多 9999 次：FR_NO_FILE 成功退出，其他错误立即终止；后续 FA_CREATE_NEW
+// 仍会再次防止覆盖已有文件，因此扫描和创建之间的变化不会静默覆盖数据。
 static uint32_t Camera_SDStorage_FindNextSnapshotFileName(void)
 {
     FILINFO file_info;
@@ -173,12 +211,14 @@ static uint32_t Camera_SDStorage_FindNextSnapshotFileName(void)
     return CAMERA_SD_ERR_FILE_INDEX_FULL;
 }
 
+// 将 16 位数按 BMP 要求的小端格式写入字节数组
 static void Camera_SDStorage_WriteU16LE(uint8_t *destination, uint16_t value)
 {
     destination[0] = (uint8_t)(value & 0xFFU);
     destination[1] = (uint8_t)((value >> 8U) & 0xFFU);
 }
 
+// 将 32 位数按 BMP 要求的小端格式写入字节数组
 static void Camera_SDStorage_WriteU32LE(uint8_t *destination, uint32_t value)
 {
     destination[0] = (uint8_t)(value & 0xFFU);
@@ -187,6 +227,8 @@ static void Camera_SDStorage_WriteU32LE(uint8_t *destination, uint32_t value)
     destination[3] = (uint8_t)((value >> 24U) & 0xFFU);
 }
 
+// 构造 54 字节 BMP24 header："BM"、总大小、像素偏移、40 字节信息头、宽高、
+// plane=1、24 bpp 和图像大小。高度写成负数表示 top-down，可按源帧行序直接写出。
 static void Camera_SDStorage_BuildBmp24Header(void)
 {
     (void)memset(s_camera_sd_bmp_header, 0, sizeof(s_camera_sd_bmp_header));
@@ -214,6 +256,9 @@ static void Camera_SDStorage_BuildBmp24Header(void)
         CAMERA_SD_BMP_IMAGE_SIZE);
 }
 
+// 将暂存帧的一行 RGB565 转成 BMP BGR888。
+// RGB565 bit[15:11]=R5、bit[10:5]=G6、bit[4:0]=B5；高位复制扩展到 8 bit，
+// 再按 BMP 的 B、G、R 顺序写入 480 字节行缓冲。循环固定 160 个像素。
 static void Camera_SDStorage_ConvertBmp24Row(uint32_t row_index)
 {
     const uint8_t *source = &s_camera_sd_snapshot_image_buffer[
@@ -238,6 +283,9 @@ static void Camera_SDStorage_ConvertBmp24Row(uint32_t row_index)
     }
 }
 
+// 先写 54 字节 header，再固定循环 120 行，每行转换并写 480 字节。
+// 这样只复用 480 字节 row buffer，而不是额外占用 57600 字节 BGR888 全帧 RAM；
+// 每次同时检查 FRESULT 和实际写入长度，任一不符都进入主流程 cleanup。
 static uint32_t Camera_SDStorage_WriteBmp24(
     FIL *file,
     uint32_t *file_bytes_written)
@@ -295,6 +343,7 @@ static uint32_t Camera_SDStorage_WriteBmp24(
     return CAMERA_SD_OK;
 }
 
+// 将 FatFs 挂载结果写入只读状态缓存
 static void Camera_SDStorage_SetMountResult(FRESULT mount_result)
 {
     s_camera_sd_status.last_mount_result = (uint32_t)mount_result;
@@ -302,6 +351,7 @@ static void Camera_SDStorage_SetMountResult(FRESULT mount_result)
         (mount_result == FR_OK) ? "PASS" : "FAIL";
 }
 
+// 只保留清理链路遇到的第一个错误，避免后续错误覆盖根因
 static void Camera_SDStorage_RecordFirstError(
     uint32_t *first_error,
     uint32_t candidate)
@@ -314,6 +364,7 @@ static void Camera_SDStorage_RecordFirstError(
     }
 }
 
+// 确保 SDIO 接管恢复前 DCMI 与原 DMA 句柄仍保持关联
 static void Camera_SDStorage_EnsureDcmiDmaHandle(void)
 {
     if (g_camera_dcmi.DMA_Handle == NULL)
@@ -322,6 +373,8 @@ static void Camera_SDStorage_EnsureDcmiDmaHandle(void)
     }
 }
 
+// 轮询等待 SD 卡回到 TRANSFER，卡错误/断开或 1000 ms timeout 均退出。
+// 每轮 HAL_Delay(1) 避免 CPU 纯忙转；只有 TRANSFER 后才能安全开始下一次块操作。
 static uint32_t Camera_SDStorage_WaitForCardTransfer(void)
 {
     uint32_t start_tick = HAL_GetTick();
@@ -349,6 +402,7 @@ static uint32_t Camera_SDStorage_WaitForCardTransfer(void)
     }
 }
 
+// 读取指定 GPIO 的模式字段
 static uint32_t Camera_SDStorage_GetPinMode(
     GPIO_TypeDef *port,
     uint32_t pin_number)
@@ -356,6 +410,7 @@ static uint32_t Camera_SDStorage_GetPinMode(
     return (port->MODER >> (pin_number * 2U)) & 0x3U;
 }
 
+// 读取指定 GPIO 的上下拉字段
 static uint32_t Camera_SDStorage_GetPinPull(
     GPIO_TypeDef *port,
     uint32_t pin_number)
@@ -363,6 +418,7 @@ static uint32_t Camera_SDStorage_GetPinPull(
     return (port->PUPDR >> (pin_number * 2U)) & 0x3U;
 }
 
+// 读取指定 GPIO 的速度字段
 static uint32_t Camera_SDStorage_GetPinSpeed(
     GPIO_TypeDef *port,
     uint32_t pin_number)
@@ -370,6 +426,7 @@ static uint32_t Camera_SDStorage_GetPinSpeed(
     return (port->OSPEEDR >> (pin_number * 2U)) & 0x3U;
 }
 
+// 读取指定 GPIO 的复用功能编号
 static uint32_t Camera_SDStorage_GetPinAf(
     GPIO_TypeDef *port,
     uint32_t pin_number)
@@ -382,6 +439,7 @@ static uint32_t Camera_SDStorage_GetPinAf(
     return (port->AFR[1] >> ((pin_number - 8U) * 4U)) & 0xFU;
 }
 
+// 校验全部 SDIO 引脚是否已切换为 AF12 推挽上拉配置
 static uint32_t Camera_SDStorage_VerifyFullGpioAf12(void)
 {
     uint32_t index;
@@ -407,6 +465,7 @@ static uint32_t Camera_SDStorage_VerifyFullGpioAf12(void)
     return 1U;
 }
 
+// 先把 DCMI/SDIO 冲突引脚置为输入，避免两端在切换瞬间同时驱动总线
 static uint32_t Camera_SDStorage_ReleaseConflictPins(void)
 {
     GPIO_InitTypeDef gpio = {0};
@@ -426,6 +485,7 @@ static uint32_t Camera_SDStorage_ReleaseConflictPins(void)
     return CAMERA_SD_OK;
 }
 
+// 将 PC8、PC9、PC11 从 DCMI AF13 切换到 SDIO AF12
 static uint32_t Camera_SDStorage_SwitchConflictPinsToSdioAf12(void)
 {
     GPIO_InitTypeDef gpio = {0};
@@ -453,6 +513,7 @@ static uint32_t Camera_SDStorage_SwitchConflictPinsToSdioAf12(void)
     return CAMERA_SD_OK;
 }
 
+// 配置完整 SDIO 1-bit 所需 GPIO，并提前标记接管以保证失败时也会清理
 static uint32_t Camera_SDStorage_SwitchFullSdioGpioToAf12(void)
 {
     GPIO_InitTypeDef gpio = {0};
@@ -480,6 +541,7 @@ static uint32_t Camera_SDStorage_SwitchFullSdioGpioToAf12(void)
     return CAMERA_SD_OK;
 }
 
+// 退出接管时先把全部 SDIO GPIO 置为高阻输入
 static uint32_t Camera_SDStorage_LeaveFullSdioGpioToInput(void)
 {
     GPIO_InitTypeDef gpio = {0};
@@ -505,6 +567,7 @@ static uint32_t Camera_SDStorage_LeaveFullSdioGpioToInput(void)
     return CAMERA_SD_OK;
 }
 
+// 将共享数据线恢复为摄像头 DCMI AF13 配置
 static uint32_t Camera_SDStorage_RestoreConflictPins(void)
 {
     GPIO_InitTypeDef gpio = {0};
@@ -531,6 +594,7 @@ static uint32_t Camera_SDStorage_RestoreConflictPins(void)
     return CAMERA_SD_OK;
 }
 
+// 按接管前状态恢复快照保护、DCMI/DMA 关联和连续采集链路
 static uint32_t Camera_SDStorage_RestoreCameraLink(
     uint32_t restore_continuous_capture,
     uint32_t verify_sdio_inputs)
@@ -593,6 +657,9 @@ static uint32_t Camera_SDStorage_RestoreCameraLink(
     return result;
 }
 
+// 填充当前硬件验证过的 SDIO 1-bit polling 参数。
+// 即使 GPIO 表包含完整 SDIO 线，也不代表启用 4-bit；读写仍调用 HAL_SD_*Blocks polling，
+// 不使用 SDIO DMA/IRQ，避免引入额外并发与恢复依赖。
 static void Camera_SDStorage_PrepareSdHandle(void)
 {
     s_camera_sd_handle.Instance = SDIO;
@@ -605,18 +672,21 @@ static void Camera_SDStorage_PrepareSdHandle(void)
     s_camera_sd_handle.Init.ClockDiv = CAMERA_SD_INIT_CLOCK_DIV;
 }
 
+// 打开 SDIO 外设时钟并记录状态
 static void Camera_SDStorage_EnableSdioClock(void)
 {
     __HAL_RCC_SDIO_CLK_ENABLE();
     s_camera_sd_clock_enabled = 1U;
 }
 
+// 关闭 SDIO 外设时钟并记录状态
 static void Camera_SDStorage_DisableSdioClock(void)
 {
     __HAL_RCC_SDIO_CLK_DISABLE();
     s_camera_sd_clock_enabled = 0U;
 }
 
+// 初始化 SD 存储状态缓存，不访问 SD 卡或共享硬件
 void Camera_SDStorage_InitState(void)
 {
     memset(&s_camera_sd_status, 0, sizeof(s_camera_sd_status));
@@ -668,6 +738,7 @@ void Camera_SDStorage_InitState(void)
     Camera_SDStorage_SetLastError(CAMERA_SD_OK);
 }
 
+// 仅读取缓存状态；SD STATUS 通过本接口查询，不能在查询时 mount、takeover 或访问卡。
 void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status)
 {
     if (status != NULL)
@@ -676,6 +747,9 @@ void Camera_SDStorage_GetStatus(CameraSdStorageStatus_t *status)
     }
 }
 
+// 保存 0x3018 后与 0x8F 相与，清零 bit[6:4] 并回读验证。
+// 这会关闭共享的 D2/D3/D4 pad，使 OV5640 不再驱动 PC8/PC9/PC11；只有完成这一步，
+// STM32 才能安全把 GPIO 从 DCMI AF13 切到 SDIO AF12。
 uint32_t Camera_SDStorage_StopDvpConflictPads(void)
 {
     uint32_t result = CAMERA_SD_OK;
@@ -737,6 +811,7 @@ uint32_t Camera_SDStorage_StopDvpConflictPads(void)
     return result;
 }
 
+// 恢复接管前保存的 OV5640 0x3018 DVP 输出配置
 uint32_t Camera_SDStorage_RestoreDvpConflictPads(void)
 {
     uint32_t result = CAMERA_SD_OK;
@@ -791,6 +866,7 @@ uint32_t Camera_SDStorage_RestoreDvpConflictPads(void)
     return result;
 }
 
+// 在摄像头已暂停且 DVP 已屏蔽后，将共享 GPIO 接管给 SDIO
 uint32_t Camera_SDStorage_RequestTakeoverEnter(void)
 {
     uint32_t result;
@@ -816,6 +892,9 @@ uint32_t Camera_SDStorage_RequestTakeoverEnter(void)
     return result;
 }
 
+// 在 DVP 已屏蔽、GPIO 已 takeover 后按 1-bit polling 初始化 SD 卡并读取容量信息。
+// HAL_SD_Init 不能提前调用，否则 OV5640 仍可能驱动共享数据线；任何失败由 exit/cleanup
+// 根据 hal_init_attempted、clock_enabled 和 GPIO 阶段标志对称恢复。
 uint32_t Camera_SDStorage_RequestInit(void)
 {
     HAL_StatusTypeDef hal_status;
@@ -874,6 +953,7 @@ uint32_t Camera_SDStorage_RequestInit(void)
     return result;
 }
 
+// 反初始化 SD、关闭时钟并把 SDIO GPIO 退出到安全输入态
 uint32_t Camera_SDStorage_RequestTakeoverExit(void)
 {
     uint32_t result = CAMERA_SD_OK;
@@ -915,6 +995,7 @@ uint32_t Camera_SDStorage_RequestTakeoverExit(void)
     return result;
 }
 
+// 向 FatFs 适配层返回当前磁盘就绪状态
 uint32_t Camera_SDStorage_FatFsDiskStatus(void)
 {
     if ((s_camera_sd_fatfs_session_active == 0U) ||
@@ -929,6 +1010,7 @@ uint32_t Camera_SDStorage_FatFsDiskStatus(void)
         CAMERA_SD_OK : CAMERA_SD_ERR_FATFS_DISK_NOT_READY;
 }
 
+// 校验当前接管会话是否已具备 FatFs 磁盘访问条件
 uint32_t Camera_SDStorage_FatFsDiskInitialize(void)
 {
     uint32_t result;
@@ -951,6 +1033,7 @@ uint32_t Camera_SDStorage_FatFsDiskInitialize(void)
     return result;
 }
 
+// 通过 HAL SD polling 接口读取 FatFs 请求的连续扇区
 uint32_t Camera_SDStorage_FatFsDiskRead(
     uint8_t *buffer,
     uint32_t sector,
@@ -968,6 +1051,11 @@ uint32_t Camera_SDStorage_FatFsDiskRead(
              (s_camera_sd_card_info_valid == 0U))
     {
         result = CAMERA_SD_ERR_FATFS_DISK_NOT_READY;
+    }
+    else if ((sector >= s_camera_sd_card_info.LogBlockNbr) ||
+             (count > (s_camera_sd_card_info.LogBlockNbr - sector)))
+    {
+        result = CAMERA_SD_ERR_INVALID_ARGUMENT;
     }
     else
     {
@@ -1001,6 +1089,7 @@ uint32_t Camera_SDStorage_FatFsDiskRead(
     return result;
 }
 
+// 仅在显式允许写入的会话中写入 FatFs 请求的连续扇区
 uint32_t Camera_SDStorage_FatFsDiskWrite(
     const uint8_t *buffer,
     uint32_t sector,
@@ -1019,6 +1108,11 @@ uint32_t Camera_SDStorage_FatFsDiskWrite(
              (s_camera_sd_card_info_valid == 0U))
     {
         result = CAMERA_SD_ERR_FATFS_DISK_NOT_READY;
+    }
+    else if ((sector >= s_camera_sd_card_info.LogBlockNbr) ||
+             (count > (s_camera_sd_card_info.LogBlockNbr - sector)))
+    {
+        result = CAMERA_SD_ERR_INVALID_ARGUMENT;
     }
     else
     {
@@ -1054,6 +1148,7 @@ uint32_t Camera_SDStorage_FatFsDiskWrite(
     return result;
 }
 
+// 处理 FatFs 同步和介质参数查询命令
 uint32_t Camera_SDStorage_FatFsDiskIoctl(uint8_t command, void *buffer)
 {
     uint32_t result = CAMERA_SD_OK;
@@ -1102,6 +1197,7 @@ uint32_t Camera_SDStorage_FatFsDiskIoctl(uint8_t command, void *buffer)
     return result;
 }
 
+// 执行一次挂载检查，并无条件沿统一清理路径恢复摄像头硬件状态
 uint32_t Camera_SDStorage_CheckFatfsMount(void)
 {
     uint32_t result = CAMERA_SD_OK;
@@ -1171,6 +1267,7 @@ uint32_t Camera_SDStorage_CheckFatfsMount(void)
         goto cleanup;
     }
 
+    // f_mount(...,1) 会立即识别卷并回调 diskio；必须先激活 session 让 diskio 访问既有卡。
     s_camera_sd_fatfs_session_active = 1U;
     mount_attempted = 1U;
     mount_result = f_mount(&s_camera_sd_fatfs, "", 1U);
@@ -1186,8 +1283,10 @@ uint32_t Camera_SDStorage_CheckFatfsMount(void)
     s_camera_sd_status.fatfs_ready = 1U;
 
 cleanup:
+    // 即使挂载检查中途失败，也必须先卸载文件系统，再退出 SDIO 接管并恢复 DVP/DCMI。
     if (mount_attempted != 0U)
     {
+        // 卸载必须发生在 HAL SD、时钟和 GPIO 仍可访问时，之后才能退出 takeover。
         mount_result = f_mount(NULL, "", 0U);
         if (mount_result != FR_OK)
         {
@@ -1225,6 +1324,7 @@ cleanup:
     return result;
 }
 
+// 获取并校验固定 160x120 RGB565 前台帧元数据
 static uint32_t Camera_SDStorage_GetValidatedFrontFrame(
     CameraFrame_t *front_frame)
 {
@@ -1245,6 +1345,9 @@ static uint32_t Camera_SDStorage_GetValidatedFrontFrame(
     return CAMERA_SD_OK;
 }
 
+// 将 front 完整复制到文件作用域 staging，并扫描固定 38400 字节计算非零数/校验和。
+// 取得 front 指针并不会锁住双缓冲；独立副本才允许后续暂停摄像头和长时间写卡。
+// 扫描循环有固定帧长，无硬件等待，用于拒绝明显全零帧而不是替代 CRC。
 static uint32_t Camera_SDStorage_StageFrontFrame(
     uint32_t *source_nonzero,
     uint32_t *source_sum32)
@@ -1266,6 +1369,7 @@ static uint32_t Camera_SDStorage_StageFrontFrame(
         return result;
     }
 
+    // front buffer 仍属于双缓冲采集链路；复制后写卡过程使用独立、稳定的数据快照。
     (void)memcpy(
         s_camera_sd_snapshot_image_buffer,
         front_frame.data,
@@ -1292,6 +1396,9 @@ static uint32_t Camera_SDStorage_StageFrontFrame(
     return CAMERA_SD_OK;
 }
 
+// 在摄像头仍可工作时复用 DUMP 的 Camera_RTOS_PrepareRgb565Frame，再立即复制 front。
+// 最多 3 次重试即共 4 次尝试，只对“准备成功但 staging 判定空帧”重试；
+// RTOS 采集错误或 timeout 直接退出。复制完成后才暂停 camera，可缩短图像链路停机时间。
 static uint32_t Camera_SDStorage_PrepareAndStageFrontFrame(
     CameraSdSnapshotResult_t *result_info)
 {
@@ -1305,6 +1412,7 @@ static uint32_t Camera_SDStorage_PrepareAndStageFrontFrame(
     }
 
     result_info->prepare_text = "FAIL";
+    // retry_count 从 0 到 3，循环具有明确上界；重试间由固定延时隔开。
     for (retry_count = 0U;
          retry_count <= CAMERA_SD_FRAME_PREPARE_MAX_RETRIES;
          ++retry_count)
@@ -1343,20 +1451,23 @@ static uint32_t Camera_SDStorage_PrepareAndStageFrontFrame(
     return CAMERA_SD_ERR_FRAME_EMPTY;
 }
 
+// 执行完整 SD SNAPSHOT 状态机，并让所有成功/失败分支汇合到统一 cleanup。
+// prepare/staging 完成后才设置 guard、屏蔽 0x3018 和 takeover，随后 mount、找名、
+// FA_CREATE_NEW 打开、逐行写 BMP；任一步失败都保留首个根因并继续恢复其余资源。
 uint32_t Camera_SDStorage_SaveSnapshotFrame(
     CameraSdSnapshotResult_t *snapshot_result)
 {
-    CameraSdSnapshotResult_t result_info;
-    uint32_t result = CAMERA_SD_OK;
-    uint32_t cleanup_result = CAMERA_SD_OK;
-    uint32_t restore_result = CAMERA_SD_OK;
-    uint32_t step_result;
-    uint32_t camera_restore_required = 0U;
-    uint32_t dvp_restore_required = 0U;
-    uint32_t takeover_attempted = 0U;
-    uint32_t mount_attempted = 0U;
-    uint32_t file_opened = 0U;
-    uint32_t restore_continuous_capture = 0U;
+    CameraSdSnapshotResult_t result_info;  // 返回 CLI 的文件、阶段、耗时和诊断统计
+    uint32_t result = CAMERA_SD_OK;        // 保留业务/cleanup 遇到的第一个总错误
+    uint32_t cleanup_result = CAMERA_SD_OK; // 文件、卸载及 takeover 清理结果
+    uint32_t restore_result = CAMERA_SD_OK; // DVP/DCMI 图像链路恢复结果
+    uint32_t step_result;                  // 当前阶段的临时返回码
+    uint32_t camera_restore_required = 0U; // guard 已进入，最终必须恢复 camera link
+    uint32_t dvp_restore_required = 0U;    // 已保存过原 0x3018，后续无论 mask 成败都尝试恢复
+    uint32_t takeover_attempted = 0U;      // 调用前置位，覆盖 GPIO 部分切换后失败的清理
+    uint32_t mount_attempted = 0U;         // f_mount 已调用，cleanup 必须尝试 unmount
+    uint32_t file_opened = 0U;             // FIL 已打开，必须先 f_close 再卸载
+    uint32_t restore_continuous_capture = 0U; // 记录接管前是否需恢复连续 LCD 采集
     uint32_t file_bytes_written = 0U;
     uint32_t total_start_tick = HAL_GetTick();
     uint32_t prepare_start_tick;
@@ -1418,6 +1529,7 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
     Camera_SDStorage_EnsureDcmiDmaHandle();
     camera_restore_required = 1U;
     prepare_start_tick = HAL_GetTick();
+    // 先准备并复制完整图像，再暂停摄像头和接管共享引脚，缩短图像链路停机时间。
     step_result = Camera_SDStorage_PrepareAndStageFrontFrame(&result_info);
     result_info.prepare_ms = HAL_GetTick() - prepare_start_tick;
     if (step_result != CAMERA_SD_OK)
@@ -1460,6 +1572,7 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
         goto cleanup;
     }
 
+    // 激活 session 后立即挂载；成功后 f_stat/f_open/f_write 才能使用该卷。
     s_camera_sd_fatfs_session_active = 1U;
     mount_attempted = 1U;
     fatfs_result = f_mount(&s_camera_sd_fatfs, "", 1U);
@@ -1510,6 +1623,13 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
     result_info.write_text = "PASS";
 
 cleanup:
+    /*
+     * 清理顺序不能颠倒：
+     * 1. f_close 先把 FatFs 缓存刷新到仍可访问的卡；2. 禁止继续写；3. unmount；
+     * 4. 结束 FatFs session；5. HAL_SD_DeInit、关闭 SDIO clock、GPIO 退出 AF12；
+     * 6. 恢复保存的 0x3018，让 OV5640 重新驱动 DVP；7. 恢复 DCMI/DMA 及原连续采集。
+     * RecordFirstError 保留最早根因，但后续清理仍全部执行，避免错误覆盖或资源残留。
+     */
     cleanup_start_tick = HAL_GetTick();
     if (file_opened != 0U)
     {
@@ -1529,6 +1649,7 @@ cleanup:
 
     if (mount_attempted != 0U)
     {
+        // SDIO 尚可访问时卸载，不能等到 DeInit/关时钟后再调用 FatFs。
         fatfs_result = f_mount(NULL, "", 0U);
         if (fatfs_result != FR_OK)
         {
@@ -1606,6 +1727,7 @@ cleanup:
     return result;
 }
 
+// 将 SD 存储错误码转换为稳定的状态文本
 const char *Camera_SDStorage_ErrorToString(uint32_t error_code)
 {
     switch (error_code)

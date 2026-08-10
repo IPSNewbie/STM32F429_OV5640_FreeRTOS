@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""SD SNAPSHOT 命令稳定性测试与状态核对工具。"""
+
 import argparse
 import csv
 import re
@@ -99,18 +101,22 @@ class RunLogger:
     """同时输出控制台信息并保存完整命令响应。"""
 
     def __init__(self, path):
+        """初始化测试会话及其运行状态。"""
         self.path = path
         self._file = path.open("w", encoding="utf-8")
 
     def close(self):
+        """关闭串口或日志等会话资源。"""
         self._file.close()
 
     def emit(self, message=""):
+        """同时输出并记录一行测试日志。"""
         print(message)
         self._file.write(message + "\n")
         self._file.flush()
 
     def transcript(self, command, lines):
+        """返回当前内存中的完整日志文本。"""
         self._file.write(f"\n>>> {command}\\r\\n\n")
         if lines:
             for line in lines:
@@ -121,6 +127,7 @@ class RunLogger:
 
 
 def parse_arguments():
+    """解析命令行参数。"""
     parser = argparse.ArgumentParser(
         description="连续执行SD SNAPSHOT并统计BMP保存稳定性。"
     )
@@ -149,6 +156,7 @@ def parse_arguments():
 
 
 def validate_arguments(args):
+    """校验命令行参数范围。"""
     if not args.port:
         raise ValueError("port不能为空。")
     if args.baud <= 0:
@@ -162,6 +170,7 @@ def validate_arguments(args):
 
 
 def build_output_paths(output_directory):
+    """按时间戳生成本轮测试输出路径。"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     prefix = f"sd_snapshot_stability_{timestamp}"
     return (
@@ -179,6 +188,7 @@ def open_serial_port(port_name, baudrate):
     port.write_timeout = 2.0
     port.rtscts = False
     port.dsrdtr = False
+    # open 前关闭控制线，避免 CH340 自动下载电路切换 BOOT0 或复位 MCU。
     port.dtr = False
     port.rts = False
 
@@ -266,6 +276,7 @@ def parse_all_indented_fields(lines):
 
 
 def parse_integer(value):
+    """按自动进制解析整数文本。"""
     if value is None or value == "":
         return None
     try:
@@ -275,6 +286,7 @@ def parse_integer(value):
 
 
 def parse_snapshot_fields(lines):
+    """解析 SD SNAPSHOT 响应中的状态字段。"""
     parsed, block_found = parse_key_value_block(lines, SNAPSHOT_HEADER)
     result = {field: parsed.get(field, "") for field in SNAPSHOT_FIELDS}
     for field in NUMERIC_FIELDS:
@@ -283,6 +295,7 @@ def parse_snapshot_fields(lines):
 
 
 def extract_file_index(file_name):
+    """从 IMGxxxx.BMP 文件名中提取递增编号。"""
     match = FILE_NAME_PATTERN.fullmatch(file_name or "")
     if match is None:
         return None
@@ -291,6 +304,7 @@ def extract_file_index(file_name):
 
 
 def validate_snapshot(fields, block_found, communication_error):
+    """核对 SD SNAPSHOT 响应的文件与耗时字段。"""
     reasons = []
     if communication_error:
         reasons.append(communication_error)
@@ -315,11 +329,13 @@ def validate_snapshot(fields, block_found, communication_error):
 
 
 def status_health_ok(fields):
+    """检查 RTOS 缓存状态是否健康。"""
     names = ("hook_fault", "uart_dma_error", "stream_overflow", "refresh_skip")
     return all(parse_integer(fields.get(name)) == 0 for name in names)
 
 
 def sd_status_health_ok(fields):
+    """检查缓存的 SD 状态是否健康。"""
     return (
         fields.get("last_snapshot") == "PASS"
         and fields.get("save_error") == "OK"
@@ -328,12 +344,14 @@ def sd_status_health_ok(fields):
 
 
 def metric_summary(values):
+    """计算耗时指标的最小值、最大值和平均值。"""
     if not values:
         return "N/A", "N/A", "N/A"
     return min(values), max(values), f"{sum(values) / len(values):.2f}"
 
 
 def main():
+    """解析参数并执行完整测试流程。"""
     args = parse_arguments()
     if serial is None:
         print("[ERROR] 缺少pyserial，请先安装后再运行本工具。")

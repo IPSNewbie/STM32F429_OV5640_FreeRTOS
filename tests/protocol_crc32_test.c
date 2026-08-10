@@ -1,3 +1,8 @@
+/*
+ * 协议 CRC32 主机侧单元测试。
+ *
+ * 使用标准向量验证一次性、逐字节、分块、空数据和空指针保护路径结果一致。
+ */
 #include "protocol_crc32.h"
 
 #include <stdio.h>
@@ -5,6 +10,7 @@
 #define PROTOCOL_CRC32_TEST_EXPECTED       0xCBF43926U
 #define PROTOCOL_CRC32_EMPTY_EXPECTED      0x00000000U
 
+// 比较 CRC32 实际值与期望值并输出失败详情
 static int Protocol_CRC32_Check(const char *name,
                                 uint32_t actual,
                                 uint32_t expected)
@@ -22,6 +28,7 @@ static int Protocol_CRC32_Check(const char *name,
     return 1;
 }
 
+// 运行 CRC32 全部标准向量和边界测试
 int main(void)
 {
     static const uint8_t test_data[] = "123456789";
