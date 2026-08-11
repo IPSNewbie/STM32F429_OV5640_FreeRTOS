@@ -8,11 +8,11 @@
 
 //============================================================================
 // @file    uart_rx_dma.c
-// @brief   USART1 循环 DMA 到 CameraServiceTask 的静态接收通道
+// @brief   USART1 循环 DMA 到 CommTask 的静态接收通道
 //
-// 数据路径：circular DMA → HT/TC/IDLE ISR → StreamBuffer → CameraServiceTask。
+// 数据路径：circular DMA → HT/TC/IDLE ISR → StreamBuffer → CommTask。
 // DMA 持续写固定环形数组；HAL 回调给出当前写位置，本模块只搬运上次位置之后的
-// 新增区间。CameraServiceTask 再以有界阻塞 API 读取，协议解析不在 ISR 中执行。
+// 新增区间。CommTask 再以有界阻塞 API 读取，协议解析不在 ISR 中执行。
 //
 // ISR 只调用 FromISR API、更新轻量统计并设置错误/溢出标志。UART 硬件错误时，
 // HAL Abort、清错误位和重启 DMA 延后到任务上下文，避免在中断内执行复杂恢复。
@@ -28,7 +28,7 @@
 static uint8_t s_uart_rx_dma_buffer[UART_RX_DMA_BUFFER_SIZE];
 // StreamBuffer 的静态字节存储，额外 1 字节不计入对外有效容量。
 static uint8_t s_uart_rx_stream_storage[UART_RX_STREAM_BUFFER_SIZE + 1U];
-// 静态控制块和句柄连接 ISR producer 与 CameraServiceTask consumer。
+// 静态控制块和句柄连接 ISR producer 与 CommTask consumer。
 static StaticStreamBuffer_t s_uart_rx_stream_control;
 static StreamBufferHandle_t s_uart_rx_stream;
 
@@ -38,7 +38,7 @@ static UART_HandleTypeDef *s_uart_rx_handle;
 static volatile uint16_t s_old_position;
 // StreamBuffer 曾丢字节的粘滞标志，任务完成协议重同步后才允许清除。
 static volatile uint8_t s_overflow;
-// ISR 只置位恢复请求，CameraServiceTask 看到后执行 HAL Abort/Restart。
+// ISR 只置位恢复请求，CommTask 看到后执行 HAL Abort/Restart。
 static volatile uint8_t s_recovery_required;
 // 成功建立静态对象并启动 DMA 后置位，防止未初始化访问。
 static volatile uint8_t s_initialized;
@@ -141,7 +141,7 @@ HAL_StatusTypeDef UART_RxDma_Init(UART_HandleTypeDef *huart)
     return HAL_OK;
 }
 
-// 仅由 CameraServiceTask 从 StreamBuffer 有界阻塞读取。
+// 仅由 CommTask 从 StreamBuffer 有界阻塞读取。
 // 返回 0 可能表示超时、无数据、未初始化、参数错误或正在等待 UART 恢复；
 // 非零毫秒若换算为 0 tick，会强制至少等待 1 tick，避免意外变成纯轮询。
 size_t UART_RxDma_Read(uint8_t *buffer,
@@ -239,7 +239,7 @@ void UART_RxDma_HandleError(UART_HandleTypeDef *huart)
     s_recovery_required = 1U;
 }
 
-// 在 CameraServiceTask 中按 Abort→清错误→复位位置→重启 Receive-to-IDLE 的顺序恢复。
+// 在 CommTask 中按 Abort→清错误→复位位置→重启 Receive-to-IDLE 的顺序恢复。
 // 任一步失败返回 RETRY 并保留请求；本函数不排空 StreamBuffer，也不复位协议 parser，
 // 这些边界恢复由 camera_rtos 在确认 DMA 结果后统一完成。
 UartRxDmaRecoveryResult_t UART_RxDma_RecoverIfNeeded(void)
@@ -344,7 +344,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
     UART_RxDma_HandleRxEvent(huart, size);
 }
 
-// HAL UART 错误回调只转交置位请求，实际恢复留给 CameraServiceTask。
+// HAL UART 错误回调只转交置位请求，实际恢复留给 CommTask。
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     UART_RxDma_HandleError(huart);

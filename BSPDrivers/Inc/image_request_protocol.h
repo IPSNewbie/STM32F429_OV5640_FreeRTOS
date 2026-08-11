@@ -14,7 +14,7 @@
  * - [8..11]：CRC32，小端，只覆盖 [2..7] 六个业务字段字节；
  * - [12..13]：EOF0=CR、EOF1=LF。
  *
- * 解析器不访问 UART、HAL 或 FreeRTOS。CameraServiceTask 从 StreamBuffer 取字节后
+ * 解析器不访问 UART、HAL 或 FreeRTOS。CommTask 从 StreamBuffer 取字节后
  * 按接收顺序调用 FeedByte()；上下文必须跨调用保存，且不能由多个任务或 ISR 并发喂入。
  * 100 ms timeout 是相邻已接受字节之间的间隔，不是整帧累计时间。
  * CRC32 用于发现传输损坏，不提供身份认证或防篡改能力。
@@ -142,7 +142,7 @@ typedef struct
  * @brief  初始化解析器并进入空闲同步状态
  * @param  parser 由调用者静态分配的解析器指针
  * @note   将状态设为 IMAGE_REQUEST_STATE_SYNC0，并重置所有内部字段。
- *         应由 CameraServiceTask 在 dispatcher 初始化阶段调用，不得与 FeedByte() 并发。
+ *         应由 CommTask 在 dispatcher 初始化阶段调用，不得与 FeedByte() 并发。
  */
 void ImageRequestProtocol_Init(ImageRequestParser_t *parser);
 
@@ -178,7 +178,7 @@ ImageRequestParseResult_t ImageRequestProtocol_FeedByte(
  * @retval IMAGE_REQUEST_PARSE_PENDING  帧仍在接收中（未超时）
  * @retval IMAGE_REQUEST_PARSE_NONE     空闲状态（无活跃帧）
  * @retval IMAGE_REQUEST_PARSE_BAD_ARGUMENT  参数无效
- * @note   CameraServiceTask 在 UART 有界读取未收到数据时调用。时间差使用无符号减法，
+ * @note   CommTask 在 UART 有界读取未收到数据时调用。时间差使用无符号减法，
  *         可自然跨越 HAL tick 回绕；空闲状态返回 NONE，不会产生伪超时。
  */
 ImageRequestParseResult_t ImageRequestProtocol_CheckTimeout(

@@ -12,21 +12,20 @@
 // @file    camera_cli.c
 // @brief   摄像头文本命令解析、运行配置和状态输出模块
 //
-// camera_pc_dump 先把 UART 文本累积成 NUL 结尾的完整行，再由 CameraServiceTask
-// 同步调用本模块；当前工程没有独立 CLI Task。DUMP 在进入本模块前已被转换为业务
-// 事件，其他命令在这里同步完成。PROC/THR/RESET 只更新运行配置，下一次公共帧准备
-// 才会读取这些值；它们不会立即启动 DCMI 或修改当前 front frame。
+// camera_pc_dump 在 CommTask 中把 UART 文本累积成完整行。HandleLine() 只识别命令、
+// 校验参数并提交 CameraCommand_t，ControlTask 随后从 CommandQueue 取出并调用本模块的
+// ExecuteCommand()。PROC/THR/RESET 仍只更新运行配置，下一次公共帧准备才读取这些值。
 //
 // STATUS 只读取 RTOS/UART 缓存诊断视图；SD STATUS 只复制 SD 状态缓存，不 mount、
-// 不初始化 SDIO、不 takeover，也不修改 OV5640 0x3018。只有 SD SNAPSHOT 会在当前
-// CameraServiceTask 上下文同步执行完整存储和恢复流程。
+// 不初始化 SDIO、不 takeover，也不修改 OV5640 0x3018。只有出队执行 SD SNAPSHOT
+// 时才会在 ControlTask 上下文同步完成存储和恢复流程。
 // HELP 的八条命令是稳定对外接口，本模块不得擅自增删或改变顺序。
 //============================================================================
 
 // 128 是 8 位灰度中点，CLI 初始化和 RESET 都恢复为该默认二值化阈值。
 #define CAMERA_CLI_DEFAULT_THRESHOLD 128U
 
-// 运行期配置只由 CameraServiceTask 中的 CLI 修改，并由下一次帧处理读取。
+// 运行期配置只由 ControlTask 修改，并由同一任务的下一次帧处理读取。
 static CameraCliRuntimeConfig_t s_camera_cli_config;
 
 // 阻塞输出一段 NUL 结尾文本。扫描循环在 '\0' 处退出，不是硬件等待；
@@ -288,8 +287,12 @@ static void Camera_CLI_PrintStatus(UART_HandleTypeDef *huart)
         (stats != NULL) ? stats->min_ever_free_heap_bytes : 0U);
     Camera_CLI_WriteFieldU32(
         huart,
-        "stack_camera_min",
-        (stats != NULL) ? stats->camera_service_stack_min_free_bytes : 0U);
+        "stack_comm_min",
+        (stats != NULL) ? stats->comm_stack_min_free_bytes : 0U);
+    Camera_CLI_WriteFieldU32(
+        huart,
+        "stack_control_min",
+        (stats != NULL) ? stats->control_stack_min_free_bytes : 0U);
     Camera_CLI_WriteFieldU32(
         huart,
         "stack_monitor_min",
@@ -365,7 +368,7 @@ static void Camera_CLI_PrintSdStatus(UART_HandleTypeDef *huart)
         "OV5640_3018_6_4");
 }
 
-// 在 CameraServiceTask 中同步执行一次完整 SD SNAPSHOT，并输出各阶段诊断字段。
+// 在 ControlTask 中同步执行一次完整 SD SNAPSHOT，并输出各阶段诊断字段。
 // 存储模块负责 prepare/takeover/FatFs/cleanup；CLI 只展示统一结果，不复制状态机逻辑。
 static CameraCliStatus_t Camera_CLI_RunSdSnapshot(
     UART_HandleTypeDef *huart)
@@ -434,76 +437,29 @@ static CameraCliStatus_t Camera_CLI_RunSdSnapshot(
     return CAMERA_CLI_OK;
 }
 
-// 无参数时查询；有参数时更新下一次帧准备使用的模式，不立即重采集或改写 front。
-// GRAY 和 GRAYSCALE 接受为同一模式，但稳定 HELP 文本只展示 GRAY。
-static CameraCliStatus_t Camera_CLI_HandleProc(
-    UART_HandleTypeDef *huart,
-    const char *argument,
-    uint32_t argument_length)
+// 统一提交 parser 已完整构造的值对象；CommTask 不在这里进行 UART TX。
+static CameraCliStatus_t Camera_CLI_SubmitCommand(
+    const CameraCommand_t *command)
 {
-    if (argument_length == 0U)
+    if (Camera_CommandSubmit(command) == false)
     {
-        Camera_CLI_WriteText(huart, "process mode: ");
-        Camera_CLI_WriteLine(
-            huart,
-            Camera_CLI_ModeName(s_camera_cli_config.process_mode));
-        return CAMERA_CLI_OK;
+        return CAMERA_CLI_ERROR_QUEUE_FULL;
     }
 
-    if (Camera_CLI_TokenEquals(argument, argument_length, "BYPASS") != 0U)
-    {
-        s_camera_cli_config.process_mode = CAMERA_PROCESS_MODE_BYPASS;
-    }
-    else if ((Camera_CLI_TokenEquals(argument, argument_length, "GRAY") != 0U) ||
-             (Camera_CLI_TokenEquals(argument, argument_length, "GRAYSCALE") != 0U))
-    {
-        s_camera_cli_config.process_mode = CAMERA_PROCESS_MODE_GRAYSCALE;
-    }
-    else if (Camera_CLI_TokenEquals(argument, argument_length, "BINARY") != 0U)
-    {
-        s_camera_cli_config.process_mode = CAMERA_PROCESS_MODE_BINARY;
-    }
-    else
-    {
-        Camera_CLI_WriteLine(huart, "ERR bad PROC arg");
-        return CAMERA_CLI_ERROR_BAD_ARG;
-    }
-
-    Camera_CLI_WriteText(huart, "OK process mode: ");
-    Camera_CLI_WriteLine(
-        huart,
-        Camera_CLI_ModeName(s_camera_cli_config.process_mode));
     return CAMERA_CLI_OK;
 }
 
-// 无参数时查询；只有完整合法的 0～255 参数才更新配置，失败时保留旧阈值。
-// BINARY 使用该值决定黑白分界，其他模式仍保存配置供以后切换。
-static CameraCliStatus_t Camera_CLI_HandleThreshold(
-    UART_HandleTypeDef *huart,
-    const char *argument,
-    uint32_t argument_length)
+// 将既有 parser 错误也作为值对象提交，使所有 UART 文本只由 ControlTask 输出。
+static CameraCliStatus_t Camera_CLI_SubmitError(
+    CameraCommandCliError_t error,
+    CameraCliStatus_t parser_status)
 {
-    uint8_t threshold;  // 先解析到局部量，确认成功后才提交到全局运行配置
+    CameraCommand_t command = {0};
 
-    if (argument_length == 0U)
-    {
-        Camera_CLI_WriteText(huart, "binary threshold: ");
-        Camera_CLI_WriteU32(huart, s_camera_cli_config.binary_threshold);
-        Camera_CLI_WriteText(huart, "\r\n");
-        return CAMERA_CLI_OK;
-    }
-
-    if (Camera_CLI_ParseU8(argument, argument_length, &threshold) == 0U)
-    {
-        Camera_CLI_WriteLine(huart, "ERR bad THR arg");
-        return CAMERA_CLI_ERROR_BAD_ARG;
-    }
-
-    s_camera_cli_config.binary_threshold = threshold;
-    Camera_CLI_WriteText(huart, "OK binary threshold: ");
-    Camera_CLI_WriteU32(huart, s_camera_cli_config.binary_threshold);
-    Camera_CLI_WriteText(huart, "\r\n");
-    return CAMERA_CLI_OK;
+    command.type = CAMERA_CMD_CLI_ERROR;
+    command.args.cli_error.error = error;
+    return (Camera_CLI_SubmitCommand(&command) == CAMERA_CLI_OK) ?
+        parser_status : CAMERA_CLI_ERROR_QUEUE_FULL;
 }
 
 // 恢复 BYPASS/128 默认配置；只改缓存，不立即处理图像或启动 DCMI。
@@ -539,8 +495,97 @@ const CameraCliRuntimeConfig_t *Camera_CLI_GetConfig(void)
     return &s_camera_cli_config;
 }
 
-// 在 CameraServiceTask 中解析并同步执行一行完整、NUL 结尾的 CLI 文本。
-// 上游正常行缓冲最多保存 31 个字符；DUMP 已在上游拦截，所以这里没有 DUMP 分支。
+// 在 ControlTask 中执行已经出队的 CLI 命令；原有输出和业务 helper 保持复用。
+CameraCliStatus_t Camera_CLI_ExecuteCommand(
+    UART_HandleTypeDef *huart,
+    const CameraCommand_t *command)
+{
+    if ((huart == NULL) || (command == NULL))
+    {
+        return CAMERA_CLI_ERROR_NULL;
+    }
+
+    switch (command->type)
+    {
+        case CAMERA_CMD_HELP:
+            Camera_CLI_PrintHelp(huart);
+            return CAMERA_CLI_OK;
+
+        case CAMERA_CMD_STATUS:
+            Camera_CLI_PrintStatus(huart);
+            return CAMERA_CLI_OK;
+
+        case CAMERA_CMD_CLI_ERROR:
+            if (command->args.cli_error.error ==
+                CAMERA_COMMAND_CLI_ERROR_BAD_PROC_ARG)
+            {
+                Camera_CLI_WriteLine(huart, "ERR bad PROC arg");
+                return CAMERA_CLI_ERROR_BAD_ARG;
+            }
+            if (command->args.cli_error.error ==
+                CAMERA_COMMAND_CLI_ERROR_BAD_THRESHOLD_ARG)
+            {
+                Camera_CLI_WriteLine(huart, "ERR bad THR arg");
+                return CAMERA_CLI_ERROR_BAD_ARG;
+            }
+            Camera_CLI_WriteLine(huart, "ERR unknown command");
+            return CAMERA_CLI_ERROR_UNKNOWN_CMD;
+
+        case CAMERA_CMD_PROC_GET:
+            Camera_CLI_WriteText(huart, "process mode: ");
+            Camera_CLI_WriteLine(
+                huart,
+                Camera_CLI_ModeName(s_camera_cli_config.process_mode));
+            return CAMERA_CLI_OK;
+
+        case CAMERA_CMD_PROC_SET:
+            if ((command->args.proc.mode != CAMERA_PROCESS_MODE_BYPASS) &&
+                (command->args.proc.mode != CAMERA_PROCESS_MODE_GRAYSCALE) &&
+                (command->args.proc.mode != CAMERA_PROCESS_MODE_BINARY))
+            {
+                Camera_CLI_WriteLine(huart, "ERR bad PROC arg");
+                return CAMERA_CLI_ERROR_BAD_ARG;
+            }
+            s_camera_cli_config.process_mode = command->args.proc.mode;
+            Camera_CLI_WriteText(huart, "OK process mode: ");
+            Camera_CLI_WriteLine(
+                huart,
+                Camera_CLI_ModeName(s_camera_cli_config.process_mode));
+            return CAMERA_CLI_OK;
+
+        case CAMERA_CMD_THRESHOLD_GET:
+            Camera_CLI_WriteText(huart, "binary threshold: ");
+            Camera_CLI_WriteU32(huart, s_camera_cli_config.binary_threshold);
+            Camera_CLI_WriteText(huart, "\r\n");
+            return CAMERA_CLI_OK;
+
+        case CAMERA_CMD_THRESHOLD_SET:
+            s_camera_cli_config.binary_threshold =
+                command->args.threshold.threshold;
+            Camera_CLI_WriteText(huart, "OK binary threshold: ");
+            Camera_CLI_WriteU32(huart, s_camera_cli_config.binary_threshold);
+            Camera_CLI_WriteText(huart, "\r\n");
+            return CAMERA_CLI_OK;
+
+        case CAMERA_CMD_RESET:
+            Camera_CLI_ResetDefault();
+            Camera_CLI_WriteLine(huart, "OK reset");
+            return CAMERA_CLI_OK;
+
+        case CAMERA_CMD_SD_STATUS:
+            Camera_CLI_PrintSdStatus(huart);
+            return CAMERA_CLI_OK;
+
+        case CAMERA_CMD_SD_SNAPSHOT:
+            return Camera_CLI_RunSdSnapshot(huart);
+
+        default:
+            return CAMERA_CLI_ERROR_UNKNOWN_CMD;
+    }
+}
+
+// 解析一行完整、NUL 结尾的 CLI 文本并生成不含临时指针的 CameraCommand_t。
+// 上游正常行缓冲最多保存 31 个字符；DUMP 已在上游转换为命令事件。
 CameraCliStatus_t Camera_CLI_HandleLine(
     UART_HandleTypeDef *huart,
     const char *line)
@@ -550,6 +595,7 @@ CameraCliStatus_t Camera_CLI_HandleLine(
     uint32_t length;      // 去除首尾空白后剩余文本的有效长度
     uint32_t command_length = 0U;  // 第一个空白前的命令关键字长度
     uint32_t argument_length;      // 去除参数尾部空白后的长度
+    CameraCommand_t command = {0}; // 仅保存执行所需枚举和小参数，提交时按值复制
 
     if ((huart == NULL) || (line == NULL))
     {
@@ -575,47 +621,106 @@ CameraCliStatus_t Camera_CLI_HandleLine(
 
     if (Camera_CLI_TokenEquals(trimmed, command_length, "HELP") != 0U)
     {
-        Camera_CLI_PrintHelp(huart);
-        return CAMERA_CLI_OK;
+        command.type = CAMERA_CMD_HELP;
+        return Camera_CLI_SubmitCommand(&command);
     }
     if (Camera_CLI_TokenEquals(trimmed, command_length, "STATUS") != 0U)
     {
-        Camera_CLI_PrintStatus(huart);
-        return CAMERA_CLI_OK;
+        command.type = CAMERA_CMD_STATUS;
+        return Camera_CLI_SubmitCommand(&command);
     }
     if (Camera_CLI_TokenEquals(trimmed, command_length, "PROC") != 0U)
     {
-        return Camera_CLI_HandleProc(huart, argument, argument_length);
+        if (argument_length == 0U)
+        {
+            command.type = CAMERA_CMD_PROC_GET;
+        }
+        else if (Camera_CLI_TokenEquals(
+                     argument,
+                     argument_length,
+                     "BYPASS") != 0U)
+        {
+            command.type = CAMERA_CMD_PROC_SET;
+            command.args.proc.mode = CAMERA_PROCESS_MODE_BYPASS;
+        }
+        else if ((Camera_CLI_TokenEquals(
+                      argument,
+                      argument_length,
+                      "GRAY") != 0U) ||
+                 (Camera_CLI_TokenEquals(
+                      argument,
+                      argument_length,
+                      "GRAYSCALE") != 0U))
+        {
+            command.type = CAMERA_CMD_PROC_SET;
+            command.args.proc.mode = CAMERA_PROCESS_MODE_GRAYSCALE;
+        }
+        else if (Camera_CLI_TokenEquals(
+                     argument,
+                     argument_length,
+                     "BINARY") != 0U)
+        {
+            command.type = CAMERA_CMD_PROC_SET;
+            command.args.proc.mode = CAMERA_PROCESS_MODE_BINARY;
+        }
+        else
+        {
+            return Camera_CLI_SubmitError(
+                CAMERA_COMMAND_CLI_ERROR_BAD_PROC_ARG,
+                CAMERA_CLI_ERROR_BAD_ARG);
+        }
+
+        return Camera_CLI_SubmitCommand(&command);
     }
     if (Camera_CLI_TokenEquals(trimmed, command_length, "THR") != 0U)
     {
-        return Camera_CLI_HandleThreshold(huart, argument, argument_length);
+        if (argument_length == 0U)
+        {
+            command.type = CAMERA_CMD_THRESHOLD_GET;
+        }
+        else
+        {
+            command.type = CAMERA_CMD_THRESHOLD_SET;
+            if (Camera_CLI_ParseU8(
+                    argument,
+                    argument_length,
+                    &command.args.threshold.threshold) == 0U)
+            {
+                return Camera_CLI_SubmitError(
+                    CAMERA_COMMAND_CLI_ERROR_BAD_THRESHOLD_ARG,
+                    CAMERA_CLI_ERROR_BAD_ARG);
+            }
+        }
+
+        return Camera_CLI_SubmitCommand(&command);
     }
     if (Camera_CLI_TokenEquals(trimmed, command_length, "RESET") != 0U)
     {
-        Camera_CLI_ResetDefault();
-        Camera_CLI_WriteLine(huart, "OK reset");
-        return CAMERA_CLI_OK;
+        command.type = CAMERA_CMD_RESET;
+        return Camera_CLI_SubmitCommand(&command);
     }
     if (Camera_CLI_TokenEquals(trimmed, command_length, "SD") != 0U)
     {
         if (Camera_CLI_TokenEquals(argument, argument_length, "STATUS") != 0U)
         {
-            Camera_CLI_PrintSdStatus(huart);
-            return CAMERA_CLI_OK;
+            command.type = CAMERA_CMD_SD_STATUS;
+            return Camera_CLI_SubmitCommand(&command);
         }
         if (Camera_CLI_TokenEquals(
                 argument,
                 argument_length,
                 "SNAPSHOT") != 0U)
         {
-            return Camera_CLI_RunSdSnapshot(huart);
+            command.type = CAMERA_CMD_SD_SNAPSHOT;
+            return Camera_CLI_SubmitCommand(&command);
         }
 
-        Camera_CLI_WriteLine(huart, "ERR unknown command");
-        return CAMERA_CLI_ERROR_UNKNOWN_CMD;
+        return Camera_CLI_SubmitError(
+            CAMERA_COMMAND_CLI_ERROR_UNKNOWN,
+            CAMERA_CLI_ERROR_UNKNOWN_CMD);
     }
 
-    Camera_CLI_WriteLine(huart, "ERR unknown command");
-    return CAMERA_CLI_ERROR_UNKNOWN_CMD;
+    return Camera_CLI_SubmitError(
+        CAMERA_COMMAND_CLI_ERROR_UNKNOWN,
+        CAMERA_CLI_ERROR_UNKNOWN_CMD);
 }

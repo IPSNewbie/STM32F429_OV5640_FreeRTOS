@@ -7,13 +7,13 @@
 // @file    camera_image_process.c
 // @brief   固定 160x120 RGB565 帧的 BYPASS、GRAY、BINARY 处理模块
 //
-// 本模块不启动 DCMI，也不直接发送或存储图像。CameraServiceTask 完成原始帧采集并
+// 本模块不启动 DCMI，也不直接发送或存储图像。ControlTask 完成原始帧采集并
 // 第一次 commit 后，从稳定 front 读取，在另一个 back 中生成完整结果；只有算法全部
 // 成功才再次 commit，使处理结果成为 DUMP/SD SNAPSHOT 可读的新 front。
 //
 // BYPASS 仍复制 front→back，以保持三种模式统一的读写/发布语义；GRAY 把亮度重新
 // 编码成 RGB565；BINARY 按阈值输出 0x0000/0xFFFF。所有模式同时维护最近一帧的
-// 灰度、阴影和高光统计。安全性依赖 CameraServiceTask 串行调用，不可在 ISR 或
+// 灰度、阴影和高光统计。安全性依赖 ControlTask 串行调用，不可在 ISR 或
 // 另一任务并发处理同一双缓冲。
 //============================================================================
 
@@ -232,7 +232,7 @@ CameraImageProcessStatus_t Camera_ImageProcess_ConvertRgb565ToBinaryRgb565(const
     return CAMERA_PROCESS_OK;
 }
 
-// 由 Camera_RTOS_PrepareRgb565Frame 在 CameraServiceTask 中发布最终处理帧。
+// 由 Camera_RTOS_PrepareRgb565Frame 在 ControlTask 中发布最终处理帧。
 // 调用前原始 DCMI back 已第一次 commit 为稳定 front；本函数只读该 front、写另一
 // back。任何取帧、尺寸、算法或 commit 失败都不发布半帧，原 front 继续保持稳定。
 CameraImageProcessStatus_t Camera_ImageProcess_ApplyToFrameBuffer(CameraProcessMode_t mode,

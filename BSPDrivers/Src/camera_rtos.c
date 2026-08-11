@@ -1,6 +1,7 @@
 #include "camera_rtos.h"             // Camera RTOS 对外错误码、健康统计和任务入口
 
-#include "camera_cli.h"              // 文本 CLI 处理模式、二值化阈值及 SD SNAPSHOT 命令
+#include "camera_cli.h"              // 文本 CLI 解析、配置读取和出队命令执行接口
+#include "camera_command.h"          // 统一命令值对象、CommandQueue 和最小运行统计
 #include "camera_dcmi_dma.h"         // DCMI 快照启动、完成标志查询和停止接口
 #include "camera_frame_buffer.h"     // front/back 双缓冲提交和稳定 front frame 访问
 #include "camera_image_process.h"    // BYPASS、GRAY、BINARY 图像处理及统计
@@ -12,6 +13,7 @@
 #include "stm32f4xx_hal_iwdg.h"      // IWDG 寄存器宏、配置类型和刷新操作
 #include "uart_rx_dma.h"             // USART1 RX DMA、StreamBuffer 读取及错误恢复接口
 
+#include "FreeRTOS.h"                // CommandQueue 创建失败时使用现有 configASSERT 机制
 #include <stddef.h>                   // 提供 NULL 和 size_t
 
 //============================================================================
@@ -19,15 +21,15 @@
 // @brief   摄像头业务串行执行、UART 请求分发和运行健康监控
 //
 // 本模块主要负责：
-// 1. 在 CameraServiceTask 中读取 USART1 RX DMA 的 StreamBuffer；
-// 2. 将同一字节流分发为文本 CLI/DUMP 或 binary image request；
-// 3. 串行启动 DCMI 快照，限时等待 ISR 发布“一帧完成”标志；
+// 1. 在 CommTask 中读取 USART1 RX DMA 的 StreamBuffer 并维护文本/binary parser；
+// 2. 将文本 CLI/DUMP 或 binary image request 转换为 CameraCommand_t 并提交队列；
+// 3. 从 CommandQueue 取出命令并串行启动原有业务，包括 DCMI 快照等待；
 // 4. 按 back→front→图像处理→再次提交的顺序发布稳定 RGB565 帧；
 // 5. 让文本 DUMP、二进制请求和 SD SNAPSHOT 复用同一帧准备路径；
 // 6. 在 MonitorTask 中采样任务栈、Heap、心跳并决定是否刷新 IWDG。
 //
-// 任务上下文关系：当前工程没有独立 CLI Task。CLI 和 SD SNAPSHOT 都由
-// CameraServiceTask 解析后同步执行，所以 DCMI/DMA 始终只有一个任务级所有者。
+// 任务上下文关系：CommTask 只解析和提交；ControlTask 是 CommandQueue consumer，
+// 串行执行所有控制、DCMI、图像和 SD 业务，因此 DCMI/DMA 仍只有一个任务级所有者。
 // DCMI 帧事件 ISR 只设置完成标志，不在中断中做图像处理、UART 或 FatFs 操作。
 // MonitorTask 不参与摄像头业务，只观察健康状态并独占 IWDG 刷新职责。
 //
@@ -54,8 +56,11 @@
 #define CAMERA_RTOS_IWDG_PRESCALER                  IWDG_PRESCALER_256
 #define CAMERA_RTOS_IWDG_RELOAD                     999U
 
-// CameraServiceTask 最长允许 6 秒没有新心跳，低于约 8 秒硬件复位窗口以留出复位余量。
-#define CAMERA_RTOS_IWDG_CAMERA_AGE_LIMIT_MS        6000U
+// CommTask 最长允许 6 秒没有新心跳，低于约 8 秒硬件复位窗口以留出复位余量。
+#define CAMERA_RTOS_IWDG_COMM_AGE_LIMIT_MS          6000U
+
+// ControlTask 执行业务时沿用 6 秒上限；阻塞等待 CommandQueue 时不按年龄误判。
+#define CAMERA_RTOS_IWDG_CONTROL_AGE_LIMIT_MS       6000U
 
 // MonitorTask 正常每 1 秒运行一次，3 秒阈值可容忍短暂调度延迟但能识别真正停滞。
 #define CAMERA_RTOS_IWDG_MONITOR_AGE_LIMIT_MS       3000U
@@ -66,15 +71,18 @@
 // RVU/PVU 表示重装值或分频值仍在更新；两位都清零后新配置才可安全使用。
 #define CAMERA_RTOS_IWDG_UPDATE_FLAGS               (IWDG_SR_RVU | IWDG_SR_PVU)
 
-// 调度器启动前由 Camera_RTOS_Init() 设置；CameraServiceTask 用它接收命令和发送响应。
+// 调度器启动前设置；CommTask 用于 RX，ControlTask 使用同一稳定句柄发送响应。
 // 该指针不是 ISR 通信变量，初始化完成后运行期不再切换 UART 实例。
 static UART_HandleTypeDef *s_camera_rtos_uart;
 
-// 跨 CameraServiceTask、MonitorTask、STATUS 和 FreeRTOS Hook 共享的诊断状态。
+// 跨 CommTask、ControlTask、MonitorTask、STATUS 和 FreeRTOS Hook 共享的诊断状态。
 // 各字段为 volatile，但整个结构不是事务快照；它只用于健康监控而不参与业务同步。
 static CameraRtosStats_t s_camera_rtos_stats;
 
-// 保存 UART 混合协议解析状态，仅由 CameraServiceTask 初始化、喂入字节和复位。
+// ControlTask 在 portMAX_DELAY 阻塞等待队列时置 1，MonitorTask 不把正常 Blocked 误判超时。
+static volatile uint8_t s_camera_control_waiting_for_command;
+
+// 保存 UART 混合协议解析状态，仅由 CommTask 初始化、喂入字节和复位。
 // ISR 只把字节搬入 StreamBuffer，不直接接触此状态机。
 static CameraUartDispatcher_t s_camera_uart_dispatcher;
 
@@ -97,6 +105,8 @@ static void Camera_RTOS_ClearStats(void)
     // UART 空闲、文本半行及二进制协议解析分类统计。
     s_camera_rtos_stats.uart_none_count = 0U;
     s_camera_rtos_stats.uart_pending_count = 0U;
+    s_camera_rtos_stats.comm_rx_count = 0U;
+    s_camera_rtos_stats.comm_parse_error_count = 0U;
     s_camera_rtos_stats.binary_request_count = 0U;
     s_camera_rtos_stats.binary_request_success_count = 0U;
     s_camera_rtos_stats.binary_request_error_count = 0U;
@@ -113,21 +123,26 @@ static void Camera_RTOS_ClearStats(void)
     s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_NONE;
     s_camera_rtos_stats.last_dump_time_ms = 0U;
     s_camera_rtos_stats.uptime_ms = 0U;
-    s_camera_rtos_stats.camera_service_stack_min_free_bytes = 0U;
+    s_camera_rtos_stats.comm_stack_min_free_bytes = 0U;
+    s_camera_rtos_stats.control_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.monitor_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.free_heap_bytes = 0U;
     s_camera_rtos_stats.min_ever_free_heap_bytes = 0U;
 
-    // 严重 Hook 和两个任务的心跳由不同上下文更新，启动时统一归零。
+    // 严重 Hook 和三个任务的心跳由不同上下文更新，启动时统一归零。
     s_camera_rtos_stats.hook_fault_code = 0U;
     s_camera_rtos_stats.hook_fault_count = 0U;
     s_camera_rtos_stats.assert_line = 0U;
-    s_camera_rtos_stats.camera_service_heartbeat_count = 0U;
+    s_camera_rtos_stats.comm_heartbeat_count = 0U;
+    s_camera_rtos_stats.control_heartbeat_count = 0U;
     s_camera_rtos_stats.monitor_heartbeat_count = 0U;
-    s_camera_rtos_stats.camera_service_heartbeat_ms = 0U;
+    s_camera_rtos_stats.comm_heartbeat_ms = 0U;
+    s_camera_rtos_stats.control_heartbeat_ms = 0U;
     s_camera_rtos_stats.monitor_heartbeat_ms = 0U;
-    s_camera_rtos_stats.camera_service_heartbeat_age_ms = 0U;
+    s_camera_rtos_stats.comm_heartbeat_age_ms = 0U;
+    s_camera_rtos_stats.control_heartbeat_age_ms = 0U;
     s_camera_rtos_stats.monitor_heartbeat_age_ms = 0U;
+    s_camera_control_waiting_for_command = 0U;
 
     // IWDG 尚未初始化，因此先标记为禁用且没有跳过记录。
     s_camera_rtos_stats.iwdg_enabled = 0U;
@@ -185,17 +200,23 @@ HAL_StatusTypeDef HAL_IWDG_Refresh(IWDG_HandleTypeDef *hiwdg)
 
 // 查询“调用本函数的当前任务”自启动以来历史最小剩余栈空间，单位为字节。
 // CMSIS-RTOS2 的该值等价于 stack high-water mark，用于发现最坏时刻的栈压力，
-// 因而必须分别在 CameraServiceTask 和 MonitorTask 自己的上下文中调用。
+// 因而必须分别在 CommTask、ControlTask 和 MonitorTask 自己的上下文中调用。
 static uint32_t Camera_RTOS_GetCurrentTaskStackMinFreeBytes(void)
 {
     return osThreadGetStackSpace(osThreadGetId());
 }
 
-// 仅在 CameraServiceTask 上下文采样自身 stack high-water mark。
-// 如果改由 MonitorTask 调用，osThreadGetId() 会测到错误的任务，因此保留独立 helper。
-static void Camera_RTOS_UpdateCameraServiceStackStats(void)
+// 仅在 CommTask 上下文采样自身 stack high-water mark。
+static void Camera_RTOS_UpdateCommStackStats(void)
 {
-    s_camera_rtos_stats.camera_service_stack_min_free_bytes =
+    s_camera_rtos_stats.comm_stack_min_free_bytes =
+        Camera_RTOS_GetCurrentTaskStackMinFreeBytes();
+}
+
+// 仅在 ControlTask 上下文采样自身栈；业务调用链仍含 DUMP、SD 和 FatFs 控制。
+static void Camera_RTOS_UpdateControlStackStats(void)
+{
+    s_camera_rtos_stats.control_stack_min_free_bytes =
         Camera_RTOS_GetCurrentTaskStackMinFreeBytes();
 }
 
@@ -210,19 +231,22 @@ static void Camera_RTOS_UpdateMonitorHealthStats(void)
         (uint32_t)xPortGetMinimumEverFreeHeapSize();
 }
 
-// 使用同一个 current_tick 计算两个任务距离最近一次心跳已经过去多久。
+// 使用同一个 current_tick 计算三个任务距离最近一次心跳已经过去多久。
 // tick 小于已保存时间时按 0 处理，避免 tick 回退或回绕边界产生无符号巨值并误判超时。
 static void Camera_RTOS_UpdateHeartbeatAges(uint32_t current_tick)
 {
-    s_camera_rtos_stats.camera_service_heartbeat_age_ms =
-        (current_tick >= s_camera_rtos_stats.camera_service_heartbeat_ms) ?
-        (current_tick - s_camera_rtos_stats.camera_service_heartbeat_ms) : 0U;
+    s_camera_rtos_stats.comm_heartbeat_age_ms =
+        (current_tick >= s_camera_rtos_stats.comm_heartbeat_ms) ?
+        (current_tick - s_camera_rtos_stats.comm_heartbeat_ms) : 0U;
+    s_camera_rtos_stats.control_heartbeat_age_ms =
+        (current_tick >= s_camera_rtos_stats.control_heartbeat_ms) ?
+        (current_tick - s_camera_rtos_stats.control_heartbeat_ms) : 0U;
     s_camera_rtos_stats.monitor_heartbeat_age_ms =
         (current_tick >= s_camera_rtos_stats.monitor_heartbeat_ms) ?
         (current_tick - s_camera_rtos_stats.monitor_heartbeat_ms) : 0U;
 }
 
-// 将 Hook 与两个任务的启动/超时状态按优先顺序归纳为一个 IWDG 跳过原因。
+// 将 Hook 与三个任务的启动/超时状态按优先顺序归纳为一个 IWDG 跳过原因。
 // 该函数只做判定，不直接刷新硬件；统一原因使 STATUS 和故障日志能解释为何不喂狗。
 static CameraRtosIwdgSkipReason_t Camera_RTOS_GetIwdgSkipReason(
     uint32_t current_tick)
@@ -235,18 +259,28 @@ static CameraRtosIwdgSkipReason_t Camera_RTOS_GetIwdgSkipReason(
         return CAMERA_RTOS_IWDG_SKIP_HOOK_FAULT;
     }
     // count 为 0 表示任务从未进入主循环，不能把初始时间戳误当成健康心跳。
-    if (s_camera_rtos_stats.camera_service_heartbeat_count == 0U)
+    if (s_camera_rtos_stats.comm_heartbeat_count == 0U)
     {
-        return CAMERA_RTOS_IWDG_SKIP_CAMERA_NOT_STARTED;
+        return CAMERA_RTOS_IWDG_SKIP_COMM_NOT_STARTED;
+    }
+    if (s_camera_rtos_stats.control_heartbeat_count == 0U)
+    {
+        return CAMERA_RTOS_IWDG_SKIP_CONTROL_NOT_STARTED;
     }
     if (s_camera_rtos_stats.monitor_heartbeat_count == 0U)
     {
         return CAMERA_RTOS_IWDG_SKIP_MONITOR_NOT_STARTED;
     }
-    if (s_camera_rtos_stats.camera_service_heartbeat_age_ms >
-        CAMERA_RTOS_IWDG_CAMERA_AGE_LIMIT_MS)
+    if (s_camera_rtos_stats.comm_heartbeat_age_ms >
+        CAMERA_RTOS_IWDG_COMM_AGE_LIMIT_MS)
     {
-        return CAMERA_RTOS_IWDG_SKIP_CAMERA_TIMEOUT;
+        return CAMERA_RTOS_IWDG_SKIP_COMM_TIMEOUT;
+    }
+    if ((s_camera_control_waiting_for_command == 0U) &&
+        (s_camera_rtos_stats.control_heartbeat_age_ms >
+         CAMERA_RTOS_IWDG_CONTROL_AGE_LIMIT_MS))
+    {
+        return CAMERA_RTOS_IWDG_SKIP_CONTROL_TIMEOUT;
     }
     if (s_camera_rtos_stats.monitor_heartbeat_age_ms >
         CAMERA_RTOS_IWDG_MONITOR_AGE_LIMIT_MS)
@@ -258,7 +292,7 @@ static CameraRtosIwdgSkipReason_t Camera_RTOS_GetIwdgSkipReason(
 }
 
 // 仅由 MonitorTask 调用：所有健康条件满足才刷新 IWDG，否则持续停止喂狗等待复位。
-// 把刷新职责放在监控任务而不是 CameraServiceTask，可防止摄像头任务卡死后仍自我喂狗。
+// 把刷新职责放在 MonitorTask，可防止 Comm/Control 卡死后仍由业务路径自我喂狗。
 static void Camera_RTOS_ServiceIwdg(uint32_t current_tick)
 {
     CameraRtosIwdgSkipReason_t skip_reason;  // 本周期综合健康判定结果
@@ -271,7 +305,7 @@ static void Camera_RTOS_ServiceIwdg(uint32_t current_tick)
     }
 
     skip_reason = Camera_RTOS_GetIwdgSkipReason(current_tick);
-    // 只有“两个任务已启动、心跳未超时且无 Hook 故障”才写 IWDG 重装键。
+    // 只有“三个任务已启动、活动任务未超时且无 Hook 故障”才写 IWDG 重装键。
     if (skip_reason == CAMERA_RTOS_IWDG_SKIP_NONE)
     {
         (void)HAL_IWDG_Refresh(&s_camera_rtos_iwdg);
@@ -298,7 +332,7 @@ void Camera_RTOS_RecordDumpRequest(void)
 }
 
 // 记录一次“帧准备 + OV56RGB5 发送”完整成功，并保存此次端到端耗时。
-// 只在 CameraServiceTask 的公共 DUMP 路径调用，不参与 frame_id 的递增规则。
+// 只在 ControlTask 的公共 DUMP 路径调用，不参与 frame_id 的递增规则。
 void Camera_RTOS_RecordDumpSuccess(uint32_t elapsed_ms)
 {
     s_camera_rtos_stats.dump_success_count++;
@@ -314,7 +348,7 @@ void Camera_RTOS_RecordDumpError(uint32_t error_code)
         (error_code == CAMERA_RTOS_ERR_NONE) ? CAMERA_RTOS_ERR_DUMP_FAILED : error_code;
 }
 
-// 记录 CameraServiceTask 一次限时读取没有收到字节，用于区分正常 UART 空闲与错误恢复。
+// 记录 CommTask 一次限时读取没有收到字节，用于区分正常 UART 空闲与错误恢复。
 void Camera_RTOS_RecordUartNone(void)
 {
     s_camera_rtos_stats.uart_none_count++;
@@ -336,7 +370,7 @@ void Camera_RTOS_RecordHookFault(uint32_t fault_code, uint32_t assert_line)
     s_camera_rtos_stats.assert_line = assert_line;
 }
 
-// 在 CameraServiceTask 上下文检查并恢复 UART DMA 错误，ISR 不执行这些复杂操作。
+// 在 CommTask 上下文检查并恢复 UART DMA 错误，ISR 不执行这些复杂操作。
 // 返回 0 表示输入链路可继续；返回 1 表示本轮字节已不再可信，主循环必须重新开始。
 // 真正重启成功时还会复位两个解析器并排空旧字节，避免错误前后的半帧被拼接。
 static uint8_t Camera_RTOS_RecoverUartInputIfNeeded(void)
@@ -372,7 +406,7 @@ static uint8_t Camera_RTOS_RecoverUartInputIfNeeded(void)
 
 // 处理 ISR 向 StreamBuffer 写入过快造成的溢出；一旦丢字节，当前协议帧便无法可信解析。
 // 因此复位文本/二进制状态机、排空现有残片后再清 overflow 标志，而不是尝试续接。
-// 返回 1 提醒 CameraServiceTask 放弃当前 chunk，0 表示没有发生溢出。
+// 返回 1 提醒 CommTask 放弃当前 chunk，0 表示没有发生溢出。
 static uint8_t Camera_RTOS_DiscardOverflowedInput(void)
 {
     // 无溢出时不能清解析器，否则每次检查都会破坏正常的跨 chunk 命令/请求。
@@ -389,11 +423,9 @@ static uint8_t Camera_RTOS_DiscardOverflowedInput(void)
     return 1U;
 }
 
-// 在 CameraServiceTask 中同步准备一帧最终可读的 RGB565 front frame。
-// 请求交接方式：UART ISR 只把字节送入 StreamBuffer；CameraServiceTask 将字节解析为
-// 文本 DUMP、binary image request 或 SD SNAPSHOT CLI 事件后，再直接调用本函数。
-// 当前实现没有独立 CLI Task，也没有另一个任务通过 prepare flag 并发控制 DCMI，
-// 因而所有摄像头 HAL 操作、超时停止、commit 和图像处理都保持在单一任务上下文。
+// 在 ControlTask 中同步准备一帧最终可读的 RGB565 front frame。
+// CommTask 只把文本 DUMP、binary request 或 SD SNAPSHOT 转成 Command；ControlTask
+// 出队后调用本函数。所有摄像头 HAL、超时停止、commit 和图像处理仍保持单一上下文。
 //
 // 处理顺序是：DCMI 写 back → ISR 置完成标志 → 原始帧 commit 为 front →
 // 图像算法读该 front、写另一个 back → 再次 commit，最终 front 才交给 DUMP/SD。
@@ -515,7 +547,7 @@ static uint32_t Camera_RTOS_PrepareAndSend(void)
     return CAMERA_RTOS_ERR_NONE;   // 公共准备和 UART 发送均已完成
 }
 
-// 在 CameraServiceTask 内统一执行文本 DUMP 与 binary image request，并先检查快照保护。
+// 在 ControlTask 内统一执行文本 DUMP 与 binary image request，并先检查快照保护。
 // SD SNAPSHOT takeover 会暂时改变摄像头/SDIO 共享硬件；guard 禁止此时再启动 DCMI，
 // 避免两条路径同时驱动 PC8/PC9/PC11。request_source 只决定阻止统计和是否输出文本，
 // 成功路径始终复用相同的 PrepareAndSend()，不会形成两套采集/协议实现。
@@ -591,7 +623,7 @@ static uint8_t Camera_RTOS_ProcessDumpRequest(uint8_t request_source)
     dump_start_tick = HAL_GetTick();
     error_code = Camera_RTOS_PrepareAndSend();
     dump_elapsed_ms = HAL_GetTick() - dump_start_tick;
-    Camera_RTOS_UpdateCameraServiceStackStats();
+    Camera_RTOS_UpdateControlStackStats();
     if (error_code == CAMERA_RTOS_ERR_NONE)
     {
         Camera_RTOS_RecordDumpSuccess(dump_elapsed_ms);
@@ -603,13 +635,12 @@ static uint8_t Camera_RTOS_ProcessDumpRequest(uint8_t request_source)
     return 0U;
 }
 
-// 记录已通过 dispatcher 完整校验的 binary image request。
-// request->seq 是 PC 请求序号，仅用于关联和诊断，不改变 OV56RGB5 响应 frame_id。
-static void Camera_RTOS_RecordBinaryRequest(
-    const ImageRequestFrame_t *request)
+// 记录已通过 dispatcher 完整校验并从 CommandQueue 取出的 binary image request。
+// seq 是 PC 请求序号，仅用于关联和诊断，不改变 OV56RGB5 响应 frame_id。
+static void Camera_RTOS_RecordBinaryRequest(uint16_t seq)
 {
     s_camera_rtos_stats.binary_request_count++;
-    s_camera_rtos_stats.last_binary_request_seq = request->seq;
+    s_camera_rtos_stats.last_binary_request_seq = seq;
 }
 
 // 记录一次 binary request 解析失败，并把总数拆分到 CRC、版本、类型、长度或 EOF。
@@ -617,6 +648,7 @@ static void Camera_RTOS_RecordBinaryRequest(
 static void Camera_RTOS_RecordBinaryError(
     ImageRequestParseResult_t parse_result)
 {
+    s_camera_rtos_stats.comm_parse_error_count++;
     s_camera_rtos_stats.binary_request_error_count++;
     s_camera_rtos_stats.last_binary_error_code = (uint32_t)parse_result;
 
@@ -652,16 +684,75 @@ static void Camera_RTOS_RecordBinaryError(
 // 不输出 ASCII 错误文本，防止 PC 正在等待二进制响应时被额外字节打乱帧边界。
 static void Camera_RTOS_RecordBinaryTimeout(void)
 {
+    s_camera_rtos_stats.comm_parse_error_count++;
     s_camera_rtos_stats.binary_request_timeout_count++;
     s_camera_rtos_stats.last_binary_error_code = IMAGE_REQUEST_PARSE_TIMEOUT;
 }
 
-// 将 dispatcher 判定为文本的单字节交给现有行解析器，并把其返回事件映射到业务。
-// 本函数运行在 CameraServiceTask；普通 CLI 由 FeedCommandByte() 内部同步处理，
-// DUMP 则只返回事件后在这里进入公共采集路径，因此不存在另一个并发 CLI Task。
+// 向统一队列提交一个完整值对象；失败只记录软件状态，不阻塞 parser 或触发复位。
+static uint8_t Camera_RTOS_SubmitCommand(const CameraCommand_t *command)
+{
+    if (Camera_CommandSubmit(command) == false)
+    {
+        s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_COMMAND_QUEUE;
+        return 0U;
+    }
+
+    return 1U;
+}
+
+// ControlTask 是唯一命令执行者；各分支继续调用已验证的 CLI、DUMP 和 SD 路径。
+static void Camera_RTOS_ExecuteCommand(const CameraCommand_t *command)
+{
+    if (command == NULL)
+    {
+        s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_BAD_STATE;
+        return;
+    }
+
+    switch (command->type)
+    {
+        case CAMERA_CMD_HELP:
+        case CAMERA_CMD_STATUS:
+        case CAMERA_CMD_CLI_ERROR:
+        case CAMERA_CMD_PROC_GET:
+        case CAMERA_CMD_PROC_SET:
+        case CAMERA_CMD_THRESHOLD_GET:
+        case CAMERA_CMD_THRESHOLD_SET:
+        case CAMERA_CMD_RESET:
+        case CAMERA_CMD_SD_STATUS:
+        case CAMERA_CMD_SD_SNAPSHOT:
+            (void)Camera_CLI_ExecuteCommand(s_camera_rtos_uart, command);
+            break;
+
+        case CAMERA_CMD_DUMP:
+            (void)Camera_RTOS_ProcessDumpRequest(
+                CAMERA_RTOS_DUMP_SOURCE_TEXT);
+            break;
+
+        case CAMERA_CMD_IMAGE_REQUEST:
+            Camera_RTOS_RecordBinaryRequest(
+                command->args.image_request.seq);
+            if (Camera_RTOS_ProcessDumpRequest(
+                    CAMERA_RTOS_DUMP_SOURCE_BINARY) != 0U)
+            {
+                s_camera_rtos_stats.binary_request_success_count++;
+            }
+            break;
+
+        case CAMERA_CMD_NONE:
+        default:
+            s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_BAD_STATE;
+            break;
+    }
+}
+
+// 将 dispatcher 判定为文本的单字节交给现有行解析器，并把 DUMP 事件提交统一队列。
+// 普通 CLI 由 HandleLine() 生成命令；DUMP 仍由 FeedCommandByte() 单独识别后生成命令。
 static void Camera_RTOS_ProcessTextByte(uint8_t byte)
 {
     uint8_t command;  // 文本行仍未结束、已由 CLI 处理、DUMP 或异常状态
+    CameraCommand_t queue_command = {0}; // DUMP 事件转换得到的无参数命令值对象
 
     command = Camera_PC_Dump_FeedCommandByte(s_camera_rtos_uart, byte);
     // PENDING 表示当前字节尚未形成完整行，保留解析器状态等待后续 CR/LF。
@@ -671,19 +762,21 @@ static void Camera_RTOS_ProcessTextByte(uint8_t byte)
         return;
     }
 
-    // HELP/STATUS/PROC/THR/RESET/SD 等 CLI 已在文本行解析器内部同步完成。
+    // HELP/STATUS/PROC/THR/RESET/SD 等 CLI 已由文本 parser 提交 CommandQueue。
     if (command == CAMERA_PC_DUMP_CMD_CLI)
     {
         return;
     }
 
-    // DUMP 事件不能只输出文本，需在本任务上下文执行采集、处理和 OV56RGB5 发送。
+    // DUMP 事件转换为值对象；真正采集、处理和 OV56RGB5 发送在出队分支执行。
     if (command == CAMERA_PC_DUMP_CMD_DUMP)
     {
-        (void)Camera_RTOS_ProcessDumpRequest(CAMERA_RTOS_DUMP_SOURCE_TEXT);
+        queue_command.type = CAMERA_CMD_DUMP;
+        (void)Camera_RTOS_SubmitCommand(&queue_command);
         return;
     }
 
+    s_camera_rtos_stats.comm_parse_error_count++;
     s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_BAD_STATE;
 }
 
@@ -694,6 +787,8 @@ static void Camera_RTOS_ProcessDispatchEvent(
     CameraUartDispatchResult_t result,
     const CameraUartDispatchEvent_t *event)
 {
+    CameraCommand_t command = {0}; // binary 请求只复制执行所需的 seq 进入队列
+
     // 每个输入字节最多产生一个事件；二进制请求只有完整通过协议校验后才进入 DUMP。
     switch (result)
     {
@@ -702,13 +797,9 @@ static void Camera_RTOS_ProcessDispatchEvent(
             break;
 
         case CAMERA_UART_DISPATCH_IMAGE_REQUEST:
-            Camera_RTOS_RecordBinaryRequest(&event->image_request);
-            // 成功计数只在共用的帧准备和 OV56RGB5 发送全部成功后递增。
-            if (Camera_RTOS_ProcessDumpRequest(
-                    CAMERA_RTOS_DUMP_SOURCE_BINARY) != 0U)
-            {
-                s_camera_rtos_stats.binary_request_success_count++;
-            }
+            command.type = CAMERA_CMD_IMAGE_REQUEST;
+            command.args.image_request.seq = event->image_request.seq;
+            (void)Camera_RTOS_SubmitCommand(&command);
             break;
 
         case CAMERA_UART_DISPATCH_BINARY_ERROR:
@@ -720,6 +811,7 @@ static void Camera_RTOS_ProcessDispatchEvent(
             break;
 
         case CAMERA_UART_DISPATCH_BAD_ARGUMENT:
+            s_camera_rtos_stats.comm_parse_error_count++;
             s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_BAD_STATE;
             break;
 
@@ -737,7 +829,7 @@ void Camera_RTOS_Init(UART_HandleTypeDef *huart)
     s_camera_rtos_frame_id = 1U;
     Camera_RTOS_ClearStats();
 
-    // 无效句柄只记录错误；CameraServiceTask 启动后会每秒阻塞重试等待有效配置。
+    // 无效句柄只记录错误；CommTask 启动后会每秒阻塞重试等待有效配置。
     if (huart == NULL)
     {
         s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_UART_NULL;
@@ -766,11 +858,9 @@ HAL_StatusTypeDef Camera_RTOS_IwdgInit(void)
     return status;
 }
 
-// CameraServiceTask 主循环：独占 UART 协议状态机和摄像头业务级控制。
-// UART ISR/DMA 只负责接收并把字节送入 StreamBuffer；本任务分块取出后逐字节区分
-// 文本与二进制协议。普通 CLI、DUMP 和 SD SNAPSHOT 都在这里串行执行，因此 CLI
-// 不会从另一个任务同时启动 DCMI。循环还周期更新心跳与 stack high-water mark。
-void Camera_RTOS_CameraServiceTask(void *argument)
+// CommTask 主循环：独占 UART RX、文本/binary parser 和 CommandQueue producer。
+// UART ISR/DMA 只把字节送入 StreamBuffer；本任务不执行控制、图像或存储业务。
+void Camera_RTOS_CommTask(void *argument)
 {
     uint8_t rx_chunk[CAMERA_RTOS_UART_RX_CHUNK_SIZE];    // 栈上 32 字节接收块，不存放大图像
     size_t received;                                     // 本轮从 StreamBuffer 实际取出的字节数，最大 32
@@ -798,7 +888,7 @@ void Camera_RTOS_CameraServiceTask(void *argument)
 
     // 启动 USART1 RX DMA 和静态 StreamBuffer。循环在 HAL_OK 时退出；暂时失败时每秒
     // 重试一次且主动阻塞，不会高速反复操作硬件。这里保持原有无总 timeout 策略，
-    // 因为没有接收链路时 CameraServiceTask 无法进入正常协议主循环。
+    // 因为没有接收链路时 CommTask 无法进入正常协议主循环。
     while (UART_RxDma_Init(s_camera_rtos_uart) != HAL_OK)
     {
         s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_UART_DMA_INIT;
@@ -806,7 +896,7 @@ void Camera_RTOS_CameraServiceTask(void *argument)
     }
 
     // 初始化完成后先建立一次栈余量基线；以后每约 1 秒更新历史最小剩余字节数。
-    Camera_RTOS_UpdateCameraServiceStackStats();
+    Camera_RTOS_UpdateCommStackStats();
     stack_sample_tick = HAL_GetTick();
 
     // 任务生命周期主循环没有“退出”条件，这是 FreeRTOS 服务任务的正常模型。
@@ -814,10 +904,9 @@ void Camera_RTOS_CameraServiceTask(void *argument)
     // 错误重试也包含 osDelay，因此该无限循环不会在空闲状态持续占满 CPU。
     for (;;)
     {
-        // 心跳在每轮入口更新。若后续 DUMP、SD 或 UART 路径异常阻塞超过 6 秒，
-        // MonitorTask 会看到年龄超限并停止刷新 IWDG，而不是让本任务自行掩盖卡死。
-        s_camera_rtos_stats.camera_service_heartbeat_count++;
-        s_camera_rtos_stats.camera_service_heartbeat_ms = HAL_GetTick();
+        // 每次进入 UART 服务循环发布 CommTask 心跳；ControlTask 业务阻塞不会影响它。
+        s_camera_rtos_stats.comm_heartbeat_count++;
+        s_camera_rtos_stats.comm_heartbeat_ms = HAL_GetTick();
 
         // 先处理 UART 硬件错误；返回非零表示解析连续性已失效，本轮不能继续用旧 chunk。
         if (Camera_RTOS_RecoverUartInputIfNeeded() != 0U)
@@ -836,6 +925,7 @@ void Camera_RTOS_CameraServiceTask(void *argument)
         received = UART_RxDma_Read(rx_chunk,
                                    sizeof(rx_chunk),
                                    CAMERA_RTOS_UART_READ_TIMEOUT_MS);
+        s_camera_rtos_stats.comm_rx_count += (uint32_t)received;
         if (received == 0U)
         {
             // 等待期间 ISR 仍可能报告 DMA 错误或 StreamBuffer 溢出，因此在把 received=0
@@ -862,7 +952,7 @@ void Camera_RTOS_CameraServiceTask(void *argument)
             if ((current_tick - stack_sample_tick) >=
                 CAMERA_RTOS_STACK_SAMPLE_PERIOD_MS)
             {
-                Camera_RTOS_UpdateCameraServiceStackStats();
+                Camera_RTOS_UpdateCommStackStats();
                 stack_sample_tick = current_tick;
             }
             continue;  // 本轮没有业务字节，回到带超时读取而不是空转
@@ -886,7 +976,7 @@ void Camera_RTOS_CameraServiceTask(void *argument)
                 rx_chunk[i],
                 HAL_GetTick(),
                 &dispatch_event);
-            // 文本字节、完整二进制请求、解析错误等都在同一任务中立即串行处理。
+            // parser 只生成命令或错误事件；业务由独立 ControlTask 从队列取出。
             Camera_RTOS_ProcessDispatchEvent(dispatch_result, &dispatch_event);
         }
 
@@ -895,9 +985,50 @@ void Camera_RTOS_CameraServiceTask(void *argument)
         if ((current_tick - stack_sample_tick) >=
             CAMERA_RTOS_STACK_SAMPLE_PERIOD_MS)
         {
-            Camera_RTOS_UpdateCameraServiceStackStats();
+            Camera_RTOS_UpdateCommStackStats();
             stack_sample_tick = current_tick;
         }
+    }
+}
+
+// ControlTask 是 CommandQueue 唯一 consumer，并继续串行拥有 DCMI、图像处理和 SD 业务。
+// 队列为空时 Camera_CommandReceive() 使用 portMAX_DELAY，使任务保持 Blocked 而不轮询。
+void Camera_RTOS_ControlTask(void *argument)
+{
+    CameraCommand_t command; // Queue 按值复制的稳定命令对象，不含 parser buffer 指针
+
+    (void)argument; // CubeMX 任务入口保留统一参数，本任务当前不需要启动参数
+
+    Camera_RTOS_UpdateControlStackStats();
+    for (;;)
+    {
+        // 进入阻塞等待前发布心跳；waiting 标志防止正常 Blocked 被 IWDG 误判为卡死。
+        s_camera_rtos_stats.control_heartbeat_count++;
+        s_camera_rtos_stats.control_heartbeat_ms = HAL_GetTick();
+        s_camera_control_waiting_for_command = 1U;
+
+        if (Camera_CommandReceive(&command) == false)
+        {
+            // Queue 在任务创建前已初始化；失败表示内部状态错误，进入现有 assert 机制。
+            s_camera_control_waiting_for_command = 0U;
+            s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_COMMAND_QUEUE;
+            configASSERT(0);
+            (void)osDelay(1000U);
+            continue;
+        }
+
+        // 收到命令后立即离开 waiting 状态并更新时间，使执行超时可被 MonitorTask 识别。
+        s_camera_control_waiting_for_command = 0U;
+        s_camera_rtos_stats.control_heartbeat_count++;
+        s_camera_rtos_stats.control_heartbeat_ms = HAL_GetTick();
+        Camera_RTOS_UpdateControlStackStats();
+
+        Camera_RTOS_ExecuteCommand(&command);
+
+        // 业务完成后再次发布心跳并采样最深调用链后的 stack high-water mark。
+        s_camera_rtos_stats.control_heartbeat_count++;
+        s_camera_rtos_stats.control_heartbeat_ms = HAL_GetTick();
+        Camera_RTOS_UpdateControlStackStats();
     }
 }
 

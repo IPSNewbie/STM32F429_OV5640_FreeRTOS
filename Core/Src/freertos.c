@@ -25,6 +25,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "camera_command.h"
 #include "camera_rtos.h"
 /* USER CODE END Includes */
 
@@ -47,12 +48,19 @@
 /* USER CODE BEGIN Variables */
 
 /* USER CODE END Variables */
-/* Definitions for CameraServiceTa */
-osThreadId_t CameraServiceTaHandle;
-const osThreadAttr_t CameraServiceTa_attributes = {
-  .name = "CameraServiceTa",
-  .stack_size = 2048 * 4,
+/* Definitions for CommTask */
+osThreadId_t CommTaskHandle;
+const osThreadAttr_t CommTask_attributes = {
+  .name = "CommTask",
+  .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
+};
+/* Definitions for ControlTask */
+osThreadId_t ControlTaskHandle;
+const osThreadAttr_t ControlTask_attributes = {
+  .name = "ControlTask",
+  .stack_size = 2048 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for MonitorTask */
 osThreadId_t MonitorTaskHandle;
@@ -67,7 +75,8 @@ const osThreadAttr_t MonitorTask_attributes = {
 
 /* USER CODE END FunctionPrototypes */
 
-void StartCameraServiceTask(void *argument);
+void StartCommTask(void *argument);
+void StartControlTask(void *argument);
 void StartMonitorTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
@@ -95,19 +104,26 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+  if (Camera_CommandInit() == false)
+  {
+    Error_Handler();
+  }
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* creation of CameraServiceTa */
-  CameraServiceTaHandle = osThreadNew(StartCameraServiceTask, NULL, &CameraServiceTa_attributes);
+  /* creation of CommTask */
+  CommTaskHandle = osThreadNew(StartCommTask, NULL, &CommTask_attributes);
+
+  /* creation of ControlTask */
+  ControlTaskHandle = osThreadNew(StartControlTask, NULL, &ControlTask_attributes);
 
   /* creation of MonitorTask */
   MonitorTaskHandle = osThreadNew(StartMonitorTask, NULL, &MonitorTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  if ((CameraServiceTaHandle == NULL) ||
+  if ((CommTaskHandle == NULL) ||
+    (ControlTaskHandle == NULL) ||
     (MonitorTaskHandle == NULL))
   {
     Error_Handler();
@@ -121,14 +137,24 @@ void MX_FREERTOS_Init(void) {
 
 }
 
-/* USER CODE BEGIN Header_StartCameraServiceTask */
-// Camera Service 任务入口，实际循环由 camera_rtos 模块实现
-/* USER CODE END Header_StartCameraServiceTask */
-void StartCameraServiceTask(void *argument)
+/* USER CODE BEGIN Header_StartCommTask */
+// CommTask 只负责 UART RX、文本/binary parser 和 CommandQueue 提交
+/* USER CODE END Header_StartCommTask */
+void StartCommTask(void *argument)
 {
-  /* USER CODE BEGIN StartCameraServiceTask */
-  Camera_RTOS_CameraServiceTask(argument);
-  /* USER CODE END StartCameraServiceTask */
+  /* USER CODE BEGIN StartCommTask */
+  Camera_RTOS_CommTask(argument);
+  /* USER CODE END StartCommTask */
+}
+
+/* USER CODE BEGIN Header_StartControlTask */
+// ControlTask 阻塞等待 CommandQueue 并串行执行现有业务
+/* USER CODE END Header_StartControlTask */
+void StartControlTask(void *argument)
+{
+  /* USER CODE BEGIN StartControlTask */
+  Camera_RTOS_ControlTask(argument);
+  /* USER CODE END StartControlTask */
 }
 
 /* USER CODE BEGIN Header_StartMonitorTask */

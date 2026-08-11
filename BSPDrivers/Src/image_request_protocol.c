@@ -6,7 +6,7 @@
 // @file    image_request_protocol.c
 // @brief   上位机 binary image request 的逐字节状态机解析器
 //
-// 本模块由 camera_uart_dispatcher 在 CameraServiceTask 上下文调用；UART ISR
+// 本模块由 camera_uart_dispatcher 在 CommTask 上下文调用；UART ISR
 // 只负责搬运字节，不在中断中解析协议。本模块不访问 UART、HAL 或 FreeRTOS API，
 // 每次 FeedByte() 只消费一个字节，跨调用状态保存在 ImageRequestParser_t 中。
 //
@@ -50,7 +50,7 @@ void ImageRequestProtocol_Reset(ImageRequestParser_t *parser)
 }
 
 // 初始化由调用者持有的解析器上下文；当前初始化语义与完整 Reset 相同。
-// parser 应在 CameraServiceTask 开始接收字节前初始化一次。
+// parser 应在 CommTask 开始接收字节前初始化一次。
 void ImageRequestProtocol_Init(ImageRequestParser_t *parser)
 {
     ImageRequestProtocol_Reset(parser);
@@ -126,7 +126,7 @@ uint8_t ImageRequestProtocol_IsActive(const ImageRequestParser_t *parser)
     return (parser->frame_active != 0U) ? 1U : 0U;
 }
 
-// 在 CameraServiceTask 上下文输入一个字节并推进固定 14 字节请求状态机。
+// 在 CommTask 上下文输入一个字节并推进固定 14 字节请求状态机。
 // 本函数没有内部等待或扫描循环：每次只处理当前 byte，成功时复制业务字段后自动 Reset。
 // out_frame 只有在返回 IMAGE_REQUEST_PARSE_OK 时有效，且不能与 parser->frame 使用同一地址。
 ImageRequestParseResult_t ImageRequestProtocol_FeedByte(

@@ -6,7 +6,7 @@
 // @file    camera_uart_dispatcher.c
 // @brief   USART1 混合字节流的文本命令与 binary image request 分发器
 //
-// UART DMA/ISR 只把字节送进 StreamBuffer；CameraServiceTask 逐字节调用本模块，
+// UART DMA/ISR 只把字节送进 StreamBuffer；CommTask 逐字节调用本模块，
 // 因而 dispatcher 由单一任务上下文拥有，不在中断中解析协议。
 // IDLE 用首字节选择文本或二进制：0xA5 启动请求候选，其他字节进入 TEXT；
 // TEXT 保持到 LF；BINARY 把字节交给固定 14 字节图像请求解析器。
@@ -108,7 +108,7 @@ static void CameraUartDispatcher_UpdateBinaryMode(
     }
 }
 
-// 将逐字节解析结果映射为 CameraServiceTask 可消费的请求、错误或超时事件。
+// 将逐字节解析结果映射为 CommTask 可消费的请求、错误或超时事件。
 // CRC 错误发生在完整帧末，无需隔离；字段中途错误必须隔离固定尾部。
 static CameraUartDispatchResult_t CameraUartDispatcher_MapBinaryResult(
     CameraUartDispatcher_t *dispatcher,
@@ -163,7 +163,7 @@ static CameraUartDispatchResult_t CameraUartDispatcher_MapBinaryResult(
     return out_event->type;
 }
 
-// 初始化 CameraServiceTask 私有的 UART 分发上下文；不启动 DMA，也不清文本行缓冲。
+// 初始化 CommTask 私有的 UART 分发上下文；不启动 DMA，也不清文本行缓冲。
 void CameraUartDispatcher_Init(CameraUartDispatcher_t *dispatcher)
 {
     if (dispatcher == NULL)
@@ -189,7 +189,7 @@ void CameraUartDispatcher_Reset(CameraUartDispatcher_t *dispatcher)
     dispatcher->mode = CAMERA_UART_DISPATCH_MODE_IDLE;
 }
 
-// 在 CameraServiceTask 中消费一个 UART 字节并生成至多一个事件。
+// 在 CommTask 中消费一个 UART 字节并生成至多一个事件。
 // 函数本身没有循环，跨字节状态保存在 dispatcher；TEXT 以 LF 作为模式边界。
 CameraUartDispatchResult_t CameraUartDispatcher_FeedByte(
     CameraUartDispatcher_t *dispatcher,
@@ -294,7 +294,7 @@ CameraUartDispatchResult_t CameraUartDispatcher_FeedByte(
                                                 out_event);
 }
 
-// 在 CameraServiceTask 的 UART 有界读取未收到字节时检查 inter-byte timeout。
+// 在 CommTask 的 UART 有界读取未收到字节时检查 inter-byte timeout。
 // discard 超时静默恢复 IDLE；真实候选帧超时则产生可统计的 TIMEOUT 事件。
 CameraUartDispatchResult_t CameraUartDispatcher_CheckTimeout(
     CameraUartDispatcher_t *dispatcher,

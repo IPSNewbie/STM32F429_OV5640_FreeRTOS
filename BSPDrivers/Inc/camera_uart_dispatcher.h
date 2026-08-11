@@ -9,10 +9,10 @@
  * @file camera_uart_dispatcher.h
  * @brief UART CLI 文本与 binary image request 的逐字节分发接口
  *
- * UART RX DMA ISR 只向 StreamBuffer 写入字节；CameraServiceTask 按接收顺序调用本模块。
+ * UART RX DMA ISR 只向 StreamBuffer 写入字节；CommTask 按接收顺序调用本模块。
  * IDLE 判定输入类别，TEXT 保持到 LF，BINARY 保持到请求完成、出错或超时。
  * 字段错误后的旧帧尾会被隔离，避免 CRC/EOF 字节泄漏为 CLI 文本。
- * @note 上下文由 CameraServiceTask 单一持有，不支持多任务或 ISR 并发访问。
+ * @note 上下文由 CommTask 单一持有，不支持多任务或 ISR 并发访问。
  */
 
 /**
@@ -52,7 +52,7 @@ typedef struct
 
 /**
  * @brief UART 分发器持久运行上下文
- * @note 由 CameraServiceTask 静态持有并跨字节保存，不支持并发访问。
+ * @note 由 CommTask 静态持有并跨字节保存，不支持并发访问。
  */
 typedef struct
 {
@@ -83,7 +83,7 @@ void CameraUartDispatcher_Reset(CameraUartDispatcher_t *dispatcher);
  * @param out_event 接收本次事件的输出结构
  * @return 本次分发结果，见 @ref CameraUartDispatchResult_t
  * @note 每次只消费一个字节并产生至多一个事件；错误旧帧尾返回 NONE 并静默隔离。
- * @warning 仅限 CameraServiceTask 任务上下文，不得与 Reset/CheckTimeout 并发调用。
+ * @warning 仅限 CommTask 任务上下文，不得与 Reset/CheckTimeout 并发调用。
  */
 CameraUartDispatchResult_t CameraUartDispatcher_FeedByte(
     CameraUartDispatcher_t *dispatcher,

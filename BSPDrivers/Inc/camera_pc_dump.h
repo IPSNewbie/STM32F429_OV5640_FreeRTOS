@@ -11,10 +11,10 @@
  * 本模块连接以下三条工程链路：
  *
  * 1. DCMI DMA 通过本模块查询 back buffer 地址和 32 位传输数量；
- * 2. UART dispatcher 将文本字节交给本模块，DUMP 事件返回 CameraServiceTask；
+ * 2. UART dispatcher 将文本字节交给本模块，DUMP 事件返回 CommTask；
  * 3. Camera RTOS 准备并提交 front frame 后，本模块按 OV56RGB5 协议发送图像。
  *
- * @note 文本解析状态由模块内部静态变量保存，只应由 CameraServiceTask 单一上下文调用。
+ * @note 文本解析状态由模块内部静态变量保存，只应由 CommTask 单一上下文调用。
  * @note 本模块不直接启动 DCMI，也不会把仍由 DMA 写入的 back buffer 发送给 PC。
  */
 
@@ -51,8 +51,8 @@
 /** @brief 历史 AEC 文本命令结果，当前最终 CLI 不再暴露该命令。 */
 #define CAMERA_PC_DUMP_CMD_AEC         2U              // 已接收到完整 AEC 命令，用于输出 OV5640 AEC/AGC 寄存器信息
 
-/** @brief 普通 CLI 命令已完成处理。 */
-#define CAMERA_PC_DUMP_CMD_CLI         3U              // 已接收到普通 CLI 命令，并且该命令已经由 CLI 模块完成处理
+/** @brief 普通 CLI 命令已完成解析并提交 CommandQueue。 */
+#define CAMERA_PC_DUMP_CMD_CLI         3U              // 普通 CLI 命令已由 CLI parser 完成校验和提交
 
 /** @brief 当前文本命令行尚未接收完整。 */
 #define CAMERA_PC_DUMP_CMD_PENDING     4U              // 当前字节已保存，但一整行命令尚未接收完，需要继续输入后续字节
@@ -103,18 +103,18 @@ uint32_t Camera_PC_Dump_GetWordCount(void);             // 返回 DCMI DMA 的�
  * @param  huart
  *         UART 句柄。
  *         本函数本身不通过 HAL_UART_Receive() 读取字节；
- *         该句柄主要用于完整 CLI 命令产生文本回复时进行 UART 输出。
+ *         为保持现有接口而保留；解析阶段不进行 UART 输出。
  *
  * @param  byte
  *         当前从 StreamBuffer 中取出的一个字节。
  *
  * @retval CAMERA_PC_DUMP_CMD_DUMP
  *         已接收到完整的 DUMP 命令。
- *         CameraServiceTask 应调用统一的图像采集与发送流程。
+ *         CommTask 应将命令提交 CommandQueue，由 ControlTask 执行统一的图像采集与发送流程。
  *
  * @retval CAMERA_PC_DUMP_CMD_CLI
  *         已接收到完整的普通 CLI 命令，例如 HELP、STATUS、PROC 或 THR，
- *         并且命令已经由 camera_cli 模块处理完毕。
+ *         并且命令已经由 camera_cli 模块完成解析并提交 CommandQueue。
  *
  * @retval CAMERA_PC_DUMP_CMD_PENDING
  *         当前字节属于一条尚未完成的文本命令，
@@ -130,17 +130,17 @@ uint32_t Camera_PC_Dump_GetWordCount(void);             // 返回 DCMI DMA 的�
  *     -> DMA Circular
  *     -> HT / TC / IDLE 回调
  *     -> StreamBuffer
- *     -> CameraServiceTask
+ *     -> CommTask
  *     -> CameraUartDispatcher
  *     -> Camera_PC_Dump_FeedCommandByte()
  *
  * 因此，本函数只负责文本行状态，不再直接读取 UART 硬件。
  *
  * @note 解析器使用模块内部静态状态，不可由多个任务或 ISR 并发调用。
- * @note DUMP 只形成返回事件；图像准备与发送仍由 CameraServiceTask 的上层流程执行。
+ * @note DUMP 只形成返回事件；CommTask 将其转为命令，ControlTask 在出队后执行。
  */
 uint8_t Camera_PC_Dump_FeedCommandByte(
-    UART_HandleTypeDef *huart,                          // USART1 句柄，用于 CLI 文本响应
+    UART_HandleTypeDef *huart,                          // 保留的 USART1 句柄；解析阶段不发送文本
     uint8_t byte);                                      // 当前需要交给文本解析器处理的一个字节
 
 
@@ -197,7 +197,7 @@ void Camera_PC_Dump_ResetCommandParser(void);           // 放弃当前未完成
 //  *
 //  * 目前已经改为：
 //  *
-//  * UART DMA + IDLE + StreamBuffer + CameraServiceTask。
+//  * UART DMA + IDLE + StreamBuffer + CommTask。
 //  *
 //  * 因此旧接口被注释保留，仅用于理解项目演进过程。
 //  */

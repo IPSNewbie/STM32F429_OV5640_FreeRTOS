@@ -10,7 +10,7 @@
 // @brief   OV5640 图像帧 UART 导出模块
 //
 // 本模块主要负责：
-// 1. 在 CameraServiceTask 中逐字节维护一行文本命令。
+// 1. 在 CommTask 中逐字节维护一行文本命令。
 // 2. 单独识别 DUMP，并把其他文本命令交给 camera_cli 处理。
 // 3. 从双缓冲模块取得已经提交的 front frame。
 // 4. 按 OV56RGB5 布局构造 header，计算 RGB565 payload 的 CRC32。
@@ -21,7 +21,7 @@
 // Camera RTOS prepare/commit -> Camera_PC_Dump_SendFrame() -> UART -> PC
 //
 // 本模块不直接启动 DCMI、不提交 front/back 缓冲区，也不管理 UART RX DMA。
-// 文本行状态由 CameraServiceTask 单一上下文维护，不能在 ISR 中并发调用。
+// 文本行状态由 CommTask 单一上下文维护，不能在 ISR 中并发调用。
 //============================================================================
 
 // 38400 字节 payload 不一次交给单个阻塞式 HAL_UART_Transmit()，而是拆成最大 1024 字节的小块。
@@ -31,7 +31,7 @@
 // 文本命令缓冲区总长度为 32 字节，其中最后 1 字节必须预留给字符串结束符 '\0'
 #define PC_DUMP_COMMAND_LINE_LEN 32U
 
-// 以下三个静态状态只由 CameraServiceTask 维护，用于跨多次逐字节调用拼接同一行命令。
+// 以下三个静态状态只由 CommTask 维护，用于跨多次逐字节调用拼接同一行命令。
 // 保存当前正在接收的一行文本命令，例如 "STATUS"、"PROC GRAY" 或 "DUMP"
 static char s_camera_pc_dump_line[PC_DUMP_COMMAND_LINE_LEN];
 
@@ -184,7 +184,7 @@ uint32_t Camera_PC_Dump_GetWordCount(void)
 }
 
 // 放弃尚未完成的文本行并恢复干净解析状态，不产生任何 UART 输出。
-// UART DMA 恢复或 StreamBuffer 溢出后由 CameraServiceTask 调用，避免残缺旧命令污染下一行。
+// UART DMA 恢复或 StreamBuffer 溢出后由 CommTask 调用，避免残缺旧命令污染下一行。
 void Camera_PC_Dump_ResetCommandParser(void)
 {
     // UART 错误恢复或 StreamBuffer 溢出后，需要放弃当前接收到一半的旧命令
@@ -194,14 +194,14 @@ void Camera_PC_Dump_ResetCommandParser(void)
                              &s_camera_pc_dump_line_overflow);
 }
 
-// 在 CameraServiceTask 上下文把一个 dispatcher 判定为文本的字节送入行解析器。
-// 本函数跨调用积累字符：DUMP 只返回事件给上层，其他完整命令才交给 camera_cli 立即处理。
+// 在 CommTask 上下文把一个 dispatcher 判定为文本的字节送入行解析器。
+// 本函数跨调用积累字符：DUMP 只返回事件，其他完整命令交给 camera_cli 解析并提交。
 // 命令最多保存 31 个字符；超长后持续丢弃到 CR/LF，防止截断内容被当成另一条合法命令。
 uint8_t Camera_PC_Dump_FeedCommandByte(UART_HandleTypeDef *huart, uint8_t byte)
 {
-    if (huart == NULL)                             // CLI 回复需要使用 UART 句柄，因此必须先检查
+    if (huart == NULL)                             // 保留接口仍要求有效 UART，解析阶段本身不发送
     {
-        return CAMERA_PC_DUMP_CMD_NONE;            // UART 句柄无效，不能继续解析和输出响应
+        return CAMERA_PC_DUMP_CMD_NONE;            // UART 句柄无效，不能继续形成可执行命令
     }
 
     // 收到回车 '\r' 或换行 '\n' 时，认为当前文本行已经结束
@@ -210,7 +210,7 @@ uint8_t Camera_PC_Dump_FeedCommandByte(UART_HandleTypeDef *huart, uint8_t byte)
         // 如果此前命令长度超过 31 字节，则整条命令视为无效命令
         if (s_camera_pc_dump_line_overflow != 0U)
         {
-            // 将固定字符串 "UNKNOWN" 交给 CLI，使 CLI 按未知命令路径输出一次错误提示
+            // 将固定字符串 "UNKNOWN" 交给 CLI，使其提交一次未知命令错误值对象
             (void)Camera_CLI_HandleLine(huart, "UNKNOWN");
 
             // 当前超长命令已经到达行结束符，可以恢复正常命令接收状态
@@ -251,7 +251,7 @@ uint8_t Camera_PC_Dump_FeedCommandByte(UART_HandleTypeDef *huart, uint8_t byte)
             return CAMERA_PC_DUMP_CMD_DUMP;
         }
 
-        // HELP、STATUS、PROC、THR、RESET 等其他命令由 camera_cli 模块解释和执行
+        // HELP、STATUS、PROC、THR、RESET 等命令由 camera_cli 解析并提交 CommandQueue
         (void)Camera_CLI_HandleLine(huart, s_camera_pc_dump_line);
 
         // 当前命令已经处理完成，清空缓存，开始等待下一条命令
@@ -260,7 +260,7 @@ uint8_t Camera_PC_Dump_FeedCommandByte(UART_HandleTypeDef *huart, uint8_t byte)
                                  &s_camera_pc_dump_line_length,
                                  &s_camera_pc_dump_line_overflow);
 
-        return CAMERA_PC_DUMP_CMD_CLI;             // 表示一个普通 CLI 命令已经处理完成
+        return CAMERA_PC_DUMP_CMD_CLI;             // 表示普通 CLI 命令已完成解析和提交
     }
 
     // 小于 0x20 的字符通常属于控制字符，但制表符 '\t' 被保留用于命令中的空白
@@ -299,7 +299,7 @@ uint8_t Camera_PC_Dump_FeedCommandByte(UART_HandleTypeDef *huart, uint8_t byte)
     return CAMERA_PC_DUMP_CMD_PENDING;
 }
 
-// 将已经 prepare/commit 的 front frame 封装为 OV56RGB5，并在 CameraServiceTask 中阻塞发送。
+// 将已经 prepare/commit 的 front frame 封装为 OV56RGB5，并在 ControlTask 中阻塞发送。
 // 文本 DUMP 与 binary image request 共用此发送函数；本函数不启动采集，也绝不能从 ISR 调用。
 // 三段 HAL_UART_Transmit() 都使用 HAL_MAX_DELAY，模块没有额外的软件 timeout。
 uint8_t Camera_PC_Dump_SendFrame(UART_HandleTypeDef *huart, uint32_t frame_id)

@@ -1,6 +1,7 @@
 #ifndef ISP_OV5640_CAMERA_CLI_H
 #define ISP_OV5640_CAMERA_CLI_H
 
+#include "camera_command.h"        // CLI 解析输出和执行入口使用的统一命令值对象
 #include "camera_image_process.h"  // BYPASS/GRAY/BINARY 模式和图像统计类型
 #include "stm32f4xx_hal.h"         // CLI 文本响应使用的 UART 句柄
 
@@ -8,11 +9,11 @@
 
 /**
  * @file camera_cli.h
- * @brief CameraServiceTask 使用的文本 CLI 和运行配置接口
+ * @brief CommTask parser 与 ControlTask executor 共用的文本 CLI 接口
  *
- * 上游先形成 NUL 结尾完整文本行，再调用 HandleLine()。PROC/THR/RESET 只更新配置，
- * 下一次帧准备才读取；STATUS 与 SD STATUS 只读缓存；SD SNAPSHOT 同步执行存储流程。
- * DUMP 在上游 camera_pc_dump 中转换为业务事件，不由 HandleLine() 直接执行。
+ * 上游先形成 NUL 结尾完整文本行，再调用 HandleLine()。HandleLine() 只识别命令、
+ * 校验参数并向 CommandQueue 提交值对象；ControlTask 出队后调用 ExecuteCommand()
+ * 执行原有文本输出、配置或 SD 业务。DUMP 仍由上游文本行模块形成命令事件。
  */
 
 /**
@@ -24,7 +25,8 @@ typedef enum
     CAMERA_CLI_ERROR = 1,             /**< 当前用于 SD SNAPSHOT 总流程失败 */
     CAMERA_CLI_ERROR_NULL = 2,        /**< UART 句柄或命令行为空 */
     CAMERA_CLI_ERROR_UNKNOWN_CMD = 3, /**< 未识别的命令 */
-    CAMERA_CLI_ERROR_BAD_ARG = 4      /**< 命令参数非法 */
+    CAMERA_CLI_ERROR_BAD_ARG = 4,     /**< 命令参数非法 */
+    CAMERA_CLI_ERROR_QUEUE_FULL = 5   /**< CommandQueue 未初始化或没有空闲槽位 */
 } CameraCliStatus_t;
 
 /**
@@ -44,21 +46,31 @@ typedef struct
 void Camera_CLI_Init(void);
 
 /**
- * @brief 处理一行完整的 UART CLI 命令
- * @param huart 用于发送命令响应的 UART 句柄
+ * @brief 解析一行完整的 UART CLI 命令并提交 CameraCommand_t
+ * @param huart 当前 UART 句柄；保留参数校验兼容，parser 本身不进行 UART TX
  * @param line 以空字符结尾的命令行
- * @return 命令处理结果，见 @ref CameraCliStatus_t
- * @note 在 CameraServiceTask 中调用；输入必须是 NUL 结尾完整行，正常上游最多 31 字符。
- *       HELP 固定包含 8 项；DUMP 已由上游处理，SD SNAPSHOT 会在本调用中同步执行。
+ * @return 解析和提交结果，见 @ref CameraCliStatus_t
+ * @note 输入必须是 NUL 结尾完整行，正常上游最多 31 字符。有效命令和既有 parser
+ *       错误都会形成值对象；HELP 固定包含 8 项，DUMP 仍由上游识别后提交。
  */
 CameraCliStatus_t Camera_CLI_HandleLine(
     UART_HandleTypeDef *huart,
     const char *line);
 
 /**
+ * @brief 在 ControlTask 中执行一个已经出队的文本 CLI 命令
+ * @param huart 用于保持原有 CLI 文本响应的 UART 句柄
+ * @param command 已从 CommandQueue 复制出的稳定命令值对象
+ * @return 命令执行结果；DUMP 和 IMAGE_REQUEST 不由本接口处理
+ */
+CameraCliStatus_t Camera_CLI_ExecuteCommand(
+    UART_HandleTypeDef *huart,
+    const CameraCommand_t *command);
+
+/**
  * @brief 获取当前图像处理模式
  * @return 当前 BYPASS、GRAY 或 BINARY 模式
- * @note 由同一 CameraServiceTask 的帧准备流程读取，无额外锁保护。
+ * @note 由同一 ControlTask 的帧准备流程读取，无额外锁保护。
  */
 CameraProcessMode_t Camera_CLI_GetProcessMode(void);
 

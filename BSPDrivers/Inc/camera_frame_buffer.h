@@ -12,7 +12,7 @@
  * 调用 @ref Camera_FrameBuffer_CommitBackBuffer 交换角色，从而避免消费者读到
  * 正在变化的像素。接口返回的是内部静态缓冲区地址，不会分配动态内存。
  *
- * @note 当前工程由 CameraServiceTask 串行组织写入、提交和读取。该模块自身
+ * @note 当前工程由 ControlTask 串行组织写入、提交和读取。该模块自身
  *       不创建互斥锁，也不保证任意任务在读取期间并发 commit 的安全性。
  */
 

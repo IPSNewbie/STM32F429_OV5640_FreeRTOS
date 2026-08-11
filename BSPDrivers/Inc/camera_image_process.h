@@ -7,7 +7,7 @@
  * @file camera_image_process.h
  * @brief 固定 160x120 RGB565 双缓冲图像处理接口
  *
- * CameraServiceTask 从稳定 front 读取，在 back 中生成 BYPASS、GRAY 或 BINARY 结果，
+ * ControlTask 从稳定 front 读取，在 back 中生成 BYPASS、GRAY 或 BINARY 结果，
  * 完整成功后才 commit。输出格式始终保持 RGB565，因此 DUMP 和 SD SNAPSHOT 无需
  * 随模式改变帧尺寸或协议。
  */
@@ -53,7 +53,7 @@ typedef struct
  * @param mode BYPASS、GRAY 或 BINARY 模式
  * @param binary_threshold 二值化阈值；非 BINARY 模式下保留该参数
  * @return 图像处理结果
- * @note 由 CameraServiceTask 调用。输入来自稳定 front，输出写 back；任何失败都不
+ * @note 由 ControlTask 调用。输入来自稳定 front，输出写 back；任何失败都不
  *       commit，避免 DUMP/SD 读取半处理帧。模块本身不提供并发锁。
  */
 CameraImageProcessStatus_t Camera_ImageProcess_ApplyToFrameBuffer(CameraProcessMode_t mode,

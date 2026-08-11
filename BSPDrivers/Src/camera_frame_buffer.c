@@ -16,7 +16,7 @@
 // 如果 DUMP 或 SD SNAPSHOT 直接读取 back buffer，读取期间 DMA/算法仍可能覆盖它，
 // 就会得到同一帧前后部分来自不同采集时刻的“撕裂”图像。因此只有生产者确认
 // 整帧写完后才能 commit，消费者也必须读取 front，而不能绕过本模块读取 back。
-// 当前工程由 CameraServiceTask 串行组织采集、处理、发送和暂存，索引交换本身
+// 当前工程由 ControlTask 串行组织采集、处理、发送和暂存，索引交换本身
 // 不提供面向任意多任务并发调用的锁或引用计数保护。
 //============================================================================
 
@@ -46,7 +46,7 @@ uint8_t *Camera_FrameBuffer_GetBackBuffer(void)
 }
 
 // 返回当前 front buffer，供 UART、SD 或其他消费者读取最近一次完整提交的帧。
-// 返回的是内部存储地址而不是副本；当前架构依靠 CameraServiceTask 串行化来避免读取中途再次 commit。
+// 返回的是内部存储地址而不是副本；当前架构依靠 ControlTask 串行化来避免读取中途再次 commit。
 uint8_t *Camera_FrameBuffer_GetFrontBuffer(void)
 {
     return s_camera_frame_buffers[s_camera_fb_front_index];

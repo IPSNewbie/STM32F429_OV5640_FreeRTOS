@@ -8,10 +8,10 @@
 
 /**
  * @file uart_rx_dma.h
- * @brief UART circular DMA、ISR 与 CameraServiceTask 之间的静态接收通道
+ * @brief UART circular DMA、ISR 与 CommTask 之间的静态接收通道
  *
  * 数据依次经过 128 字节 circular DMA、HT/TC/IDLE ISR、512 字节 StreamBuffer，
- * 最终由 CameraServiceTask 读取。ISR 只搬运数据和提出恢复请求；HAL Abort/Restart、
+ * 最终由 CommTask 读取。ISR 只搬运数据和提出恢复请求；HAL Abort/Restart、
  * 协议重同步及缓存排空在任务上下文执行。模块为单 UART、单 reader 设计。
  */
 
@@ -63,7 +63,7 @@ HAL_StatusTypeDef UART_RxDma_Init(UART_HandleTypeDef *huart);
  * @param buffer_size 目标缓冲区大小
  * @param timeout_ms 最长等待时间，单位为毫秒
  * @return 实际读取字节数；0 也可能表示超时、未初始化、参数非法或正在等待恢复
- * @note 仅限 CameraServiceTask 单 reader；ISR 使用 FromISR 写入，不能调用本接口。
+ * @note 仅限 CommTask 单 reader；ISR 使用 FromISR 写入，不能调用本接口。
  */
 size_t UART_RxDma_Read(uint8_t *buffer,
                        size_t buffer_size,
