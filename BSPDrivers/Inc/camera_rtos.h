@@ -124,6 +124,7 @@ typedef struct
     volatile uint32_t comm_stack_min_free_bytes;  /**< CommTask 历史最小剩余栈，单位 B */
     volatile uint32_t control_stack_min_free_bytes; /**< ControlTask 历史最小剩余栈，单位 B */
     volatile uint32_t capture_stack_min_free_bytes; /**< CaptureTask stack high-water mark in bytes */
+    volatile uint32_t process_stack_min_free_bytes; /**< ProcessTask 历史最小剩余栈，单位 B */
     volatile uint32_t monitor_stack_min_free_bytes; /**< MonitorTask 历史最小剩余栈，即 stack high-water mark，单位 B */
     volatile uint32_t free_heap_bytes;            /**< 当前 FreeRTOS Heap 余量，单位 B */
     volatile uint32_t min_ever_free_heap_bytes;   /**< FreeRTOS 历史最小 Heap 余量，单位 B */

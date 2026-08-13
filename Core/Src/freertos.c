@@ -27,6 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "camera_command.h"
 #include "camera_capture.h"
+#include "camera_process_task.h"
 #include "camera_rtos.h"
 /* USER CODE END Includes */
 
@@ -70,6 +71,13 @@ const osThreadAttr_t CaptureTask_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
 };
+/* Definitions for ProcessTask */
+osThreadId_t ProcessTaskHandle;
+const osThreadAttr_t ProcessTask_attributes = {
+  .name = "ProcessTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
 /* Definitions for MonitorTask */
 osThreadId_t MonitorTaskHandle;
 const osThreadAttr_t MonitorTask_attributes = {
@@ -86,6 +94,7 @@ const osThreadAttr_t MonitorTask_attributes = {
 void StartCommTask(void *argument);
 void StartControlTask(void *argument);
 void StartCaptureTask(void *argument);
+void StartProcessTask(void *argument);
 void StartMonitorTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
@@ -121,6 +130,10 @@ void MX_FREERTOS_Init(void) {
   {
     Error_Handler();
   }
+  if (Camera_ProcessTaskInit() == false)
+  {
+    Error_Handler();
+  }
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -133,6 +146,9 @@ void MX_FREERTOS_Init(void) {
   /* creation of CaptureTask */
   CaptureTaskHandle = osThreadNew(StartCaptureTask, NULL, &CaptureTask_attributes);
 
+  /* creation of ProcessTask */
+  ProcessTaskHandle = osThreadNew(StartProcessTask, NULL, &ProcessTask_attributes);
+
   /* creation of MonitorTask */
   MonitorTaskHandle = osThreadNew(StartMonitorTask, NULL, &MonitorTask_attributes);
 
@@ -141,6 +157,7 @@ void MX_FREERTOS_Init(void) {
   if ((CommTaskHandle == NULL) ||
     (ControlTaskHandle == NULL) ||
     (CaptureTaskHandle == NULL) ||
+    (ProcessTaskHandle == NULL) ||
     (MonitorTaskHandle == NULL))
   {
     Error_Handler();
@@ -182,6 +199,11 @@ void StartCaptureTask(void *argument)
   /* USER CODE BEGIN StartCaptureTask */
   Camera_CaptureTask(argument);
   /* USER CODE END StartCaptureTask */
+}
+
+void StartProcessTask(void *argument)
+{
+  Camera_ProcessTask(argument);
 }
 
 /* USER CODE BEGIN Header_StartMonitorTask */

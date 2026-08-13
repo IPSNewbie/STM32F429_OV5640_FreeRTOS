@@ -299,6 +299,10 @@ static void Camera_CLI_PrintStatus(UART_HandleTypeDef *huart)
         (stats != NULL) ? stats->capture_stack_min_free_bytes : 0U);
     Camera_CLI_WriteFieldU32(
         huart,
+        "stack_process_min",
+        (stats != NULL) ? stats->process_stack_min_free_bytes : 0U);
+    Camera_CLI_WriteFieldU32(
+        huart,
         "stack_monitor_min",
         (stats != NULL) ? stats->monitor_stack_min_free_bytes : 0U);
 

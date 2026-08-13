@@ -6,6 +6,7 @@
 #include "camera_frame_buffer.h"     // front/back 双缓冲提交和稳定 front frame 访问
 #include "camera_image_process.h"    // BYPASS、GRAY、BINARY 图像处理及统计
 #include "camera_pc_dump.h"          // 文本 DUMP 解析、OV56RGB5 发送和 DCMI back 地址
+#include "camera_process_task.h"     // ProcessRequest/ResultQueue 与 ProcessTask 接口
 #include "camera_snapshot_control.h" // SDIO takeover 期间阻止 DUMP/binary request 的软件保护
 #include "camera_uart_dispatcher.h"  // 在同一 UART 字节流中区分文本与二进制图像请求
 #include "bsp_log.h"                 // IWDG 停止刷新时输出一次故障原因
@@ -24,13 +25,14 @@
 // 1. 在 CommTask 中读取 USART1 RX DMA 的 StreamBuffer 并维护文本/binary parser；
 // 2. 将文本 CLI/DUMP 或 binary image request 转换为 CameraCommand_t 并提交队列；
 // 3. 从 CommandQueue 取出命令并串行启动原有业务，通过 CaptureTask 请求 DCMI 快照；
-// 4. 按 back→front→图像处理→再次提交的顺序发布稳定 RGB565 帧；
+// 4. 编排 back→front→ProcessTask 图像处理→再次提交，发布稳定 RGB565 帧；
 // 5. 让文本 DUMP、二进制请求和 SD SNAPSHOT 复用同一帧准备路径；
 // 6. 在 MonitorTask 中采样任务栈、Heap、心跳并决定是否刷新 IWDG。
 //
 // 任务上下文关系：CommTask 只解析和提交；ControlTask 是 CommandQueue consumer，
-// 串行执行所有控制、图像和 SD 业务；CaptureTask 是 DCMI/DMA 唯一任务级所有者。
-// DCMI 帧事件 ISR 只通知 CaptureTask，不在中断中做图像处理、UART 或 FatFs 操作。
+// 串行编排所有控制和 SD 业务；CaptureTask 是 DCMI/DMA 唯一任务级所有者，
+// ProcessTask 是图像处理的唯一执行者。DCMI 帧事件 ISR 只通知 CaptureTask，
+// 不在中断中做图像处理、UART 或 FatFs 操作。
 // MonitorTask 不参与摄像头业务，只观察健康状态并独占 IWDG 刷新职责。
 //
 // 数据关系：DCMI/算法写 back，整帧完成后 commit 为 front；DUMP 读取 front，
@@ -93,6 +95,24 @@ static uint32_t s_camera_rtos_frame_id = 1U;
 // IWDG 句柄在调度器启动前配置；运行期只有 MonitorTask 根据全局健康条件刷新。
 static IWDG_HandleTypeDef s_camera_rtos_iwdg;
 
+static uint32_t Camera_RTOS_RemainingTimeoutMs(TickType_t start_tick,
+                                                TickType_t timeout_ticks)
+{
+    TickType_t elapsed_ticks = xTaskGetTickCount() - start_tick;
+    TickType_t remaining_ticks;
+    uint32_t remaining_ms;
+
+    if (elapsed_ticks >= timeout_ticks)
+    {
+        return 0U;
+    }
+
+    remaining_ticks = timeout_ticks - elapsed_ticks;
+    remaining_ms = (uint32_t)remaining_ticks * (uint32_t)portTICK_PERIOD_MS;
+
+    return (remaining_ms != 0U) ? remaining_ms : 1U;
+}
+
 // 在 Camera_RTOS_Init() 中建立干净的诊断基线，不改变 UART、DCMI 或缓冲区状态。
 // 字段按协议统计、资源监控、Hook/心跳和 IWDG 四组清零，避免上次运行残值进入 STATUS。
 static void Camera_RTOS_ClearStats(void)
@@ -126,6 +146,7 @@ static void Camera_RTOS_ClearStats(void)
     s_camera_rtos_stats.comm_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.control_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.capture_stack_min_free_bytes = 0U;
+    s_camera_rtos_stats.process_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.monitor_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.free_heap_bytes = 0U;
     s_camera_rtos_stats.min_ever_free_heap_bytes = 0U;
@@ -231,6 +252,8 @@ static void Camera_RTOS_UpdateMonitorHealthStats(void)
         Camera_RTOS_GetCurrentTaskStackMinFreeBytes();
     s_camera_rtos_stats.capture_stack_min_free_bytes =
         (capture_stats != NULL) ? capture_stats->stack_min_free_bytes : 0U;
+    s_camera_rtos_stats.process_stack_min_free_bytes =
+        Camera_ProcessTaskGetStackMinFreeBytes();
     s_camera_rtos_stats.free_heap_bytes = (uint32_t)xPortGetFreeHeapSize();
     s_camera_rtos_stats.min_ever_free_heap_bytes =
         (uint32_t)xPortGetMinimumEverFreeHeapSize();
@@ -437,10 +460,13 @@ static uint8_t Camera_RTOS_DiscardOverflowedInput(void)
 // 两条业务链复用这里，是为了避免各自维护不同的采集时序、超时和处理模式规则。
 uint32_t Camera_RTOS_PrepareRgb565Frame(uint32_t timeout_ms)
 {
+    CameraProcessResult_t task_process_ret;
+    TickType_t prepare_start_tick;
+    TickType_t prepare_timeout_ticks;
+    uint32_t process_remaining_ms;
     CameraCaptureResult_t capture_ret;          // CaptureTask 返回的启动、完成、超时或 HAL 错误
     const CameraCaptureStats_t *capture_stats;  // 保留 DCMI 启动 helper 的具体子错误
     CameraFrameBufferStatus_t commit_ret;      // 将已完成 back 发布为 front 的结果
-    CameraImageProcessStatus_t process_ret;    // BYPASS/GRAY/BINARY 处理及第二次提交结果
     CameraProcessMode_t process_mode;          // CLI 当前选择的处理模式，本次准备期间保持该快照值
     uint8_t binary_threshold;                  // BINARY 模式使用的 0~255 灰度阈值快照
 
@@ -449,6 +475,18 @@ uint32_t Camera_RTOS_PrepareRgb565Frame(uint32_t timeout_ms)
     {
         return CAMERA_RTOS_ERR_BAD_STATE;
     }
+
+    if (Camera_ProcessTaskIsIdle() == false)
+    {
+        return CAMERA_RTOS_ERR_BAD_STATE;
+    }
+
+    prepare_timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    if (prepare_timeout_ticks == 0U)
+    {
+        prepare_timeout_ticks = 1U;
+    }
+    prepare_start_tick = xTaskGetTickCount();
 
     // CaptureTask owns DCMI/DMA and the current back buffer until raw capture ends.
     // This synchronous call blocks ControlTask on a completion notification, not polling.
@@ -486,22 +524,23 @@ uint32_t Camera_RTOS_PrepareRgb565Frame(uint32_t timeout_ms)
     process_mode = Camera_CLI_GetProcessMode();
     binary_threshold = Camera_CLI_GetBinaryThreshold();
 
-    // ApplyToFrameBuffer() 从原始 front 读取，向当前 back 写处理结果；只有算法完整
-    // 成功后它才执行第二次 commit。返回成功时，最终 front 就是 DUMP 与 SD 共用帧。
-    process_ret = Camera_ImageProcess_ApplyToFrameBuffer(process_mode, binary_threshold);
-    if (process_ret != CAMERA_PROCESS_OK)
+    process_remaining_ms = Camera_RTOS_RemainingTimeoutMs(
+        prepare_start_tick,
+        prepare_timeout_ticks);
+    if (process_remaining_ms == 0U)
     {
-        // 用户选择的 GRAY/BINARY 等处理失败时，回退到 BYPASS，把稳定原始 front
-        // 完整复制到 back 并提交，尽量保留可发送/保存的一帧而不是发布半成品。
-        process_ret = Camera_ImageProcess_ApplyToFrameBuffer(
-            CAMERA_PROCESS_MODE_BYPASS,
-            binary_threshold);
-        if (process_ret != CAMERA_PROCESS_OK)
-        {
-            // 连 BYPASS 都失败说明帧视图、尺寸或提交链路已异常，不能宣称准备成功。
-            return CAMERA_RTOS_ERR_IMAGE_PROCESS_BASE | (uint32_t)process_ret;
-        }
-        // BYPASS 回退成功后最终 front 仍是一帧完整原始 RGB565，允许业务继续。
+        return CAMERA_RTOS_ERR_IMAGE_PROCESS_BASE |
+            (uint32_t)CAMERA_PROCESS_RESULT_TIMEOUT;
+    }
+
+    task_process_ret = Camera_ProcessRequestFrame(
+        process_mode,
+        binary_threshold,
+        process_remaining_ms);
+    if (task_process_ret != CAMERA_PROCESS_RESULT_OK)
+    {
+        return CAMERA_RTOS_ERR_IMAGE_PROCESS_BASE |
+            (uint32_t)task_process_ret;
     }
 
     return CAMERA_RTOS_ERR_NONE;

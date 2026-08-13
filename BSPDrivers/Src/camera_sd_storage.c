@@ -1,6 +1,7 @@
 #include "camera_sd_storage.h"       // SD takeover、FatFs、BMP 和状态缓存公开接口
 
 #include "bsp_sccb.h"                // 保存、屏蔽和恢复 OV5640 0x3018 DVP pad
+#include "bsp_log.h"                 // 仅在 SD/FatFs 失败现场输出最小诊断
 #include "camera_dcmi_dma.h"         // 停止/恢复 DCMI 及 DMA 句柄关联
 #include "camera_frame_buffer.h"     // 获取已提交的稳定 front frame
 #include "camera_rtos.h"             // 复用 DUMP 的公共 RGB565 帧准备路径
@@ -8,6 +9,8 @@
 #include "ff.h"                      // FatFs mount、stat、open、write、close API
 #include "diskio.h"                  // FatFs ioctl 命令和块设备返回类型
 #include "stm32f4xx_hal.h"           // SDIO、GPIO、时钟和 HAL SD polling API
+#include "FreeRTOS.h"                // task.h 所需内核基础定义
+#include "task.h"                    // 写块 polling 期间仅暂停 Task 调度
 
 #include <stddef.h>                   // 提供 NULL
 #include <string.h>                   // staging 复制、BMP header 清零和文件名缓存复制
@@ -202,6 +205,7 @@ static uint32_t Camera_SDStorage_FindNextSnapshotFileName(void)
         }
         if (fatfs_result != FR_OK)
         {
+            LOG_RAW("[SD][FSTAT] fr=%d\r\n", (int)fatfs_result);
             s_camera_sd_candidate_file_name[0] = '\0';
             return CAMERA_SD_ERR_FILE_SCAN_FAILED;
         }
@@ -310,6 +314,8 @@ static uint32_t Camera_SDStorage_WriteBmp24(
     if ((fatfs_result != FR_OK) ||
         (chunk_bytes_written != (UINT)CAMERA_SD_BMP_HEADER_SIZE))
     {
+        LOG_RAW("[SD][FWRITE] fr=%d bw=%u\r\n",
+                (int)fatfs_result, (unsigned int)chunk_bytes_written);
         return (s_camera_sd_fatfs_disk_error != CAMERA_SD_OK) ?
             s_camera_sd_fatfs_disk_error :
             CAMERA_SD_ERR_FATFS_FILE_WRITE_FAILED;
@@ -327,6 +333,8 @@ static uint32_t Camera_SDStorage_WriteBmp24(
         if ((fatfs_result != FR_OK) ||
             (chunk_bytes_written != (UINT)CAMERA_SD_BMP_ROW_STRIDE))
         {
+            LOG_RAW("[SD][FWRITE] fr=%d bw=%u\r\n",
+                    (int)fatfs_result, (unsigned int)chunk_bytes_written);
             return (s_camera_sd_fatfs_disk_error != CAMERA_SD_OK) ?
                 s_camera_sd_fatfs_disk_error :
                 CAMERA_SD_ERR_FATFS_FILE_WRITE_FAILED;
@@ -1040,6 +1048,8 @@ uint32_t Camera_SDStorage_FatFsDiskRead(
     uint32_t count)
 {
     HAL_StatusTypeDef hal_status;
+    uint32_t hal_error;
+    uint32_t sdio_status;
     uint32_t result;
 
     if ((buffer == NULL) || (count == 0U))
@@ -1062,17 +1072,23 @@ uint32_t Camera_SDStorage_FatFsDiskRead(
         result = Camera_SDStorage_WaitForCardTransfer();
         if (result == CAMERA_SD_OK)
         {
+            vTaskSuspendAll();
             hal_status = HAL_SD_ReadBlocks(
                 &s_camera_sd_handle,
                 buffer,
                 sector,
                 count,
                 CAMERA_SD_FATFS_READ_TIMEOUT_MS);
+            (void)xTaskResumeAll();
+            hal_error = s_camera_sd_handle.ErrorCode;
+            sdio_status = SDIO->STA;
             s_camera_sd_status.last_sd_rw_status = (uint32_t)hal_status;
-            s_camera_sd_status.last_sd_rw_error =
-                HAL_SD_GetError(&s_camera_sd_handle);
+            s_camera_sd_status.last_sd_rw_error = hal_error;
             if (hal_status != HAL_OK)
             {
+                LOG_RAW("[SDIO][RFAIL] sector=%lu count=%u hal=%d err=0x%08lX sta=0x%08lX\r\n",
+                        (unsigned long)sector, (unsigned int)count, (int)hal_status,
+                        (unsigned long)hal_error, (unsigned long)sdio_status);
                 result = CAMERA_SD_ERR_FATFS_DISK_READ_FAILED;
             }
             else
@@ -1096,6 +1112,8 @@ uint32_t Camera_SDStorage_FatFsDiskWrite(
     uint32_t count)
 {
     HAL_StatusTypeDef hal_status;
+    uint32_t hal_error;
+    uint32_t sdio_status;
     uint32_t result;
 
     if ((buffer == NULL) || (count == 0U))
@@ -1119,17 +1137,23 @@ uint32_t Camera_SDStorage_FatFsDiskWrite(
         result = Camera_SDStorage_WaitForCardTransfer();
         if (result == CAMERA_SD_OK)
         {
+            vTaskSuspendAll();
             hal_status = HAL_SD_WriteBlocks(
                 &s_camera_sd_handle,
                 (uint8_t *)buffer,
                 sector,
                 count,
                 CAMERA_SD_FATFS_WRITE_TIMEOUT_MS);
+            (void)xTaskResumeAll();
+            hal_error = s_camera_sd_handle.ErrorCode;
+            sdio_status = SDIO->STA;
             s_camera_sd_status.last_sd_rw_status = (uint32_t)hal_status;
-            s_camera_sd_status.last_sd_rw_error =
-                HAL_SD_GetError(&s_camera_sd_handle);
+            s_camera_sd_status.last_sd_rw_error = hal_error;
             if (hal_status != HAL_OK)
             {
+                LOG_RAW("[SDIO][WFAIL] sector=%lu count=%u hal=%d err=0x%08lX sta=0x%08lX\r\n",
+                        (unsigned long)sector, (unsigned int)count, (int)hal_status,
+                        (unsigned long)hal_error, (unsigned long)sdio_status);
                 result = CAMERA_SD_ERR_FATFS_DISK_WRITE_FAILED;
             }
             else
