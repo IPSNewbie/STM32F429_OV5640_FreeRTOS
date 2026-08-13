@@ -1,6 +1,7 @@
 #ifndef ISP_OV5640_CAMERA_SD_STORAGE_H
 #define ISP_OV5640_CAMERA_SD_STORAGE_H
 
+#include <stdbool.h>
 #include <stdint.h>  // 提供错误码、状态字段、扇区号和耗时的固定宽度类型
 
 /**
@@ -132,6 +133,15 @@ typedef struct
  * @note 只清除软件状态，不访问 SD 卡、FatFs 或共享引脚。
  */
 void Camera_SDStorage_InitState(void);
+
+/** Create the depth-one Storage request/result queues. */
+bool Camera_SDStorage_TaskInit(void);
+
+/** StorageTask entry; waits indefinitely for an already-staged snapshot. */
+void Camera_SDStorage_Task(void *argument);
+
+/** StorageTask historical minimum remaining stack, in bytes. */
+uint32_t Camera_SDStorage_GetStackMinFreeBytes(void);
 
 /**
  * @brief 获取 SD 存储缓存状态

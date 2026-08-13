@@ -10,6 +10,7 @@
 #include "diskio.h"                  // FatFs ioctl 命令和块设备返回类型
 #include "stm32f4xx_hal.h"           // SDIO、GPIO、时钟和 HAL SD polling API
 #include "FreeRTOS.h"                // task.h 所需内核基础定义
+#include "queue.h"                   // Storage request/result depth-one queues
 #include "task.h"                    // 写块 polling 期间仅暂停 Task 调度
 
 #include <stddef.h>                   // 提供 NULL
@@ -100,6 +101,19 @@ typedef struct
     uint32_t pin_number;
 } CameraSdLine_t;
 
+typedef struct
+{
+    uint32_t request_id;
+    uint32_t total_start_tick;
+    uint32_t restore_continuous_capture;
+} CameraStorageRequest_t;
+
+typedef struct
+{
+    uint32_t request_id;
+    uint32_t result;
+} CameraStorageResponse_t;
+
 static const CameraSdLine_t s_camera_sd_lines[] =
 {
     {GPIOC, 8U},
@@ -144,6 +158,16 @@ static uint32_t s_camera_sd_fatfs_session_active;
 static uint32_t s_camera_sd_fatfs_write_allowed;
 // FatFs 只返回通用 FRESULT，该字段保存更具体的 HAL/diskio 根因供上层诊断。
 static uint32_t s_camera_sd_fatfs_disk_error;
+static QueueHandle_t s_camera_storage_request_queue;
+static QueueHandle_t s_camera_storage_result_queue;
+static uint32_t s_camera_storage_request_id;
+static volatile uint32_t s_camera_storage_stack_min_free_bytes;
+static CameraSdSnapshotResult_t s_camera_storage_result_info;
+
+static uint32_t Camera_SDStorage_SaveStagedSnapshotFrame(
+    CameraSdSnapshotResult_t *prepared_result,
+    uint32_t total_start_tick,
+    uint32_t restore_continuous_capture);
 
 // 更新最近一次 SD 操作的缓存错误信息
 static void Camera_SDStorage_SetLastError(uint32_t error_code)
@@ -744,6 +768,60 @@ void Camera_SDStorage_InitState(void)
     s_camera_sd_fatfs_disk_error = CAMERA_SD_OK;
     Camera_SDStorage_SetSaveError(CAMERA_SD_OK);
     Camera_SDStorage_SetLastError(CAMERA_SD_OK);
+}
+
+bool Camera_SDStorage_TaskInit(void)
+{
+    s_camera_storage_request_queue = xQueueCreate(
+        1U,
+        sizeof(CameraStorageRequest_t));
+    s_camera_storage_result_queue = xQueueCreate(
+        1U,
+        sizeof(CameraStorageResponse_t));
+    s_camera_storage_request_id = 0U;
+    s_camera_storage_stack_min_free_bytes = 0U;
+
+    return ((s_camera_storage_request_queue != NULL) &&
+            (s_camera_storage_result_queue != NULL));
+}
+
+void Camera_SDStorage_Task(void *argument)
+{
+    CameraStorageRequest_t request;
+    CameraStorageResponse_t response;
+
+    (void)argument;
+    s_camera_storage_stack_min_free_bytes =
+        (uint32_t)uxTaskGetStackHighWaterMark(NULL) *
+        (uint32_t)sizeof(StackType_t);
+    for (;;)
+    {
+        if (xQueueReceive(
+                s_camera_storage_request_queue,
+                &request,
+                portMAX_DELAY) != pdPASS)
+        {
+            continue;
+        }
+
+        s_camera_storage_stack_min_free_bytes =
+            (uint32_t)uxTaskGetStackHighWaterMark(NULL) *
+            (uint32_t)sizeof(StackType_t);
+        response.request_id = request.request_id;
+        response.result = Camera_SDStorage_SaveStagedSnapshotFrame(
+            &s_camera_storage_result_info,
+            request.total_start_tick,
+            request.restore_continuous_capture);
+        s_camera_storage_stack_min_free_bytes =
+            (uint32_t)uxTaskGetStackHighWaterMark(NULL) *
+            (uint32_t)sizeof(StackType_t);
+        (void)xQueueSend(s_camera_storage_result_queue, &response, 0U);
+    }
+}
+
+uint32_t Camera_SDStorage_GetStackMinFreeBytes(void)
+{
+    return s_camera_storage_stack_min_free_bytes;
 }
 
 // 仅读取缓存状态；SD STATUS 通过本接口查询，不能在查询时 mount、takeover 或访问卡。
@@ -1481,23 +1559,20 @@ static uint32_t Camera_SDStorage_PrepareAndStageFrontFrame(
 uint32_t Camera_SDStorage_SaveSnapshotFrame(
     CameraSdSnapshotResult_t *snapshot_result)
 {
-    CameraSdSnapshotResult_t result_info;  // 返回 CLI 的文件、阶段、耗时和诊断统计
+    CameraSdSnapshotResult_t result_info;  // ControlTask stack remains valid while it waits for StorageTask
+    CameraStorageRequest_t storage_request;
+    CameraStorageResponse_t storage_response;
     uint32_t result = CAMERA_SD_OK;        // 保留业务/cleanup 遇到的第一个总错误
-    uint32_t cleanup_result = CAMERA_SD_OK; // 文件、卸载及 takeover 清理结果
-    uint32_t restore_result = CAMERA_SD_OK; // DVP/DCMI 图像链路恢复结果
     uint32_t step_result;                  // 当前阶段的临时返回码
-    uint32_t camera_restore_required = 0U; // guard 已进入，最终必须恢复 camera link
-    uint32_t dvp_restore_required = 0U;    // 已保存过原 0x3018，后续无论 mask 成败都尝试恢复
-    uint32_t takeover_attempted = 0U;      // 调用前置位，覆盖 GPIO 部分切换后失败的清理
-    uint32_t mount_attempted = 0U;         // f_mount 已调用，cleanup 必须尝试 unmount
-    uint32_t file_opened = 0U;             // FIL 已打开，必须先 f_close 再卸载
     uint32_t restore_continuous_capture = 0U; // 记录接管前是否需恢复连续 LCD 采集
-    uint32_t file_bytes_written = 0U;
     uint32_t total_start_tick = HAL_GetTick();
     uint32_t prepare_start_tick;
-    uint32_t write_start_tick;
-    uint32_t cleanup_start_tick;
-    FRESULT fatfs_result;
+
+    if ((s_camera_storage_request_queue == NULL) ||
+        (s_camera_storage_result_queue == NULL))
+    {
+        return CAMERA_SD_ERR_SNAPSHOT_BUSY;
+    }
 
     memset(&result_info, 0, sizeof(result_info));
     result_info.file_name = CAMERA_SD_NO_FILE_NAME_TEXT;
@@ -1551,7 +1626,6 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
     restore_continuous_capture =
         ((DCMI->CR & DCMI_CR_CAPTURE) != 0U) ? 1U : 0U;
     Camera_SDStorage_EnsureDcmiDmaHandle();
-    camera_restore_required = 1U;
     prepare_start_tick = HAL_GetTick();
     // 先准备并复制完整图像，再暂停摄像头和接管共享引脚，缩短图像链路停机时间。
     step_result = Camera_SDStorage_PrepareAndStageFrontFrame(&result_info);
@@ -1559,8 +1633,79 @@ uint32_t Camera_SDStorage_SaveSnapshotFrame(
     if (step_result != CAMERA_SD_OK)
     {
         result = step_result;
-        goto cleanup;
+        uint32_t restore_result = Camera_SDStorage_RestoreCameraLink(
+            restore_continuous_capture,
+            0U);
+
+        Camera_SDStorage_RecordFirstError(&result, restore_result);
+        result_info.restore_text =
+            (restore_result == CAMERA_SD_OK) ? "PASS" : "FAIL";
+        result_info.cleanup_text = result_info.restore_text;
+        result_info.total_ms = HAL_GetTick() - total_start_tick;
+        result_info.error_code = result;
+        result_info.error_text = Camera_SDStorage_ErrorToString(result);
+        s_camera_sd_status.last_snapshot_text = "FAIL";
+        s_camera_sd_status.last_total_ms = result_info.total_ms;
+        Camera_SDStorage_SetSaveError(result);
+        Camera_SDStorage_SetLastError(result);
+        if (snapshot_result != NULL)
+        {
+            *snapshot_result = result_info;
+        }
+        return result;
     }
+
+    storage_request.request_id = ++s_camera_storage_request_id;
+    storage_request.total_start_tick = total_start_tick;
+    storage_request.restore_continuous_capture = restore_continuous_capture;
+    s_camera_storage_result_info = result_info;
+    while (xQueueReceive(
+               s_camera_storage_result_queue,
+               &storage_response,
+               0U) == pdPASS)
+    {
+    }
+    if (xQueueSend(
+            s_camera_storage_request_queue,
+            &storage_request,
+            portMAX_DELAY) != pdPASS)
+    {
+        return CAMERA_SD_ERR_SNAPSHOT_BUSY;
+    }
+    do
+    {
+        (void)xQueueReceive(
+            s_camera_storage_result_queue,
+            &storage_response,
+            portMAX_DELAY);
+    } while (storage_response.request_id != storage_request.request_id);
+
+    if (snapshot_result != NULL)
+    {
+        *snapshot_result = s_camera_storage_result_info;
+    }
+    return storage_response.result;
+}
+
+static uint32_t Camera_SDStorage_SaveStagedSnapshotFrame(
+    CameraSdSnapshotResult_t *prepared_result,
+    uint32_t total_start_tick,
+    uint32_t restore_continuous_capture)
+{
+    CameraSdSnapshotResult_t result_info = *prepared_result;
+    uint32_t result = CAMERA_SD_OK;
+    uint32_t cleanup_result = CAMERA_SD_OK;
+    uint32_t restore_result = CAMERA_SD_OK;
+    uint32_t step_result;
+    uint32_t camera_restore_required = 1U;
+    uint32_t dvp_restore_required = 0U;
+    uint32_t takeover_attempted = 0U;
+    uint32_t mount_attempted = 0U;
+    uint32_t file_opened = 0U;
+    uint32_t file_bytes_written = 0U;
+    uint32_t write_start_tick;
+    uint32_t cleanup_start_tick;
+    FRESULT fatfs_result;
 
     step_result = Camera_SnapshotControl_RequestPrepare();
     if (step_result != CAMERA_SNAPSHOT_OK)
@@ -1744,10 +1889,7 @@ cleanup:
         (result == CAMERA_SD_OK) ? file_bytes_written : 0U;
     result_info.error_code = result;
     result_info.error_text = Camera_SDStorage_ErrorToString(result);
-    if (snapshot_result != NULL)
-    {
-        *snapshot_result = result_info;
-    }
+    *prepared_result = result_info;
     return result;
 }
 

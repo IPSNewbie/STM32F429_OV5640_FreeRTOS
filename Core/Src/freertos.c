@@ -29,6 +29,7 @@
 #include "camera_capture.h"
 #include "camera_process_task.h"
 #include "camera_rtos.h"
+#include "camera_sd_storage.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -78,6 +79,13 @@ const osThreadAttr_t ProcessTask_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for StorageTask */
+osThreadId_t StorageTaskHandle;
+const osThreadAttr_t StorageTask_attributes = {
+  .name = "StorageTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
 /* Definitions for MonitorTask */
 osThreadId_t MonitorTaskHandle;
 const osThreadAttr_t MonitorTask_attributes = {
@@ -95,6 +103,7 @@ void StartCommTask(void *argument);
 void StartControlTask(void *argument);
 void StartCaptureTask(void *argument);
 void StartProcessTask(void *argument);
+void StartStorageTask(void *argument);
 void StartMonitorTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
@@ -134,6 +143,10 @@ void MX_FREERTOS_Init(void) {
   {
     Error_Handler();
   }
+  if (Camera_SDStorage_TaskInit() == false)
+  {
+    Error_Handler();
+  }
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -149,6 +162,9 @@ void MX_FREERTOS_Init(void) {
   /* creation of ProcessTask */
   ProcessTaskHandle = osThreadNew(StartProcessTask, NULL, &ProcessTask_attributes);
 
+  /* creation of StorageTask */
+  StorageTaskHandle = osThreadNew(StartStorageTask, NULL, &StorageTask_attributes);
+
   /* creation of MonitorTask */
   MonitorTaskHandle = osThreadNew(StartMonitorTask, NULL, &MonitorTask_attributes);
 
@@ -158,6 +174,7 @@ void MX_FREERTOS_Init(void) {
     (ControlTaskHandle == NULL) ||
     (CaptureTaskHandle == NULL) ||
     (ProcessTaskHandle == NULL) ||
+    (StorageTaskHandle == NULL) ||
     (MonitorTaskHandle == NULL))
   {
     Error_Handler();
@@ -204,6 +221,11 @@ void StartCaptureTask(void *argument)
 void StartProcessTask(void *argument)
 {
   Camera_ProcessTask(argument);
+}
+
+void StartStorageTask(void *argument)
+{
+  Camera_SDStorage_Task(argument);
 }
 
 /* USER CODE BEGIN Header_StartMonitorTask */

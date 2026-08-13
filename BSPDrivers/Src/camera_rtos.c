@@ -7,6 +7,7 @@
 #include "camera_image_process.h"    // BYPASS、GRAY、BINARY 图像处理及统计
 #include "camera_pc_dump.h"          // 文本 DUMP 解析、OV56RGB5 发送和 DCMI back 地址
 #include "camera_process_task.h"     // ProcessRequest/ResultQueue 与 ProcessTask 接口
+#include "camera_sd_storage.h"       // StorageTask stack watermark
 #include "camera_snapshot_control.h" // SDIO takeover 期间阻止 DUMP/binary request 的软件保护
 #include "camera_uart_dispatcher.h"  // 在同一 UART 字节流中区分文本与二进制图像请求
 #include "bsp_log.h"                 // IWDG 停止刷新时输出一次故障原因
@@ -147,6 +148,7 @@ static void Camera_RTOS_ClearStats(void)
     s_camera_rtos_stats.control_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.capture_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.process_stack_min_free_bytes = 0U;
+    s_camera_rtos_stats.storage_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.monitor_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.free_heap_bytes = 0U;
     s_camera_rtos_stats.min_ever_free_heap_bytes = 0U;
@@ -254,6 +256,8 @@ static void Camera_RTOS_UpdateMonitorHealthStats(void)
         (capture_stats != NULL) ? capture_stats->stack_min_free_bytes : 0U;
     s_camera_rtos_stats.process_stack_min_free_bytes =
         Camera_ProcessTaskGetStackMinFreeBytes();
+    s_camera_rtos_stats.storage_stack_min_free_bytes =
+        Camera_SDStorage_GetStackMinFreeBytes();
     s_camera_rtos_stats.free_heap_bytes = (uint32_t)xPortGetFreeHeapSize();
     s_camera_rtos_stats.min_ever_free_heap_bytes =
         (uint32_t)xPortGetMinimumEverFreeHeapSize();
