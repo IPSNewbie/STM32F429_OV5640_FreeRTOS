@@ -26,6 +26,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "camera_command.h"
+#include "camera_capture.h"
 #include "camera_rtos.h"
 /* USER CODE END Includes */
 
@@ -62,6 +63,13 @@ const osThreadAttr_t ControlTask_attributes = {
   .stack_size = 2048 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for CaptureTask */
+osThreadId_t CaptureTaskHandle;
+const osThreadAttr_t CaptureTask_attributes = {
+  .name = "CaptureTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
 /* Definitions for MonitorTask */
 osThreadId_t MonitorTaskHandle;
 const osThreadAttr_t MonitorTask_attributes = {
@@ -77,6 +85,7 @@ const osThreadAttr_t MonitorTask_attributes = {
 
 void StartCommTask(void *argument);
 void StartControlTask(void *argument);
+void StartCaptureTask(void *argument);
 void StartMonitorTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
@@ -108,6 +117,10 @@ void MX_FREERTOS_Init(void) {
   {
     Error_Handler();
   }
+  if (Camera_CaptureInit() == false)
+  {
+    Error_Handler();
+  }
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -117,6 +130,9 @@ void MX_FREERTOS_Init(void) {
   /* creation of ControlTask */
   ControlTaskHandle = osThreadNew(StartControlTask, NULL, &ControlTask_attributes);
 
+  /* creation of CaptureTask */
+  CaptureTaskHandle = osThreadNew(StartCaptureTask, NULL, &CaptureTask_attributes);
+
   /* creation of MonitorTask */
   MonitorTaskHandle = osThreadNew(StartMonitorTask, NULL, &MonitorTask_attributes);
 
@@ -124,6 +140,7 @@ void MX_FREERTOS_Init(void) {
   /* add threads, ... */
   if ((CommTaskHandle == NULL) ||
     (ControlTaskHandle == NULL) ||
+    (CaptureTaskHandle == NULL) ||
     (MonitorTaskHandle == NULL))
   {
     Error_Handler();
@@ -155,6 +172,16 @@ void StartControlTask(void *argument)
   /* USER CODE BEGIN StartControlTask */
   Camera_RTOS_ControlTask(argument);
   /* USER CODE END StartControlTask */
+}
+
+/* USER CODE BEGIN Header_StartCaptureTask */
+// CaptureTask owns DCMI/DMA and the frame-buffer back buffer during raw capture.
+/* USER CODE END Header_StartCaptureTask */
+void StartCaptureTask(void *argument)
+{
+  /* USER CODE BEGIN StartCaptureTask */
+  Camera_CaptureTask(argument);
+  /* USER CODE END StartCaptureTask */
 }
 
 /* USER CODE BEGIN Header_StartMonitorTask */

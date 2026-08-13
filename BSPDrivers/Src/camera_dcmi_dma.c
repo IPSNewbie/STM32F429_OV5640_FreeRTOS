@@ -2,6 +2,7 @@
 // Created by FAKE on 2026/6/2.
 //
 #include "camera_dcmi_dma.h"
+#include "camera_capture.h"
 #include "lcd_mcu.h"
 #include "bsp_log.h"
 
@@ -74,7 +75,9 @@ void Camera_DCMI_Init(void)
                           DCMI_IT_ERR |                   // 关闭同步错误中断
                           DCMI_IT_OVR);                   // 关闭溢出中断
 
-    HAL_NVIC_SetPriority(DCMI_IRQn, 2, 2);  // 设置DCMI中断优先级
+    HAL_NVIC_SetPriority(DCMI_IRQn,
+                         configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY,
+                         0U);  // ISR uses FreeRTOS task notification API
     HAL_NVIC_EnableIRQ(DCMI_IRQn);          // 使能DCMI中断
 }
 
@@ -124,7 +127,9 @@ uint8_t Camera_DCMI_StartSnapshotToBuffer(uint32_t buffer_addr, uint32_t word_co
     __HAL_LINKDMA(&g_camera_dcmi, DMA_Handle, g_camera_dma);  // 把 DMA 句柄绑定到 DCMI 句柄
 
     // 配置并使能 DMA 传输完成中断，用于通知 CPU 一帧接收完毕
-    HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 2, 1);   // 设置中断优先级
+    HAL_NVIC_SetPriority(DMA2_Stream1_IRQn,
+                         configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY,
+                         0U);  // DMA error callback can notify CaptureTask
     HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);           // 使能 DMA 中断
 
     s_camera_snapshot_done = 0U;      // 复位快照完成标志
@@ -239,8 +244,12 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
 {
     if (s_camera_snapshot_active != 0U)
     {
+        BaseType_t higher_priority_task_woken;
+
         s_camera_snapshot_active = 0U;
         s_camera_snapshot_done = 1U;
+        higher_priority_task_woken = Camera_CaptureNotifyFrameCompleteFromISR();
+        portYIELD_FROM_ISR(higher_priority_task_woken);
         return;
     }
 
@@ -255,4 +264,21 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
      */
 
     __HAL_DCMI_ENABLE_IT(&g_camera_dcmi, DCMI_IT_FRAME);  // 重新使能帧中断
+}
+
+// Wake CaptureTask immediately when HAL reports a DCMI or linked-DMA error.
+void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *hdcmi)
+{
+    BaseType_t higher_priority_task_woken;
+
+    (void)hdcmi;
+    if (s_camera_snapshot_active == 0U)
+    {
+        return;
+    }
+
+    s_camera_snapshot_active = 0U;
+    s_camera_snapshot_done = 0U;
+    higher_priority_task_woken = Camera_CaptureNotifyErrorFromISR();
+    portYIELD_FROM_ISR(higher_priority_task_woken);
 }

@@ -167,7 +167,7 @@ static void Camera_PC_Dump_WriteU32LE(uint8_t *dst, uint32_t value)
     dst[3] = (uint8_t)((value >> 24) & 0xFFU);     // 第 3 字节保存最高 8 位
 }
 
-// 向 DCMI 启动路径提供本次采集应写入的 back buffer 地址。
+// 向 CaptureTask 的 DCMI 启动路径提供本次采集应写入的 back buffer 地址。
 // UART/SD 只读取已经 commit 的 front frame，因此采集期间不会直接覆盖正在消费的图像。
 uint32_t Camera_PC_Dump_GetBufferAddress(void)
 {

@@ -10,11 +10,11 @@
  *
  * CommTask 独占 UART RX、文本/binary parser 和命令提交；ControlTask 阻塞等待
  * CommandQueue 并串行执行 CLI、DUMP、SD SNAPSHOT 等既有业务；MonitorTask 独立
- * 采集健康数据并决定是否刷新 IWDG。当前没有 Capture/Process/Storage Task。
+ * 采集健康数据并决定是否刷新 IWDG。CaptureTask 独占原始帧采集；没有 Process/Storage Task。
  *
  * DUMP 与 SD SNAPSHOT 共用 @ref Camera_RTOS_PrepareRgb565Frame，确保二者都经过
- * DCMI 快照、back→front 提交及 BYPASS/GRAY/BINARY 处理。DCMI 帧完成 ISR 只发布
- * 完成标志，实际等待、超时处理和帧提交仍留在 ControlTask 上下文。
+ * DCMI 快照、back→front 提交及 BYPASS/GRAY/BINARY 处理。DCMI 帧完成 ISR 通过 Task
+ * Notification 唤醒 CaptureTask；原始帧完成后，提交和图像处理仍留在 ControlTask。
  */
 
 #ifndef CAMERA_SD_DIAG_SD_ONLY_BOOT
@@ -64,7 +64,8 @@ typedef enum
     CAMERA_RTOS_ERR_SNAPSHOT_TIMEOUT = 0x00000200U,    /**< 快照等待超时 */
     CAMERA_RTOS_ERR_CAPTURE_COMMIT_BASE = 0x00000300U, /**< 帧缓冲提交失败基础码 */
     CAMERA_RTOS_ERR_IMAGE_PROCESS_BASE = 0x00000400U,  /**< 图像处理失败基础码 */
-    CAMERA_RTOS_ERR_DUMP_SEND_BASE = 0x00000500U       /**< 图像发送失败基础码 */
+    CAMERA_RTOS_ERR_DUMP_SEND_BASE = 0x00000500U,      /**< 图像发送失败基础码 */
+    CAMERA_RTOS_ERR_CAPTURE_HAL = 0x00000600U          /**< CaptureTask observed a DCMI/DMA HAL error */
 } CameraRtosErrorCode_t;
 
 /**
@@ -122,6 +123,7 @@ typedef struct
     volatile uint32_t uptime_ms;                 /**< MonitorTask 按 1000 ms 周期累计的运行时间 */
     volatile uint32_t comm_stack_min_free_bytes;  /**< CommTask 历史最小剩余栈，单位 B */
     volatile uint32_t control_stack_min_free_bytes; /**< ControlTask 历史最小剩余栈，单位 B */
+    volatile uint32_t capture_stack_min_free_bytes; /**< CaptureTask stack high-water mark in bytes */
     volatile uint32_t monitor_stack_min_free_bytes; /**< MonitorTask 历史最小剩余栈，即 stack high-water mark，单位 B */
     volatile uint32_t free_heap_bytes;            /**< 当前 FreeRTOS Heap 余量，单位 B */
     volatile uint32_t min_ever_free_heap_bytes;   /**< FreeRTOS 历史最小 Heap 余量，单位 B */
@@ -169,7 +171,7 @@ HAL_StatusTypeDef Camera_RTOS_IwdgInit(void);
  * @param timeout_ms 等待 DCMI 快照完成的最大时间，单位 ms
  * @return CAMERA_RTOS_ERR_NONE-成功，其他值-采集、提交、处理失败或超时
  * @note 仅在 ControlTask 上下文同步调用。CommTask 只解析并提交 DUMP、binary request
- *       和 SD SNAPSHOT；ControlTask 出队后进入该接口，保持 DCMI/DMA 单任务所有权。
+ *       和 SD SNAPSHOT；ControlTask 出队后进入该接口，再同步请求 CaptureTask 独占 DCMI/DMA。
  *       本接口限时等待并让出 CPU，完成后按 back→front→处理后再次 commit 的路径
  *       发布最终稳定帧。它不负责 UART 发送，也不负责 SDIO takeover 或文件写入。
  */

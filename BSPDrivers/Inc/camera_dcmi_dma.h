@@ -40,6 +40,7 @@ uint8_t Camera_DCMI_StartSnapshotToBuffer(uint32_t buffer_addr, uint32_t word_co
 
 /**
  * @brief 查询 DCMI 快照是否传输完成
+ * @note Stage 15C 的同步采集由 Task Notification 唤醒；该标志保留底层兼容性。
  * @retval 0 尚未完成
  * @retval 1 DMA 传输完成回调已确认本次快照完成
  */
@@ -47,7 +48,7 @@ uint8_t Camera_DCMI_IsSnapshotDone(void);
 
 /**
  * @brief 清除快照完成标志
- * @note 准备下一次快照前调用，避免读取上一次完成状态。
+ * @note CaptureTask 在启动下一次快照前调用，避免保留上一次完成状态。
  */
 void Camera_DCMI_ClearSnapshotDone(void);
 

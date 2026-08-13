@@ -10,7 +10,7 @@
  *
  * 本模块连接以下三条工程链路：
  *
- * 1. DCMI DMA 通过本模块查询 back buffer 地址和 32 位传输数量；
+ * 1. CaptureTask 通过本模块查询 DCMI DMA 的 back buffer 地址和 32 位传输数量；
  * 2. UART dispatcher 将文本字节交给本模块，DUMP 事件返回 CommTask；
  * 3. Camera RTOS 准备并提交 front frame 后，本模块按 OV56RGB5 协议发送图像。
  *

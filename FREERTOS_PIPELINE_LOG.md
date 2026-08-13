@@ -380,3 +380,61 @@ Notification；更细的任务健康监督留待后续阶段。
 - FLASH（text+data）：93996 B；链接器报告 94000 B，相对 Stage 15A 增加 532 B。
 - 链接 RAM（data+bss）：157080 B，相对 Stage 15A 增加 32 B。
 - 硬件测试：未执行；本阶段按要求只做代码修改、构建和静态检查。
+
+---
+
+## Stage 15C CaptureTask 与 DCMI Task Notification
+
+### 本阶段边界
+
+Stage 15C 只在 Stage 15B 的 CommTask、CommandQueue、ControlTask、MonitorTask 架构上增加
+CaptureTask、深度为 1 的 CaptureRequestQueue，以及 DCMI ISR 到 CaptureTask 的 Task
+Notification。没有增加 ProcessTask、StorageTask、EventGroup 或 Mutex。
+
+### 采集链路
+
+```text
+ControlTask -> Camera_RTOS_PrepareRgb565Frame()
+    -> Camera_CaptureRequestFrame() -> CaptureRequestQueue
+    -> CaptureTask -> Camera_DCMI_StartSnapshotToBuffer()
+    -> HAL_DCMI_Start_DMA() -> DCMI frame ISR
+    -> vTaskNotifyGiveFromISR() -> CaptureTask
+    -> task notification completion -> ControlTask
+    -> commit -> image process -> commit
+```
+
+CaptureTask 使用 `ulTaskNotifyTake()` 有界等待原始帧完成，并区分 OK、启动失败、超时和 HAL
+错误。CaptureTask 与 ControlTask 在每次新请求前清理各自可能残留的 notification；完成结果通过
+一对一 Task Notification 返回请求者。
+
+### Ownership
+
+DCMI DMA 活动期间，当前 back buffer 只由 CaptureTask/硬件拥有。CaptureTask 在完整帧、超时或
+错误后停止 DCMI/DMA 并释放 ownership；随后 ControlTask 才按 Stage 15B 原顺序执行第一次
+commit、BYPASS/GRAY/BINARY 图像处理和第二次 commit。DUMP 与 SD SNAPSHOT 仍只读取最终
+front frame，因此不需要 Mutex。
+
+### 任务与健康状态
+
+| Task | CMSIS-RTOS2 优先级 | 栈大小 |
+|---|---:|---:|
+| CommTask | `osPriorityAboveNormal` | 2048 B |
+| ControlTask | `osPriorityNormal` | 8192 B |
+| CaptureTask | `osPriorityAboveNormal` | 1024 B |
+| MonitorTask | `osPriorityLow` | 2048 B |
+
+MonitorTask 读取 CaptureTask 的 stack high-water mark；`STATUS` 只新增
+`stack_capture_min`。CaptureTask 保留内部 heartbeat，但本阶段没有改变 Stage 15B 的 IWDG gate。
+
+### 保持不变
+
+SDIO/FatFs、SDIO takeover、OV5640 DVP mask、BMP/IMGxxxx.BMP、OV56RGB5、UART wire
+protocol、Python 工具、图像算法和 HELP 文本均未修改。没有新增动态帧内存或大帧队列。
+
+### 静态验证
+
+- `git diff --check`：PASS。
+- `cmake --build build/Debug --parallel`：PASS。
+- 链接 RAM：157112 B（79.91%）。
+- 链接 FLASH：95360 B（9.09%）。
+- 硬件测试：未执行。

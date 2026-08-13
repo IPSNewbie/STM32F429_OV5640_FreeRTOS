@@ -1,8 +1,8 @@
 #include "camera_rtos.h"             // Camera RTOS 对外错误码、健康统计和任务入口
 
 #include "camera_cli.h"              // 文本 CLI 解析、配置读取和出队命令执行接口
+#include "camera_capture.h"          // CaptureRequestQueue、同步采集结果和 CaptureTask 健康数据
 #include "camera_command.h"          // 统一命令值对象、CommandQueue 和最小运行统计
-#include "camera_dcmi_dma.h"         // DCMI 快照启动、完成标志查询和停止接口
 #include "camera_frame_buffer.h"     // front/back 双缓冲提交和稳定 front frame 访问
 #include "camera_image_process.h"    // BYPASS、GRAY、BINARY 图像处理及统计
 #include "camera_pc_dump.h"          // 文本 DUMP 解析、OV56RGB5 发送和 DCMI back 地址
@@ -23,14 +23,14 @@
 // 本模块主要负责：
 // 1. 在 CommTask 中读取 USART1 RX DMA 的 StreamBuffer 并维护文本/binary parser；
 // 2. 将文本 CLI/DUMP 或 binary image request 转换为 CameraCommand_t 并提交队列；
-// 3. 从 CommandQueue 取出命令并串行启动原有业务，包括 DCMI 快照等待；
+// 3. 从 CommandQueue 取出命令并串行启动原有业务，通过 CaptureTask 请求 DCMI 快照；
 // 4. 按 back→front→图像处理→再次提交的顺序发布稳定 RGB565 帧；
 // 5. 让文本 DUMP、二进制请求和 SD SNAPSHOT 复用同一帧准备路径；
 // 6. 在 MonitorTask 中采样任务栈、Heap、心跳并决定是否刷新 IWDG。
 //
 // 任务上下文关系：CommTask 只解析和提交；ControlTask 是 CommandQueue consumer，
-// 串行执行所有控制、DCMI、图像和 SD 业务，因此 DCMI/DMA 仍只有一个任务级所有者。
-// DCMI 帧事件 ISR 只设置完成标志，不在中断中做图像处理、UART 或 FatFs 操作。
+// 串行执行所有控制、图像和 SD 业务；CaptureTask 是 DCMI/DMA 唯一任务级所有者。
+// DCMI 帧事件 ISR 只通知 CaptureTask，不在中断中做图像处理、UART 或 FatFs 操作。
 // MonitorTask 不参与摄像头业务，只观察健康状态并独占 IWDG 刷新职责。
 //
 // 数据关系：DCMI/算法写 back，整帧完成后 commit 为 front；DUMP 读取 front，
@@ -125,6 +125,7 @@ static void Camera_RTOS_ClearStats(void)
     s_camera_rtos_stats.uptime_ms = 0U;
     s_camera_rtos_stats.comm_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.control_stack_min_free_bytes = 0U;
+    s_camera_rtos_stats.capture_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.monitor_stack_min_free_bytes = 0U;
     s_camera_rtos_stats.free_heap_bytes = 0U;
     s_camera_rtos_stats.min_ever_free_heap_bytes = 0U;
@@ -224,8 +225,12 @@ static void Camera_RTOS_UpdateControlStackStats(void)
 // 当前 Heap 反映即时余量，minimum-ever 值则保留系统运行以来最紧张的内存时刻。
 static void Camera_RTOS_UpdateMonitorHealthStats(void)
 {
+    const CameraCaptureStats_t *capture_stats = Camera_CaptureGetStats();
+
     s_camera_rtos_stats.monitor_stack_min_free_bytes =
         Camera_RTOS_GetCurrentTaskStackMinFreeBytes();
+    s_camera_rtos_stats.capture_stack_min_free_bytes =
+        (capture_stats != NULL) ? capture_stats->stack_min_free_bytes : 0U;
     s_camera_rtos_stats.free_heap_bytes = (uint32_t)xPortGetFreeHeapSize();
     s_camera_rtos_stats.min_ever_free_heap_bytes =
         (uint32_t)xPortGetMinimumEverFreeHeapSize();
@@ -425,15 +430,15 @@ static uint8_t Camera_RTOS_DiscardOverflowedInput(void)
 
 // 在 ControlTask 中同步准备一帧最终可读的 RGB565 front frame。
 // CommTask 只把文本 DUMP、binary request 或 SD SNAPSHOT 转成 Command；ControlTask
-// 出队后调用本函数。所有摄像头 HAL、超时停止、commit 和图像处理仍保持单一上下文。
+// 出队后调用本函数。CaptureTask 负责摄像头 HAL 和超时停止；commit 和图像处理仍在 ControlTask。
 //
-// 处理顺序是：DCMI 写 back → ISR 置完成标志 → 原始帧 commit 为 front →
+// 处理顺序是：CaptureTask 启动 DCMI 写 back → ISR 通知完成 → 原始帧 commit 为 front →
 // 图像算法读该 front、写另一个 back → 再次 commit，最终 front 才交给 DUMP/SD。
 // 两条业务链复用这里，是为了避免各自维护不同的采集时序、超时和处理模式规则。
 uint32_t Camera_RTOS_PrepareRgb565Frame(uint32_t timeout_ms)
 {
-    uint8_t snapshot_ret;                      // DCMI 快照启动子错误，0 表示 DMA 已启动
-    uint32_t snapshot_start_tick;              // 计算 ISR 完成标志等待时间的起始 tick
+    CameraCaptureResult_t capture_ret;          // CaptureTask 返回的启动、完成、超时或 HAL 错误
+    const CameraCaptureStats_t *capture_stats;  // 保留 DCMI 启动 helper 的具体子错误
     CameraFrameBufferStatus_t commit_ret;      // 将已完成 back 发布为 front 的结果
     CameraImageProcessStatus_t process_ret;    // BYPASS/GRAY/BINARY 处理及第二次提交结果
     CameraProcessMode_t process_mode;          // CLI 当前选择的处理模式，本次准备期间保持该快照值
@@ -445,41 +450,27 @@ uint32_t Camera_RTOS_PrepareRgb565Frame(uint32_t timeout_ms)
         return CAMERA_RTOS_ERR_BAD_STATE;
     }
 
-    // snapshot_done 由 DCMI 帧事件 ISR 写 1；启动新快照前必须清零，
-    // 否则上一次完成标志可能让本次等待立即通过并发布尚未写完的 back buffer。
-    Camera_DCMI_ClearSnapshotDone();
-
-    // Camera_PC_Dump_GetBufferAddress() 实际返回双缓冲当前 back 地址；DCMI DMA 按
-    // 32 位 word 把一整帧 RGB565 写入这里。front 在 DMA 期间保持不变，因此消费者
-    // 若仍持有 front 视图，也不会读到正在变化的半帧。
-    snapshot_ret = Camera_DCMI_StartSnapshotToBuffer(
-        Camera_PC_Dump_GetBufferAddress(),
-        Camera_PC_Dump_GetWordCount());
-    // 启动失败表示 DMA/DCMI 未建立可靠采集状态，必须先停止硬件再向上返回阶段子码。
-    if (snapshot_ret != 0U)
+    // CaptureTask owns DCMI/DMA and the current back buffer until raw capture ends.
+    // This synchronous call blocks ControlTask on a completion notification, not polling.
+    capture_ret = Camera_CaptureRequestFrame(timeout_ms);
+    if (capture_ret == CAMERA_CAPTURE_START_FAILED)
     {
-        Camera_DCMI_Stop();   // 启动失败也统一停止，清理可能部分配置的采集状态
-        // 高位基础码定位“快照启动阶段”，低位保留 DCMI helper 的具体子错误。
-        return CAMERA_RTOS_ERR_SNAPSHOT_START_BASE | (uint32_t)snapshot_ret;
+        capture_stats = Camera_CaptureGetStats();
+        return CAMERA_RTOS_ERR_SNAPSHOT_START_BASE |
+            ((capture_stats != NULL) ? capture_stats->last_start_status : 0U);
     }
-
-    // DCMI ISR 在完整帧事件中置 snapshot_done；任务只轮询这个轻量标志，不在 ISR
-    // 做 commit 或图像算法。循环有 timeout_ms 上限，每轮 osDelay(1) 主动让出 CPU，
-    // 因此它不是无界忙等待；出口只有“ISR 已完成”或“超时停止 DCMI”。
-    snapshot_start_tick = HAL_GetTick();
-    while (Camera_DCMI_IsSnapshotDone() == 0U)
+    if (capture_ret == CAMERA_CAPTURE_TIMEOUT)
     {
-        // 使用无符号 tick 差计算等待时长，可自然处理常规 HAL tick 回绕。
-        if ((HAL_GetTick() - snapshot_start_tick) > timeout_ms)
-        {
-            Camera_DCMI_Stop();   // 超时必须停止 DMA/DCMI，不能把未完成 back 发布出去
-            return CAMERA_RTOS_ERR_SNAPSHOT_TIMEOUT;
-        }
-        (void)osDelay(1U);  // 阻塞当前任务 1 ms，让 MonitorTask 和其他就绪任务运行
+        return CAMERA_RTOS_ERR_SNAPSHOT_TIMEOUT;
     }
-
-    // ISR 已确认完整帧到达；先停止采集，确保 DMA 不再写 back，然后才允许交换索引。
-    Camera_DCMI_Stop();
+    if (capture_ret == CAMERA_CAPTURE_HAL_ERROR)
+    {
+        return CAMERA_RTOS_ERR_CAPTURE_HAL;
+    }
+    if (capture_ret != CAMERA_CAPTURE_OK)
+    {
+        return CAMERA_RTOS_ERR_BAD_STATE;
+    }
 
     // 第一次 commit 发布 DCMI 原始 RGB565：本次 back 变为稳定 front，旧 front
     // 变成可供图像处理写入的新 back。DUMP/SD 仍不会直接读取正在写的 back。
@@ -991,7 +982,7 @@ void Camera_RTOS_CommTask(void *argument)
     }
 }
 
-// ControlTask 是 CommandQueue 唯一 consumer，并继续串行拥有 DCMI、图像处理和 SD 业务。
+// ControlTask 是 CommandQueue 唯一 consumer，串行拥有图像处理和 SD 业务，并同步请求 CaptureTask。
 // 队列为空时 Camera_CommandReceive() 使用 portMAX_DELAY，使任务保持 Blocked 而不轮询。
 void Camera_RTOS_ControlTask(void *argument)
 {
