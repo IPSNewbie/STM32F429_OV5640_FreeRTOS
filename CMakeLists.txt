@@ -57,6 +57,8 @@ add_executable(${CMAKE_PROJECT_NAME}
         BSPDrivers/Src/camera_frame_buffer.c
         BSPDrivers/Inc/camera_image_process.h
         BSPDrivers/Src/camera_image_process.c
+        BSPDrivers/Inc/camera_process_task.h
+        BSPDrivers/Src/camera_process_task.c
         BSPDrivers/Inc/lcd_mcu.h
         BSPDrivers/Src/lcd_mcu.c
         BSPDrivers/Inc/OV5640.h
