@@ -107,10 +107,10 @@ bool Camera_CommandSubmit(const CameraCommand_t *command);
 /**
  * @brief 由 ControlTask 阻塞等待并取出一个待执行命令
  * @param command 接收命令副本的输出对象
- * @return true-成功取得命令；false-参数无效或队列未初始化
- * @note 内部使用 portMAX_DELAY；队列为空时 ControlTask 保持 Blocked，不周期轮询。
+ * @param timeout_ms 最大等待时间，超时只返回 false，不改变队列内容
+ * @return true-成功取得命令；false-等待超时、参数无效或队列未初始化
  */
-bool Camera_CommandReceive(CameraCommand_t *command);
+bool Camera_CommandReceive(CameraCommand_t *command, uint32_t timeout_ms);
 
 /** @brief 获取 CommandQueue 内部统计的只读实时视图。 */
 const CameraCommandStats_t *Camera_CommandGetStats(void);

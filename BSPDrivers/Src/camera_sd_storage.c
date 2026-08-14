@@ -796,17 +796,20 @@ void Camera_SDStorage_Task(void *argument)
         (uint32_t)sizeof(StackType_t);
     for (;;)
     {
+        (void)xEventGroupSetBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_STORAGE);
         if (xQueueReceive(
                 s_camera_storage_request_queue,
                 &request,
-                portMAX_DELAY) != pdPASS)
+                pdMS_TO_TICKS(CAMERA_RTOS_HEARTBEAT_TIMEOUT_MS)) != pdPASS)
         {
             continue;
         }
 
         (void)xEventGroupSetBits(
             CameraSystemEventGroup,
-            CAMERA_SYS_STORAGE_BUSY);
+            CAMERA_SYS_STORAGE_BUSY | CAMERA_SYS_HB_STORAGE);
         s_camera_storage_stack_min_free_bytes =
             (uint32_t)uxTaskGetStackHighWaterMark(NULL) *
             (uint32_t)sizeof(StackType_t);
@@ -818,6 +821,9 @@ void Camera_SDStorage_Task(void *argument)
         (void)xEventGroupClearBits(
             CameraSystemEventGroup,
             CAMERA_SYS_STORAGE_BUSY);
+        (void)xEventGroupSetBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_STORAGE);
         s_camera_storage_stack_min_free_bytes =
             (uint32_t)uxTaskGetStackHighWaterMark(NULL) *
             (uint32_t)sizeof(StackType_t);

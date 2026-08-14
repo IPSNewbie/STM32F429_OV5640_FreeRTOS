@@ -2,6 +2,7 @@
 
 #include "camera_dcmi_dma.h"
 #include "camera_pc_dump.h"
+#include "camera_rtos.h"
 
 #include "queue.h"
 #include "task.h"
@@ -130,11 +131,20 @@ void Camera_CaptureTask(void *argument)
 
     for (;;)
     {
-        if (xQueueReceive(s_camera_capture_request_queue, &request, portMAX_DELAY) != pdPASS)
+        (void)xEventGroupSetBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_CAPTURE);
+        if (xQueueReceive(
+                s_camera_capture_request_queue,
+                &request,
+                pdMS_TO_TICKS(CAMERA_RTOS_HEARTBEAT_TIMEOUT_MS)) != pdPASS)
         {
             continue;
         }
 
+        (void)xEventGroupSetBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_CAPTURE);
         s_camera_capture_stats.heartbeat_count++;
         result = Camera_CaptureExecute(request.timeout_ms);
         s_camera_capture_stats.last_result = result;
@@ -144,6 +154,9 @@ void Camera_CaptureTask(void *argument)
             request.requester,
             (uint32_t)result,
             eSetValueWithOverwrite);
+        (void)xEventGroupSetBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_CAPTURE);
         s_camera_capture_stats.heartbeat_count++;
     }
 }

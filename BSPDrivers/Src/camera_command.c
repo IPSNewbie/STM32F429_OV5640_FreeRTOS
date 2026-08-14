@@ -84,9 +84,10 @@ bool Camera_CommandSubmit(const CameraCommand_t *command)
     return true;
 }
 
-// ControlTask 使用 portMAX_DELAY 阻塞等待；成功返回即表示该对象进入统一执行分派。
-bool Camera_CommandReceive(CameraCommand_t *command)
+// ControlTask 有界阻塞等待；成功返回即表示该对象进入统一执行分派。
+bool Camera_CommandReceive(CameraCommand_t *command, uint32_t timeout_ms)
 {
+    configASSERT((command != NULL) && (s_camera_command_queue != NULL));
     if ((command == NULL) || (s_camera_command_queue == NULL))
     {
         return false;
@@ -95,7 +96,7 @@ bool Camera_CommandReceive(CameraCommand_t *command)
     if (xQueueReceive(
             s_camera_command_queue,
             command,
-            portMAX_DELAY) != pdPASS)
+            pdMS_TO_TICKS(timeout_ms)) != pdPASS)
     {
         return false;
     }

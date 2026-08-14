@@ -82,7 +82,7 @@ static UART_HandleTypeDef *s_camera_rtos_uart;
 // 各字段为 volatile，但整个结构不是事务快照；它只用于健康监控而不参与业务同步。
 static CameraRtosStats_t s_camera_rtos_stats;
 
-// ControlTask 在 portMAX_DELAY 阻塞等待队列时置 1，MonitorTask 不把正常 Blocked 误判超时。
+// ControlTask 阻塞等待队列时置 1，MonitorTask 不把正常 Blocked 误判为旧式年龄超时。
 static volatile uint8_t s_camera_control_waiting_for_command;
 
 // 保存 UART 混合协议解析状态，仅由 CommTask 初始化、喂入字节和复位。
@@ -278,10 +278,11 @@ static void Camera_RTOS_UpdateHeartbeatAges(uint32_t current_tick)
         (current_tick - s_camera_rtos_stats.monitor_heartbeat_ms) : 0U;
 }
 
-// 将 Hook 与三个任务的启动/超时状态按优先顺序归纳为一个 IWDG 跳过原因。
+// 将 Hook、五任务 heartbeat 与原有启动/超时状态归纳为一个 IWDG 跳过原因。
 // 该函数只做判定，不直接刷新硬件；统一原因使 STATUS 和故障日志能解释为何不喂狗。
 static CameraRtosIwdgSkipReason_t Camera_RTOS_GetIwdgSkipReason(
-    uint32_t current_tick)
+    uint32_t current_tick,
+    EventBits_t task_heartbeat_bits)
 {
     Camera_RTOS_UpdateHeartbeatAges(current_tick);
 
@@ -289,6 +290,10 @@ static CameraRtosIwdgSkipReason_t Camera_RTOS_GetIwdgSkipReason(
     if (s_camera_rtos_stats.hook_fault_code != 0U)
     {
         return CAMERA_RTOS_IWDG_SKIP_HOOK_FAULT;
+    }
+    if ((task_heartbeat_bits & CAMERA_SYS_HB_ALL) != CAMERA_SYS_HB_ALL)
+    {
+        return CAMERA_RTOS_IWDG_SKIP_TASK_HEARTBEAT_MISSING;
     }
     // count 为 0 表示任务从未进入主循环，不能把初始时间戳误当成健康心跳。
     if (s_camera_rtos_stats.comm_heartbeat_count == 0U)
@@ -325,7 +330,8 @@ static CameraRtosIwdgSkipReason_t Camera_RTOS_GetIwdgSkipReason(
 
 // 仅由 MonitorTask 调用：所有健康条件满足才刷新 IWDG，否则持续停止喂狗等待复位。
 // 把刷新职责放在 MonitorTask，可防止 Comm/Control 卡死后仍由业务路径自我喂狗。
-static void Camera_RTOS_ServiceIwdg(uint32_t current_tick)
+static void Camera_RTOS_ServiceIwdg(uint32_t current_tick,
+                                    EventBits_t task_heartbeat_bits)
 {
     CameraRtosIwdgSkipReason_t skip_reason;  // 本周期综合健康判定结果
     uint32_t previous_skip_reason;           // 上周期原因，用于抑制相同错误重复刷屏
@@ -336,8 +342,10 @@ static void Camera_RTOS_ServiceIwdg(uint32_t current_tick)
         return;
     }
 
-    skip_reason = Camera_RTOS_GetIwdgSkipReason(current_tick);
-    // 只有“三个任务已启动、活动任务未超时且无 Hook 故障”才写 IWDG 重装键。
+    skip_reason = Camera_RTOS_GetIwdgSkipReason(
+        current_tick,
+        task_heartbeat_bits);
+    // 只有五任务 heartbeat 完整且原有健康条件满足才写 IWDG 重装键。
     if (skip_reason == CAMERA_RTOS_IWDG_SKIP_NONE)
     {
         (void)HAL_IWDG_Refresh(&s_camera_rtos_iwdg);
@@ -946,6 +954,9 @@ void Camera_RTOS_CommTask(void *argument)
     for (;;)
     {
         // 每次进入 UART 服务循环发布 CommTask 心跳；ControlTask 业务阻塞不会影响它。
+        (void)xEventGroupSetBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_COMM);
         s_camera_rtos_stats.comm_heartbeat_count++;
         s_camera_rtos_stats.comm_heartbeat_ms = HAL_GetTick();
 
@@ -1033,7 +1044,7 @@ void Camera_RTOS_CommTask(void *argument)
 }
 
 // ControlTask 是 CommandQueue 唯一 consumer，串行拥有图像处理和 SD 业务，并同步请求 CaptureTask。
-// 队列为空时 Camera_CommandReceive() 使用 portMAX_DELAY，使任务保持 Blocked 而不轮询。
+// 队列为空时使用有限等待，只为周期发布 heartbeat，不改变命令业务语义。
 void Camera_RTOS_ControlTask(void *argument)
 {
     CameraCommand_t command; // Queue 按值复制的稳定命令对象，不含 parser buffer 指针
@@ -1044,22 +1055,25 @@ void Camera_RTOS_ControlTask(void *argument)
     for (;;)
     {
         // 进入阻塞等待前发布心跳；waiting 标志防止正常 Blocked 被 IWDG 误判为卡死。
+        (void)xEventGroupSetBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_CONTROL);
         s_camera_rtos_stats.control_heartbeat_count++;
         s_camera_rtos_stats.control_heartbeat_ms = HAL_GetTick();
         s_camera_control_waiting_for_command = 1U;
 
-        if (Camera_CommandReceive(&command) == false)
+        if (Camera_CommandReceive(
+                &command,
+                CAMERA_RTOS_HEARTBEAT_TIMEOUT_MS) == false)
         {
-            // Queue 在任务创建前已初始化；失败表示内部状态错误，进入现有 assert 机制。
-            s_camera_control_waiting_for_command = 0U;
-            s_camera_rtos_stats.last_error_code = CAMERA_RTOS_ERR_COMMAND_QUEUE;
-            configASSERT(0);
-            (void)osDelay(1000U);
             continue;
         }
 
         // 收到命令后立即离开 waiting 状态并更新时间，使执行超时可被 MonitorTask 识别。
         s_camera_control_waiting_for_command = 0U;
+        (void)xEventGroupSetBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_CONTROL);
         s_camera_rtos_stats.control_heartbeat_count++;
         s_camera_rtos_stats.control_heartbeat_ms = HAL_GetTick();
         Camera_RTOS_UpdateControlStackStats();
@@ -1067,6 +1081,9 @@ void Camera_RTOS_ControlTask(void *argument)
         Camera_RTOS_ExecuteCommand(&command);
 
         // 业务完成后再次发布心跳并采样最深调用链后的 stack high-water mark。
+        (void)xEventGroupSetBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_CONTROL);
         s_camera_rtos_stats.control_heartbeat_count++;
         s_camera_rtos_stats.control_heartbeat_ms = HAL_GetTick();
         Camera_RTOS_UpdateControlStackStats();
@@ -1078,6 +1095,7 @@ void Camera_RTOS_ControlTask(void *argument)
 void Camera_RTOS_MonitorTask(void *argument)
 {
     uint32_t current_tick;  // 本周期心跳、年龄判定和 IWDG 服务共用的 tick 快照
+    EventBits_t task_heartbeat_bits;
 
     (void)argument;  // CubeMX 任务入口保留统一参数，监控任务当前不需要启动参数
 
@@ -1087,13 +1105,16 @@ void Camera_RTOS_MonitorTask(void *argument)
     {
         (void)osDelay(1000U);
         s_camera_rtos_stats.uptime_ms += 1000U;
+        task_heartbeat_bits = xEventGroupClearBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_ALL);
 
         // 先发布 MonitorTask 自身心跳，再用同一 tick 计算两个任务的年龄。
         s_camera_rtos_stats.monitor_heartbeat_count++;
         current_tick = HAL_GetTick();
         s_camera_rtos_stats.monitor_heartbeat_ms = current_tick;
         Camera_RTOS_UpdateMonitorHealthStats();
-        Camera_RTOS_ServiceIwdg(current_tick);
+        Camera_RTOS_ServiceIwdg(current_tick, task_heartbeat_bits);
     }
 }
 

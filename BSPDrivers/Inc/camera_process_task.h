@@ -45,7 +45,7 @@ CameraProcessResult_t Camera_ProcessRequestFrame(CameraProcessMode_t mode,
                                                  uint8_t threshold,
                                                  uint32_t timeout_ms);
 
-/** ProcessTask entry; blocks indefinitely on ProcessRequestQueue while idle. */
+/** ProcessTask entry; wakes periodically for heartbeat while idle. */
 void Camera_ProcessTask(void *argument);
 
 /** True only when no accepted request is queued or executing. */

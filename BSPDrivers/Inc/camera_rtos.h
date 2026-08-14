@@ -34,10 +34,21 @@
  *       防止摄像头异常时永久占住 ControlTask。
  */
 #define CAMERA_RTOS_RGB565_PREPARE_TIMEOUT_MS (3000U)
+#define CAMERA_RTOS_HEARTBEAT_TIMEOUT_MS       (500U)
 
 #define CAMERA_SYS_CAMERA_READY (1U << 0)
 #define CAMERA_SYS_FRAME_READY  (1U << 1)
 #define CAMERA_SYS_STORAGE_BUSY (1U << 2)
+#define CAMERA_SYS_HB_COMM       (1U << 3)
+#define CAMERA_SYS_HB_CONTROL    (1U << 4)
+#define CAMERA_SYS_HB_CAPTURE    (1U << 5)
+#define CAMERA_SYS_HB_PROCESS    (1U << 6)
+#define CAMERA_SYS_HB_STORAGE    (1U << 7)
+#define CAMERA_SYS_HB_ALL        (CAMERA_SYS_HB_COMM | \
+                                  CAMERA_SYS_HB_CONTROL | \
+                                  CAMERA_SYS_HB_CAPTURE | \
+                                  CAMERA_SYS_HB_PROCESS | \
+                                  CAMERA_SYS_HB_STORAGE)
 
 extern EventGroupHandle_t CameraSystemEventGroup;
 
@@ -80,7 +91,7 @@ typedef enum
 /**
  * @brief MonitorTask 本周期不刷新 IWDG 的原因
  *
- * MonitorTask 会先检查 Hook 故障，再确认三个任务已经启动且活动任务心跳未超限。
+ * MonitorTask 会先检查 Hook 故障，再确认五个业务任务 heartbeat 完整且原有健康条件满足。
  * 任何一项不健康时都记录具体原因并停止喂狗，让独立看门狗最终复位系统。
  */
 typedef enum
@@ -92,7 +103,8 @@ typedef enum
     CAMERA_RTOS_IWDG_SKIP_MONITOR_TIMEOUT = 4U,     /**< 监控任务心跳超时 */
     CAMERA_RTOS_IWDG_SKIP_HOOK_FAULT = 5U,          /**< FreeRTOS 保护 Hook 已报错 */
     CAMERA_RTOS_IWDG_SKIP_CONTROL_NOT_STARTED = 6U, /**< ControlTask 尚未启动 */
-    CAMERA_RTOS_IWDG_SKIP_CONTROL_TIMEOUT = 7U      /**< ControlTask 执行业务时心跳超时 */
+    CAMERA_RTOS_IWDG_SKIP_CONTROL_TIMEOUT = 7U,     /**< ControlTask 执行业务时心跳超时 */
+    CAMERA_RTOS_IWDG_SKIP_TASK_HEARTBEAT_MISSING = 8U /**< 业务任务 heartbeat 不完整 */
 } CameraRtosIwdgSkipReason_t;
 
 //============================================================================
@@ -249,7 +261,7 @@ void Camera_RTOS_CommTask(void *argument);
  * @brief CommandQueue 唯一业务消费者任务
  * @param argument 任务参数，当前未使用
  * @return 不返回
- * @note 使用 portMAX_DELAY 阻塞等待命令，串行执行现有 CLI、DUMP、SD SNAPSHOT 和
+ * @note 使用 heartbeat 有限超时阻塞等待命令，串行执行现有 CLI、DUMP、SD SNAPSHOT 和
  *       binary image request；Capture/Process/Storage 职责仍暂留本任务。
  */
 void Camera_RTOS_ControlTask(void *argument);

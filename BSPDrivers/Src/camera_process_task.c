@@ -1,4 +1,5 @@
 #include "camera_process_task.h"
+#include "camera_rtos.h"
 
 #include "FreeRTOS.h"
 #include "queue.h"
@@ -162,14 +163,20 @@ void Camera_ProcessTask(void *argument)
 
     for (;;)
     {
+        (void)xEventGroupSetBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_PROCESS);
         if (xQueueReceive(
                 s_camera_process_request_queue,
                 &request,
-                portMAX_DELAY) != pdPASS)
+                pdMS_TO_TICKS(CAMERA_RTOS_HEARTBEAT_TIMEOUT_MS)) != pdPASS)
         {
             continue;
         }
 
+        (void)xEventGroupSetBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_PROCESS);
         response.request_id = request.request_id;
         response.result = Camera_ProcessApplyRequest(&request);
         Camera_ProcessUpdateStackStats();
@@ -178,6 +185,9 @@ void Camera_ProcessTask(void *argument)
             s_camera_process_result_queue,
             &response,
             0U);
+        (void)xEventGroupSetBits(
+            CameraSystemEventGroup,
+            CAMERA_SYS_HB_PROCESS);
         s_camera_process_request_outstanding = 0U;
     }
 }

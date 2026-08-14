@@ -123,6 +123,7 @@ void MX_FREERTOS_Init(void) {
   {
     Error_Handler();
   }
+  (void)xEventGroupSetBits(CameraSystemEventGroup, CAMERA_SYS_HB_ALL);
 
   /* USER CODE END Init */
 
