@@ -50,6 +50,8 @@
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
 
+EventGroupHandle_t CameraSystemEventGroup;
+
 /* USER CODE END Variables */
 /* Definitions for CommTask */
 osThreadId_t CommTaskHandle;
@@ -115,6 +117,12 @@ void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
   */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
+
+  CameraSystemEventGroup = xEventGroupCreate();
+  if (CameraSystemEventGroup == NULL)
+  {
+    Error_Handler();
+  }
 
   /* USER CODE END Init */
 

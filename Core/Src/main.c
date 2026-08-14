@@ -96,7 +96,7 @@ void SystemClock_Config(void);
 void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 #if (CAMERA_SD_DIAG_SD_ONLY_BOOT == 0U)
-static void Camera_Application_Init(void);
+static uint8_t Camera_Application_Init(void);
 #else
 static void Camera_SDOnly_Application_Init(void);
 #endif
@@ -117,6 +117,10 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT == 0U)
+  uint8_t camera_init_result;
+#endif
 
   g_boot_iwdg_reset = ((RCC->CSR & RCC_CSR_IWDGRSTF) != 0U) ? 1U : 0U;
   __HAL_RCC_CLEAR_RESET_FLAGS();
@@ -153,7 +157,7 @@ int main(void)
 #if (CAMERA_SD_DIAG_SD_ONLY_BOOT != 0U)
   Camera_SDOnly_Application_Init();
 #else
-  Camera_Application_Init();
+  camera_init_result = Camera_Application_Init();
 #endif
   Camera_RTOS_Init(&huart1);
   // 应用初始化完成后、调度器启动前启用IWDG
@@ -167,6 +171,14 @@ int main(void)
   /* Init scheduler */
   osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
   MX_FREERTOS_Init();
+#if (CAMERA_SD_DIAG_SD_ONLY_BOOT == 0U)
+  if (camera_init_result == 0U)
+  {
+    (void)xEventGroupSetBits(
+      CameraSystemEventGroup,
+      CAMERA_SYS_CAMERA_READY);
+  }
+#endif
 
   /* Start scheduler */
   osKernelStart();
@@ -250,7 +262,7 @@ static void Camera_SDOnly_Application_Init(void)
 
 #if (CAMERA_SD_DIAG_SD_ONLY_BOOT == 0U)
 // 按编译期模式初始化摄像头、可选 LCD、双缓冲和 CLI
-static void Camera_Application_Init(void)
+static uint8_t Camera_Application_Init(void)
 {
   uint16_t ov_id;
   uint8_t ret;
@@ -394,6 +406,7 @@ static void Camera_Application_Init(void)
   {
     LOG_INFO("Camera init OK");
   }
+  return ret;
 }
 #endif
 

@@ -1,6 +1,9 @@
 #ifndef CAMERA_RTOS_H
 #define CAMERA_RTOS_H
 
+#include "FreeRTOS.h"
+#include "event_groups.h"
+
 #include <stdint.h>          // 提供统计字段、错误码和超时参数使用的固定宽度整数类型
 #include "stm32f4xx_hal.h"  // 提供 UART、IWDG 句柄及 HAL_StatusTypeDef
 
@@ -31,6 +34,12 @@
  *       防止摄像头异常时永久占住 ControlTask。
  */
 #define CAMERA_RTOS_RGB565_PREPARE_TIMEOUT_MS (3000U)
+
+#define CAMERA_SYS_CAMERA_READY (1U << 0)
+#define CAMERA_SYS_FRAME_READY  (1U << 1)
+#define CAMERA_SYS_STORAGE_BUSY (1U << 2)
+
+extern EventGroupHandle_t CameraSystemEventGroup;
 
 //============================================================================
 // 对外错误码、健康统计结构和任务入口

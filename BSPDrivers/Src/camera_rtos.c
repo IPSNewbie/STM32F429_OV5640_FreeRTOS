@@ -475,6 +475,10 @@ uint32_t Camera_RTOS_PrepareRgb565Frame(uint32_t timeout_ms)
     uint8_t binary_threshold;                  // BINARY 模式使用的 0~255 灰度阈值快照
 
     // 零超时无法给 ISR 留出任何完成机会，也会让调用语义不明确，因此按状态错误拒绝。
+    (void)xEventGroupClearBits(
+        CameraSystemEventGroup,
+        CAMERA_SYS_FRAME_READY);
+
     if (timeout_ms == 0U)
     {
         return CAMERA_RTOS_ERR_BAD_STATE;
@@ -547,6 +551,9 @@ uint32_t Camera_RTOS_PrepareRgb565Frame(uint32_t timeout_ms)
             (uint32_t)task_process_ret;
     }
 
+    (void)xEventGroupSetBits(
+        CameraSystemEventGroup,
+        CAMERA_SYS_FRAME_READY);
     return CAMERA_RTOS_ERR_NONE;
 }
 
