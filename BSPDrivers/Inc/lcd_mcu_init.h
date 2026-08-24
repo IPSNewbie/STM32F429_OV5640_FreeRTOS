@@ -7,11 +7,10 @@
 #include "stm32f4xx_hal.h"
 #include <stdint.h>
 
-/*
- * 只声明 LCD 控制器厂家初始化函数。
- * 主驱动逻辑在 lcd_mcu.c。
+/**
+ * @brief 执行 NT35310 厂家寄存器初始化序列
+ * @note 仅由 LCD 主驱动在识别控制器后调用，主驱动逻辑位于 lcd_mcu.c。
  */
-
 void LCD_MCU_NT35310_RegInit(void);
 
 

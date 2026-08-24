@@ -47,10 +47,18 @@ add_executable(${CMAKE_PROJECT_NAME}
         BSPDrivers/Src/camera_dcmi_dma.c
         BSPDrivers/Inc/camera_cli.h
         BSPDrivers/Src/camera_cli.c
+        BSPDrivers/Inc/camera_sd_storage.h
+        BSPDrivers/Src/camera_sd_storage.c
+        BSPDrivers/Inc/camera_fatfs_diskio.h
+        BSPDrivers/Src/camera_fatfs_diskio.c
+        BSPDrivers/Inc/camera_snapshot_control.h
+        BSPDrivers/Src/camera_snapshot_control.c
         BSPDrivers/Inc/camera_frame_buffer.h
         BSPDrivers/Src/camera_frame_buffer.c
         BSPDrivers/Inc/camera_image_process.h
         BSPDrivers/Src/camera_image_process.c
+        BSPDrivers/Inc/camera_process_task.h
+        BSPDrivers/Src/camera_process_task.c
         BSPDrivers/Inc/lcd_mcu.h
         BSPDrivers/Src/lcd_mcu.c
         BSPDrivers/Inc/OV5640.h
@@ -73,17 +81,26 @@ file(GLOB_RECURSE BSPDRIVERS CONFIGURE_DEPENDS "BSPDrivers/Src/*.c")
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         # Add user sources here
         ${BSPDRIVERS}
+        Middlewares/Third_Party/FatFs/src/ff.c
+        Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_dcmi.c
+        Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_sd.c
+        Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_ll_sdmmc.c
+        Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_sram.c
+        Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_ll_fmc.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
         BSPDrivers/Inc
+        Middlewares/Third_Party/FatFs/src
 )
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
+        HAL_DCMI_MODULE_ENABLED
+        HAL_SRAM_MODULE_ENABLED
 )
 
 # Remove wrong libob.a library dependency when using cpp files

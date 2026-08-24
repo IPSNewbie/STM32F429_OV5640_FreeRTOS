@@ -1,18 +1,28 @@
+//============================================================================
+// @file    OV5640.c
+// @brief   OV5640 最小 RGB565 初始化、尺寸配置和寄存器诊断实现
 //
-// Created by FAKE on 2026/6/2.
+// 本模块位于应用层相机流程与 SCCB 字节传输层之间：上层选择分辨率和
+// 彩条/真实图像模式，本模块按已通过硬件验证的顺序写寄存器表，bsp_sccb
+// 再通过软件 I2C 完成实际总线时序。所有接口都是阻塞调用，只能在任务或
+// 初始化上下文使用，不应从 ISR 调用，也没有为多任务并发访问提供锁。
 //
-#include "ov5640.h"
-#include "bsp_sccb.h"
-#include "bsp_log.h"
-#include "ov5640cfg.h"
+// 初始化顺序保持为“基础表 -> RGB565 覆盖表 -> 窗口/输出尺寸 -> 彩条或
+// 真实图像”。彩条绕过真实场景的曝光、白平衡等变量，适合先验证
+// SCCB -> OV5640 DVP -> STM32 DCMI -> 显示/缓冲链路是否连通。
+//============================================================================
+#include "ov5640.h"    // 声明本模块对外的模式初始化和诊断接口
+#include "bsp_sccb.h"  // 提供 OV5640 16 位寄存器地址的阻塞式读写
+#include "bsp_log.h"   // 记录寄存器访问失败和可选诊断回读结果
+#include "ov5640cfg.h" // 提供已验证的基础初始化表和 RGB565 覆盖表
+#include <stddef.h>     // 提供 NULL，用于诊断标签参数检查
 
-/*
- * 本文件只做“最小可视化调试配置”。
- * 当前目标：RGB565 + QVGA/480x320/320x240/160x120 + 彩条/RealImage
- * 复杂画质、曝光、AWB、AF 后面再接完整寄存器表。
- */
+/* OV5640初始化详细打印开关：仅控制成功日志，不改变任何硬件访问。 */
+#ifndef OV5640_VERBOSE_INIT_LOG
+#define OV5640_VERBOSE_INIT_LOG 0U
+#endif
 
-// 写 OV5640 单个寄存器
+// 写一个寄存器并保留已验证的 1 ms 写后间隔
 static uint8_t OV5640_Min_WriteReg(uint16_t reg, uint8_t val)
 {
     // 通过 SCCB 写 16 位寄存器地址 + 8 位数据
@@ -25,13 +35,13 @@ static uint8_t OV5640_Min_WriteReg(uint16_t reg, uint8_t val)
         return 1;
     }
 
-    // 每次写寄存器后稍作延时，保证传感器内部配置稳定
+    // 固定写后间隔属于当前已验证初始化节奏，批量写表时也不应省略
     HAL_Delay(1);
 
     return 0;
 }
 
-// 读 OV5640 单个寄存器
+// 读取一个寄存器，并把 SCCB 失败统一转换为本模块错误码 1
 static uint8_t OV5640_Min_ReadReg(uint16_t reg, uint8_t *val)
 {
     // 通过 SCCB 读取指定寄存器
@@ -47,10 +57,10 @@ static uint8_t OV5640_Min_ReadReg(uint16_t reg, uint8_t *val)
     return 0;
 }
 
-// 批量写寄存器表
+// 按表中固定顺序写入全部寄存器，遇到首个失败立即退出
 static uint8_t OV5640_Min_WriteTable(const uint16_t (*tbl)[2], uint32_t len)
 {
-    // 表格式：{寄存器地址, 寄存器值}
+    // 每项为 {16 位寄存器地址, 低 8 位寄存器值}，循环上界由调用方传入的表长限定
     for (uint32_t i = 0; i < len; i++)
     {
         // 逐项写入寄存器表
@@ -58,6 +68,7 @@ static uint8_t OV5640_Min_WriteTable(const uint16_t (*tbl)[2], uint32_t len)
         {
             LOG_ERROR("OV5640 table write failed at index=%lu, reg=0x%04X, val=0x%02X",
                       i, tbl[i][0], (uint8_t)tbl[i][1]);
+            // 不重试也不回滚；失败前已经写入的寄存器仍保留在传感器中
             return 1;
         }
     }
@@ -94,7 +105,13 @@ uint8_t OV5640_Min_EnableTestBar(uint8_t enable)
 // 设置缩放后的 DVP 输出尺寸和 ISP 偏移
 uint8_t OV5640_Min_OutSize_Set(uint16_t offx, uint16_t offy, uint16_t width, uint16_t height)
 {
-    // 配置 ISP 控制寄存器，允许修改相关参数（解锁写保护）
+    // 0 尺寸会写入无效 DVP 时序，必须在首次寄存器访问前拒绝。
+    if ((width == 0U) || (height == 0U))
+    {
+        return 12U;
+    }
+
+    // 0x03/0x13/0xA3 是当前硬件验证保留的分组参数提交序列，不臆测其位级语义
     if (SCCB_WriteReg(0x3212, 0x03) != 0) return 1;
 
     // 设置最终输出图像的宽度（高 8 位和低 8 位）
@@ -113,7 +130,7 @@ uint8_t OV5640_Min_OutSize_Set(uint16_t offx, uint16_t offy, uint16_t width, uin
     if (SCCB_WriteReg(0x3812, (uint8_t)(offy >> 8)) != 0) return 8;
     if (SCCB_WriteReg(0x3813, (uint8_t)(offy & 0xFF)) != 0) return 9;
 
-    // 锁定参数并启动 ISP 处理
+    // 完成该组参数的提交序列；任一步 SCCB 失败都按写入阶段返回 1~11
     if (SCCB_WriteReg(0x3212, 0x13) != 0) return 10;
     if (SCCB_WriteReg(0x3212, 0xA3) != 0) return 11;
 
@@ -123,13 +140,21 @@ uint8_t OV5640_Min_OutSize_Set(uint16_t offx, uint16_t offy, uint16_t width, uin
 // 设置输出缩放前使用的传感器/ISP 图像窗口
 uint8_t OV5640_Min_ImageWindow_Set(uint16_t offx, uint16_t offy, uint16_t width, uint16_t height)
 {
+    // 用 32 位计算终点边界，避免 16 位加法回绕后写入错误窗口。
+    if ((width == 0U) || (height == 0U) ||
+        (((uint32_t)offx + (uint32_t)width) > 0x10000UL) ||
+        (((uint32_t)offy + (uint32_t)height) > 0x10000UL))
+    {
+        return 12U;
+    }
+
     // 计算输入窗口的起始和结束坐标
     uint16_t xst = offx;
     uint16_t yst = offy;
     uint16_t xend = offx + width - 1;
     uint16_t yend = offy + height - 1;
 
-    // 配置 ISP 控制寄存器，允许修改相关参数
+    // 0x03/0x13/0xA3 是当前硬件验证保留的分组参数提交序列
     if (SCCB_WriteReg(0x3212, 0x03) != 0) return 1;
 
     // 设置输入窗口起始 X 坐标（高 8 位和低 8 位）
@@ -148,7 +173,7 @@ uint8_t OV5640_Min_ImageWindow_Set(uint16_t offx, uint16_t offy, uint16_t width,
     if (SCCB_WriteReg(0x3806, (uint8_t)(yend >> 8)) != 0) return 8;
     if (SCCB_WriteReg(0x3807, (uint8_t)(yend & 0xFF)) != 0) return 9;
 
-    // 锁定参数并启动 ISP 处理
+    // 完成该组窗口参数的提交序列；不改变现有写入顺序和失败码
     if (SCCB_WriteReg(0x3212, 0x13) != 0) return 10;
     if (SCCB_WriteReg(0x3212, 0xA3) != 0) return 11;
 
@@ -156,7 +181,7 @@ uint8_t OV5640_Min_ImageWindow_Set(uint16_t offx, uint16_t offy, uint16_t width,
 }
 
 
-// 初始化 OV5640 为 RGB565 + QVGA + 测试彩条
+// 按基础表、RGB565 表、QVGA 尺寸和彩条的顺序初始化传感器
 uint8_t OV5640_Min_InitRGB565_QVGA_TestBar(void)
 {
     // 先确认 SCCB 通信和芯片 ID 正常
@@ -206,7 +231,10 @@ uint8_t OV5640_Min_InitRGB565_QVGA_TestBar(void)
     // 5.最后开启内部测试彩条
     if (OV5640_Min_EnableTestBar(1)) return 9;
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 full table RGB565 QVGA testbar init done");
+#endif
+    // 回读仅用于日志诊断；不能让一次非关键诊断失败推翻已经成功的初始化结果
     (void)OV5640_Min_ReadBackTimingDebug("QVGA_TESTBAR");
 
     return 0;
@@ -260,7 +288,7 @@ uint8_t OV5640_Min_ReadBackDebug(void)
     return 0;
 }
 
-//回读 OV5640 时序相关的全部寄存器，用于详细调试与确认配置完整性
+// 回读 OV5640 时序相关的全部寄存器，用于详细调试与确认配置完整性
 uint8_t OV5640_Min_ReadBackTimingDebug(const char *tag)
 {
     // 需要回读的时序相关寄存器列表
@@ -286,7 +314,15 @@ uint8_t OV5640_Min_ReadBackTimingDebug(const char *tag)
     };
     uint8_t val = 0;
 
+    // tag 会传给格式化日志，空指针不能作为 %s 参数。
+    if (tag == NULL)
+    {
+        return 1U;
+    }
+
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 timing readback begin: %s", tag);
+#endif
 
     // 遍历整个寄存器列表，逐一回读并输出
     for (uint32_t i = 0; i < (sizeof(regs) / sizeof(regs[0])); i++)
@@ -297,10 +333,14 @@ uint8_t OV5640_Min_ReadBackTimingDebug(const char *tag)
             return 1;
         }
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
         LOG_INFO("OV5640 %s reg 0x%04X = 0x%02X", tag, regs[i], val);
+#endif
     }
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 timing readback end: %s", tag);
+#endif
 
     return 0;
 }
@@ -329,7 +369,7 @@ uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void)
 
     HAL_Delay(20);
 
-    //确认测试图案已经关闭
+    // 读取并记录测试图寄存器供诊断；此处不比较数值，因此不能视为状态断言
     ret = SCCB_ReadReg(0x4741, &val);
     if (ret != 0)
     {
@@ -351,10 +391,12 @@ uint8_t OV5640_Min_InitRGB565_QVGA_RealImage(void)
         return 12;
     }
 
-    // 等待自动曝光稳定几帧
+    // 保留已验证的固定粗粒度稳定等待；它不是按帧同步的精确等待
     HAL_Delay(200);
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 RGB565 320x240 real image init done");
+#endif
 
     return 0;
 }
@@ -378,7 +420,9 @@ uint8_t OV5640_Min_InitRGB565_160x120_TestBar(void)
         return 10U;
     }
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 RGB565 160x120 testbar init done");
+#endif
     return 0U;
 }
 
@@ -411,7 +455,9 @@ uint8_t OV5640_Min_InitRGB565_160x120_RealImage(void)
 
     // 等待曝光稳定
     HAL_Delay(200U);
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 RGB565 160x120 real image init done");
+#endif
     return 0U;
 }
 
@@ -453,8 +499,11 @@ uint8_t OV5640_Min_InitRGB565_480x320_TestBar(void)
     // 6. 开启内部测试彩条，便于检查数据通路和显示
     if (OV5640_Min_EnableTestBar(1)) return 9;
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 full table RGB565 480x320 testbar init done");
+#endif
     // 回读关键时序寄存器，确认配置写入
+    // 回读是尽力而为的诊断，不改变已经成功的初始化返回值
     (void)OV5640_Min_ReadBackTimingDebug("480X320_TESTBAR");
 
     return 0;
@@ -492,7 +541,7 @@ uint8_t OV5640_Min_InitRGB565_480x320_RealImage(void)
 
     HAL_Delay(20);
 
-    // 回读确认测试图案已经关闭
+    // 读取并记录测试图寄存器供诊断；代码未比较 0x00，不宣称“确认关闭”
     ret = SCCB_ReadReg(0x4741, &val);
     if (ret != 0)
     {
@@ -512,10 +561,12 @@ uint8_t OV5640_Min_InitRGB565_480x320_RealImage(void)
         return 12;
     }
 
-    // 等待自动曝光稳定（几帧时间）
+    // 保留已验证的 200 ms 粗粒度稳定等待，不把它解释为确定的帧数
     HAL_Delay(200);
 
+#if (OV5640_VERBOSE_INIT_LOG != 0U)
     LOG_INFO("OV5640 RGB565 480x320 real image init done");
+#endif
 
     return 0;
 }

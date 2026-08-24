@@ -1,0 +1,219 @@
+"""UART 二进制图像请求协议重复稳定性验证工具。"""
+
+import struct
+import sys
+import time
+import zlib
+import serial
+
+PORT = "COM4"
+BAUD = 115200
+TIMEOUT_SECONDS = 8.0
+REQUEST_COUNT = 20
+REQUEST_INTERVAL_SECONDS = 0.2
+START_SEQ = 1
+REQUEST_FRAME_SIZE = 14
+IMAGE_HEADER_SIZE = 22
+IMAGE_PAYLOAD_SIZE = 38400
+IMAGE_CRC_SIZE = 4
+IMAGE_FRAME_SIZE = 38426
+FAILED_RESPONSE_PATH = "captures/uart_repeat_first_failed_response.bin"
+
+
+def save_failed_response(response):
+    """保存并显示第一次校验失败响应的有限诊断信息。"""
+    with open(FAILED_RESPONSE_PATH, "wb") as output_file:
+        saved_bytes = output_file.write(response)
+
+    magic_offset = response.find(b"OV56RGB5")
+    crlf_count = response.count(b"\r\n")
+    print(f"失败响应已保存：{FAILED_RESPONSE_PATH}")
+    print(f"保存字节数：{saved_bytes}")
+    print(f"是否以OV56RGB5开头：{'是' if response.startswith(b'OV56RGB5') else '否'}")
+    if magic_offset < 0:
+        print("OV56RGB5位置：未找到")
+    else:
+        print(f"OV56RGB5位置：{magic_offset}")
+    print(f"CRLF数量：{crlf_count}")
+    print("前256 B文本：")
+    print(repr(response[:256].decode("utf-8", errors="replace")))
+    print("前128 B十六进制：")
+    print(response[:128].hex(" "))
+
+
+def build_request(seq):
+    """按协议动态构造一帧 14 B 图像请求。"""
+    if not 0 <= seq <= 0xFFFF:
+        raise ValueError("请求 seq 必须在 0 到 65535 之间。")
+    body = struct.pack("<BBHH", 0x01, 0x20, seq, 0)
+    crc = zlib.crc32(body) & 0xFFFFFFFF
+    request = b"\xA5\x5A" + body + struct.pack("<I", crc) + b"\x0D\x0A"
+    if len(request) != REQUEST_FRAME_SIZE:
+        raise ValueError("请求帧长度错误。")
+    return request
+
+def read_exact(ser, expected_size, timeout_seconds):
+    """循环接收，直到达到目标长度或总超时。"""
+    data = bytearray()
+    deadline = time.monotonic() + timeout_seconds
+    while len(data) < expected_size:
+        if time.monotonic() >= deadline:
+            break
+        chunk = ser.read(expected_size - len(data))
+        if chunk:
+            data.extend(chunk)
+    return bytes(data)
+
+def check_response(response):
+    """检查单帧 OV56RGB5 响应的 header、长度和 payload CRC。"""
+    if len(response) != IMAGE_FRAME_SIZE:
+        return False, 0, "接收长度错误"
+    # 总长度正确后再解析固定 22 B header，避免短数据触发解包错误。
+    magic = response[0:8]
+    version = response[8]
+    pixel_format = response[9]
+    width, height = struct.unpack("<HH", response[10:14])
+    payload_len, frame_id = struct.unpack("<II", response[14:22])
+    if magic != b"OV56RGB5":
+        return False, 0, "响应 magic 错误"
+    if version != 1:
+        return False, 0, "响应 version 错误"
+    if pixel_format != 1:
+        return False, 0, "响应 pixel_format 错误"
+    if width != 160 or height != 120:
+        return False, 0, "响应图像尺寸错误"
+    if payload_len != IMAGE_PAYLOAD_SIZE:
+        return False, 0, "响应 payload_len 错误"
+    payload = response[IMAGE_HEADER_SIZE:IMAGE_HEADER_SIZE + payload_len]
+    if len(payload) != IMAGE_PAYLOAD_SIZE:
+        return False, 0, "实际 payload 长度错误"
+    crc_start = IMAGE_HEADER_SIZE + payload_len
+    crc_end = crc_start + IMAGE_CRC_SIZE
+    if crc_end > len(response):
+        return False, 0, "响应末尾缺少 CRC"
+    received_crc = struct.unpack("<I", response[crc_start:crc_end])[0]
+    calculated_crc = zlib.crc32(payload) & 0xFFFFFFFF
+    if received_crc != calculated_crc:
+        return False, 0, "payload CRC错误"
+    return True, frame_id, ""
+
+def main():
+    """解析参数并执行完整测试流程。"""
+    success_count = 0
+    failure_count = 0
+    failure_dump_saved = False
+    elapsed_times = []
+    received_frame_ids = []
+    print(f"串口：{PORT}")
+    print(f"波特率：{BAUD}")
+    print(f"连续请求次数：{REQUEST_COUNT}")
+    print(f"请求间隔：{REQUEST_INTERVAL_SECONDS}秒")
+    print(f"预期响应长度：{IMAGE_FRAME_SIZE} B")
+
+    try:
+        ser = serial.Serial()
+        try:
+            ser.port = PORT
+            ser.baudrate = BAUD
+            ser.timeout = 0.2
+            ser.write_timeout = 2.0
+            ser.rtscts = False
+            ser.dsrdtr = False
+            # open 前关闭控制线，避免 CH340 自动下载电路切换 BOOT0 或复位 MCU。
+            ser.dtr = False
+            ser.rts = False
+            ser.open()
+
+            print(f"DTR状态：{ser.dtr}")
+            print(f"RTS状态：{ser.rts}")
+            time.sleep(0.2)
+            ser.reset_output_buffer()
+
+            for index in range(REQUEST_COUNT):
+                seq = (START_SEQ + index) & 0xFFFF
+                request = build_request(seq)
+                ser.reset_input_buffer()
+                start_time = time.monotonic()
+                ser.write(request)
+                ser.flush()
+                response = read_exact(ser, IMAGE_FRAME_SIZE, TIMEOUT_SECONDS)
+                end_time = time.monotonic()
+                elapsed_ms = (end_time - start_time) * 1000.0
+                success, frame_id, error_message = check_response(response)
+                if success:
+                    success_count += 1
+                    elapsed_times.append(elapsed_ms)
+                    received_frame_ids.append(frame_id)
+                    print(f"[{index + 1:02d}/{REQUEST_COUNT:02d}] seq=0x{seq:04X} "
+                          f"frame_id={frame_id} 接收={len(response)} B "
+                          f"耗时={elapsed_ms:.1f} ms PASS")
+                else:
+                    failure_count += 1
+                    print(f"[{index + 1:02d}/{REQUEST_COUNT:02d}] seq=0x{seq:04X} "
+                          f"接收={len(response)} B 耗时={elapsed_ms:.1f} ms "
+                          f"FAIL：{error_message}")
+                    if not failure_dump_saved:
+                        failure_dump_saved = True
+                        try:
+                            save_failed_response(response)
+                        except Exception as error:
+                            print(f"保存失败响应时发生错误：{error}")
+                # 单次失败也继续下一次请求，用于观察接收链路能否恢复。
+                time.sleep(REQUEST_INTERVAL_SECONDS)
+        finally:
+            if ser.is_open:
+                ser.close()
+    except serial.SerialException as error:
+        print(f"串口错误：{error}")
+        print(f"无法打开或使用 {PORT}，请确认 MobaXterm 已经关闭。")
+        print("测试结果：FAIL")
+        return 1
+    except OSError as error:
+        print(f"系统错误：{error}")
+        print("测试结果：FAIL")
+        return 1
+    except Exception as error:
+        # 兜底仅用于显示未预期错误，不用于掩盖正常校验失败。
+        print(f"未预期错误：{error}")
+        print("测试结果：FAIL")
+        return 1
+    success_rate = success_count * 100.0 / REQUEST_COUNT
+    print("\n========== 测试汇总 ==========")
+    print(f"请求总数：{REQUEST_COUNT}")
+    print(f"成功次数：{success_count}")
+    print(f"失败次数：{failure_count}")
+    print(f"成功率：{success_rate:.2f}%")
+    if elapsed_times:
+        average_ms = sum(elapsed_times) / len(elapsed_times)
+        print(f"平均耗时：{average_ms:.2f} ms")
+        print(f"最短耗时：{min(elapsed_times):.2f} ms")
+        print(f"最长耗时：{max(elapsed_times):.2f} ms")
+    else:
+        print("平均耗时：无")
+        print("最短耗时：无")
+        print("最长耗时：无")
+    frame_ids_continuous = True
+    for index in range(1, len(received_frame_ids)):
+        previous_id = received_frame_ids[index - 1]
+        current_id = received_frame_ids[index]
+        if current_id != ((previous_id + 1) & 0xFFFFFFFF):
+            frame_ids_continuous = False
+            break
+    if received_frame_ids:
+        print(f"首个 frame_id：{received_frame_ids[0]}")
+        print(f"最后 frame_id：{received_frame_ids[-1]}")
+        print(f"frame_id 是否连续：{'是' if frame_ids_continuous else '否'}")
+        if not frame_ids_continuous:
+            print("警告：frame_id 不连续")
+    else:
+        print("首个 frame_id：无")
+        print("最后 frame_id：无")
+        print("frame_id 是否连续：无")
+    if success_count == REQUEST_COUNT and failure_count == 0:
+        print("测试结果：PASS")
+        return 0
+    print("测试结果：FAIL")
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(main())

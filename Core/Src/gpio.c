@@ -80,21 +80,24 @@ void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 2 */
+// 点亮指定板载 LED；非法枚举值保持无操作
 void BSP_LED_On(bsp_led_t led)
 {
     if (led == BSP_LED0) HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_RESET);
-    else                HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+    else if (led == BSP_LED1) HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
 }
 
+// 熄灭指定板载 LED；非法枚举值保持无操作
 void BSP_LED_Off(bsp_led_t led)
 {
     if (led == BSP_LED0) HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);
-    else                HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+    else if (led == BSP_LED1) HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
 }
 
+// 翻转指定板载 LED；非法枚举值保持无操作
 void BSP_LED_Toggle(bsp_led_t led)
 {
     if (led == BSP_LED0) HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
-    else                HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+    else if (led == BSP_LED1) HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
 }
 /* USER CODE END 2 */

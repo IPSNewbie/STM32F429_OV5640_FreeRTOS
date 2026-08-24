@@ -8,7 +8,7 @@
 #include "stm32f4xx_hal.h"
 #include <stdint.h>
 
-/*
+/**
  * Apollo F429 + 正点原子 3.5寸 MCU TFT LCD
  * 已确认 LCD ID = 0x5310，对应 NT35310。
  *
@@ -22,12 +22,15 @@
  * 写 LCD_MCU->REG 表示写 LCD 命令；
  * 写 LCD_MCU->RAM 表示写 LCD 数据或像素数据。
  */
+/** @brief LCD 连接的 FMC 存储区编号。 */
 #define LCD_MCU_FMC_NEX             1U
+/** @brief 作为 LCD RS 命令/数据选择线的 FMC 地址线编号。 */
 #define LCD_MCU_FMC_AX              18U
 
+/** @brief 已验证的 NT35310 控制器 ID。 */
 #define LCD_MCU_ID_NT35310          0x5310U
 
-/*
+/**
  * LCD_MCU_BASE_ADDR 是 LCD 的 FMC 映射地址。
  *
  * 对当前硬件：
@@ -39,24 +42,19 @@
  */
 #define LCD_MCU_BASE_ADDR     ((uint32_t)((0x60000000UL + (0x4000000UL * (LCD_MCU_FMC_NEX - 1U))) | (((1UL << LCD_MCU_FMC_AX) * 2UL) - 2UL)))
 
-/*
- * LCD 寄存器/数据访问结构体。
- *
- * REG：写 LCD 命令寄存器；
- * RAM：写 LCD 数据寄存器，也可以连续写入像素数据到 GRAM。
+/**
+ * @brief LCD 在 FMC 地址空间中的命令与数据端口
  */
 typedef struct
 {
-    volatile uint16_t REG;//REG 地址0x6007FFFE（访问时 RS = 0，写入命令）
-    volatile uint16_t RAM;//RAM 地址0x6007FFFE + 2 = 0x60080000（访问时 RS = 1，写入数据）
+    volatile uint16_t REG; /**< 命令端口，访问时 RS=0 */
+    volatile uint16_t RAM; /**< 数据/GRAM 端口，访问时 RS=1 */
 } LCD_MCU_TypeDef;
 
-/*
- * LCD_MCU 是 LCD 控制器在 STM32 FMC 地址空间中的映射指针。
- */
+/** @brief LCD 控制器在 STM32 FMC 地址空间中的映射指针。 */
 #define LCD_MCU                     ((LCD_MCU_TypeDef *)LCD_MCU_BASE_ADDR)
 
-/*
+/**
  * 常用 RGB565 颜色定义。
  *
  * RGB565 格式：
@@ -73,29 +71,21 @@ typedef struct
 #define LCD_COLOR_CYAN              0x07FF
 #define LCD_COLOR_MAGENTA           0xF81F
 
-/*
- * LCD 设备参数结构体。
- *
- * id：LCD 控制器 ID，例如当前屏幕为 0x5310；
- * width：当前显示方向下的屏幕宽度；
- * height：当前显示方向下的屏幕高度；
- * dir：显示方向，0 表示竖屏，1 表示横屏；
- * cmd_set_x：设置 X 方向窗口的命令；
- * cmd_set_y：设置 Y 方向窗口的命令；
- * cmd_write_ram：写 GRAM 的命令，也就是开始写像素数据的命令。
+/**
+ * @brief LCD 控制器及当前显示方向参数
  */
 typedef struct
 {
-    uint16_t id;
-    uint16_t width;
-    uint16_t height;
-    uint8_t  dir;      /* 0: portrait, 1: landscape */
-    uint16_t cmd_set_x;
-    uint16_t cmd_set_y;
-    uint16_t cmd_write_ram;
+    uint16_t id;            /**< LCD 控制器 ID */
+    uint16_t width;         /**< 当前方向下的屏幕宽度 */
+    uint16_t height;        /**< 当前方向下的屏幕高度 */
+    uint8_t  dir;           /**< 显示方向：0-竖屏，1-横屏 */
+    uint16_t cmd_set_x;     /**< 设置 X 窗口的命令 */
+    uint16_t cmd_set_y;     /**< 设置 Y 窗口的命令 */
+    uint16_t cmd_write_ram; /**< 开始写 GRAM 的命令 */
 } LCD_MCU_Device_t;
 
-/*
+/**
  * LCD 全局设备参数。
  *
  * 初始化 LCD 后，屏幕 ID、宽度、高度、GRAM 命令等都会保存在这里。

@@ -6,10 +6,21 @@
 #define ISP_OV5640_OV5640CFG_H
 // #include "ov5640.h"
 
-//寄存器配置摘自OV5640应用手册案例
+/**
+ * @file OV5640cfg.h
+ * @brief OV5640 厂家参考寄存器配置表和项目已验证的 RGB565 覆盖表
+ *
+ * 每个表项按“16 位寄存器地址、低 8 位寄存器值”成对保存，并由
+ * OV5640_Min_WriteTable() 严格按顺序写入。表内包含大量模拟阵列、ISP 和
+ * 时钟相关的厂家参考值；对没有本地数据手册证据的 0x36xx/0x37xx/0x39xx
+ * 等寄存器只按功能组说明，不推测单个位的含义。
+ *
+ * @note 表项顺序、寄存器地址和值属于已通过硬件验证的初始化时序。
+ *       0x3008=0x42 使传感器进入 software power-down，表尾 0x3008=0x02
+ *       才将其唤醒；两者共同构成初始化过程，不能只保留其中一项。
+ */
 
-/* JPEG配置.7.5帧 */
-/* 最大支持2592*1944的JPEG图像输出 */
+/** @brief JPEG 输出参考配置表，最大支持 2592x1944。 */
 const uint16_t OV5640_jpeg_reg_tbl[][2] =
 {
     // 下面这组用于 JPEG 模式，当前 RGB565 调试阶段暂时不用
@@ -79,7 +90,7 @@ const uint16_t OV5640_jpeg_reg_tbl[][2] =
     0x460c, 0x22,
 
     // PCLK/MIPI时序相关，DVP模式下部分仍会影响输出时序
-    0x4837, 0x16, /* MIPI global timing */
+    0x4837, 0x16, /* 厂家参考时序值；当前不对该寄存器做位级推断 */
     0x3824, 0x02, /* PCLK manual divider */
 
     // ISP功能开关：缩放、色彩矩阵、AWB等
@@ -89,8 +100,7 @@ const uint16_t OV5640_jpeg_reg_tbl[][2] =
     0x3503, 0x00, /* AEC/AGC on */
 };
 
-/*RGB565配置.15帧 */
-/*最大支持1280*800的RGB565图像输出 */
+/** @brief RGB565 输出参考配置表，最大支持 1280x800。 */
 const uint16_t ov5640_rgb565_reg_tbl[][2] =
 {
     // 4300 控制输出格式，这里配置为 RGB565 相关输出
@@ -181,7 +191,7 @@ const uint16_t ov5640_rgb565_reg_tbl[][2] =
     0x460c, 0x20,
 
     // 时序相关
-    0x4837, 0x16, /* MIPI global timing */
+    0x4837, 0x16, /* 厂家参考时序值；当前不对该寄存器做位级推断 */
 
     // PCLK手动分频，影响 DCMI 接收数据速度
     0x3824, 0x04, /* PCLK manual divider */
@@ -193,7 +203,7 @@ const uint16_t ov5640_rgb565_reg_tbl[][2] =
     0x3503, 0x00, /* AEC/AGC on */
 };
 
-/* OV5640 UXGA初始化寄存器序列表 */
+/** @brief OV5640 UXGA 基础初始化寄存器序列表。 */
 const uint16_t ov5640_init_reg_tbl[][2] =
 {
     /* 24MHz input clock, 24MHz PCLK */
@@ -209,7 +219,12 @@ const uint16_t ov5640_init_reg_tbl[][2] =
     0x3017, 0xff, /* FREX, Vsync, HREF, PCLK, D[9:6] output enable */
 
     // DVP输出引脚使能：D[5:0]/GPIO
-    0x3018, 0xff, /* D[5:0], GPIO[1:0] output enable */
+    /*
+     * 0x3018 控制 DVP 数据输出使能。项目经硬件验证确认 bit[6:4] 对应
+     * D4/D3/D2；SD SNAPSHOT 写卡时使用 value & 0x8F 临时关闭这三路，
+     * 因为 D2/D3/D4 分别与 SDIO 的 PC8/PC9/PC11 复用，cleanup 后恢复原值。
+     */
+    0x3018, 0xff, /* 基础初始化阶段保持完整 DVP 数据输出 */
 
     // MIPI数据位宽相关配置，虽然我们用DVP，仍保留原表
     0x3034, 0x1a, /* MIPI 10-bit */
@@ -480,7 +495,7 @@ const uint16_t ov5640_init_reg_tbl[][2] =
     /*自行添加的设置 */
     // VSYNC 极性设置
     // 你当前 DCMI 配置为 VSYNC 低有效，若画面异常可重点检查这里和 DCMI 极性是否匹配
-    0x4740, 0X21, /* VSYNC 高有效 */
+    0x4740, 0X21, /* 与当前 DCMI 配置配套且已硬件验证；不在此推断极性位语义 */
 };
 
 #endif //ISP_OV5640_OV5640CFG_H
