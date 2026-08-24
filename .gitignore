@@ -39,3 +39,9 @@ ov5640_gray.png
 ov5640_hist.png
 ov5640_report.txt
 frame.png
+# Local development documents
+*.md
+!/README.md
+# Local development documents
+*.md
+!/README.md
